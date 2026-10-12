@@ -1188,6 +1188,12 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
         const int32_t* d_tk = pf_dev_;
         const int32_t* d_stp = d_tk + n;
         const int32_t* d_ps = d_stp + 4 * n;
+        static const bool trace = std::getenv("STRATA_DRAFT_PREFILL_TRACE") != nullptr;
+        const int64_t ngroups = (n + max_t_ - 1) / max_t_;
+        uint64_t* marks = trace && sync ? (uint64_t*) strata::ze::malloc_host((size_t) ngroups * 2 * sizeof(uint64_t)) : nullptr;
+        if (marks) std::memset(marks, 0, (size_t) ngroups * 2 * sizeof(uint64_t));
+        int64_t gi = 0;
+        const Clock::time_point tq = Clock::now();
         for (int64_t c = 0; c < n; c += max_t_) {
             const int T = (int) std::min<int64_t>(max_t_, n - c);
             if (cell0 + c + T <= first_needed) continue;
@@ -1196,9 +1202,50 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
             cs_->memcpy(step_, d_stp + c * 4, (size_t) T * 16);
             cs_->memcpy(pos_, d_ps + c * NHp, (size_t) (T * NHp) * 4);
             cs_->memcpy(Rin_, R_rows + (size_t) c * HCN, (size_t) T * HCN * sizeof(float));
+            if (marks) cs_->write_timestamp(marks + 2 * gi);
             cs_->launch(*prefill_dev_exec_[T]);
+            if (marks) cs_->write_timestamp(marks + 2 * gi + 1);
+            ++gi;
         }
         if (!sync) {   // the caller orders on stream(); the records are staged (a pageable copy returns once taken)
+            ms_prefill += ms_since(t0);
+            return true;
+        }
+        if (marks) {
+            std::fprintf(stderr, "strata mtp: prefill trace: GPU %d, %lld groups of up to %d rows queued in %.1f ms (cells %lld-%lld)\n",
+                         device_, (long long) gi, max_t_, ms_since(tq), (long long) cell0, (long long) (cell0 + n));
+            const Clock::time_point tw = Clock::now();
+            bool done = false;
+            auto last_mark = [&] {
+                int64_t last = -1;
+                for (int64_t i = 0; i < 2 * gi; ++i)
+                    if (((volatile uint64_t*) marks)[i] != 0) last = i;
+                return last;
+            };
+            while (!(done = cs_->sync_for(5000)) && ms_since(tw) < 50000.0) {
+                const int64_t last = last_mark();
+                std::fprintf(stderr, "strata mtp: prefill trace: %.0f ms waiting, last mark %lld of %lld (group %lld, %s)\n",
+                             ms_since(tw), (long long) last, (long long) (2 * gi), (long long) (last / 2),
+                             last < 0 ? "none" : last % 2 == 0 ? "inputs copied, graph not done" : "graph done");
+            }
+            if (!done) {
+                const int64_t last = last_mark();
+                std::fprintf(stderr, "strata mtp: prefill trace: the GPU stopped after mark %lld of %lld (group %lld of %lld)\n",
+                             (long long) last, (long long) (2 * gi), (long long) (last / 2), (long long) gi);
+                err = "mtp prefill: the GPU stopped (STRATA_DRAFT_PREFILL_TRACE)";
+                return false;
+            }
+            const strata::ze::DeviceInfo& di = strata::ze::device_info(device_);
+            std::vector<double> ms;
+            for (int64_t i = 0; i < gi; ++i)
+                ms.push_back((double) ((marks[2 * i + 1] - marks[2 * i]) & di.timestamp_mask) * (double) di.timer_ns_num /
+                             (double) di.timer_ns_den / 1e6);
+            std::vector<double> sorted = ms;
+            std::sort(sorted.begin(), sorted.end());
+            const size_t worst = (size_t) (std::max_element(ms.begin(), ms.end()) - ms.begin());
+            std::fprintf(stderr, "strata mtp: prefill trace: done after %.1f ms; graph ms per group min %.3f median %.3f max %.3f "
+                                 "(group %zu)\n", ms_since(tw), sorted.front(), sorted[sorted.size() / 2], sorted.back(), worst);
+            strata::ze::free(marks);
             ms_prefill += ms_since(t0);
             return true;
         }

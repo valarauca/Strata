@@ -245,7 +245,9 @@ public:
     Graph* end_capture();
     /// True between begin_capture and end_capture, and for a stream that joined a capture until it ends.
     bool capturing() const { return cap_ != nullptr; }
-    /// Appends a recorded graph.
+    /// Appends a recorded graph. A graph whose previous replay has not finished is waited for first (host): on the
+    /// xe driver a regular in-order command list appended again while an earlier execution of it is still queued loses
+    /// that execution's work, and enough of them hang the GPU (notebook scripts/l0-p2p-toy/replay_toy.cpp).
     void launch(Graph& g);
 
     /// Number of commands this stream appended (a counter for STRATA_ZE_REPORT).
@@ -358,7 +360,7 @@ private:
     ze_command_list_handle_t list_ = nullptr;
     size_t nodes_ = 0;
     int dev_ = 0;
-    bool launched_ = false;
+    Event* done_ = nullptr;   ///< signaled when the last replay finished
     Stream::Capture* cap_ = nullptr;
 };
 

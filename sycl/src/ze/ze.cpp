@@ -1311,8 +1311,8 @@ void Stream::launch(Graph& g) {
         std::fprintf(stderr, "strata ze: a graph of GPU %d launched on a stream of GPU %d\n", g.dev_, dev_);
         std::exit(1);
     }
+    if (g.done_ != nullptr) g.done_->sync();
     STRATA_ZE_CHECK(zeCommandListImmediateAppendCommandListsExp(imm_, 1, &g.list_, nullptr, 0, nullptr));
-    g.launched_ = true;
     if (g.cap_ != nullptr) {
         std::lock_guard<std::mutex> cl(rt().cap_mu);
         for (Event* e : g.cap_->events) {
@@ -1321,12 +1321,16 @@ void Stream::launch(Graph& g) {
             e->dev_ = dev_;
         }
     }
+    if (g.done_ == nullptr) g.done_ = new Event();
+    STRATA_ZE_CHECK(zeCommandListAppendBarrier(imm_, g.done_->ev_, 0, nullptr));
+    g.done_->recorded_ = true;
+    g.done_->dev_ = dev_;
     g_count.graph_launches.fetch_add(1, std::memory_order_relaxed);
     after_append();
 }
 
 Graph::~Graph() {
-    if (launched_) device_sync(dev_);
+    delete done_;
     if (cap_ != nullptr) {
         std::lock_guard<std::mutex> cl(rt().cap_mu);
         for (Event* e : cap_->events) {
