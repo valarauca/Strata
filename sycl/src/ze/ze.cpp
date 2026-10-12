@@ -366,7 +366,7 @@ uint64_t* new_stamp() {
 [[noreturn]] void fatal(const char* what, ze_result_t r, const char* file, int line) {
     std::fprintf(stderr, "strata ze: %s failed: %s (%s:%d)%s\n", what, result_name(r), file, line,
                  r == ZE_RESULT_ERROR_DEVICE_LOST ? " - DEVICE_LOST" : "");
-    std::fflush(stderr);
+    std::fflush(nullptr);
     std::_Exit(1);
 }
 
@@ -561,6 +561,28 @@ size_t device_offset_end(const void* p, size_t bytes) {
     return (size_t) (end - it->first);
 }
 
+namespace {
+
+MemKind range_kind(const void* p, size_t bytes, const char* what) {
+    if (p == nullptr) return MemKind::Unknown;
+    Runtime& r = rt();
+    std::lock_guard<std::mutex> lk(r.alloc_mu);
+    auto it = r.allocs.upper_bound((uintptr_t) p);
+    if (it == r.allocs.begin()) return MemKind::Unknown;
+    --it;
+    const uintptr_t lim = it->first + it->second.bytes;
+    if ((uintptr_t) p >= lim) return MemKind::Unknown;
+    if ((uintptr_t) p + bytes > lim) {
+        std::fprintf(stderr, "strata ze: %s of %zu bytes at %p runs %zu bytes past its allocation (%p, %zu bytes)\n", what,
+                     bytes, p, (size_t) ((uintptr_t) p + bytes - lim), (void*) it->first, it->second.bytes);
+        std::fflush(nullptr);
+        std::abort();
+    }
+    return it->second.kind;
+}
+
+}  // namespace
+
 MemTotals mem_totals() {
     Runtime& r = rt();
     std::lock_guard<std::mutex> lk(r.alloc_mu);
@@ -593,6 +615,8 @@ ze_kernel_handle_t KernelBase::create(int ordinal) const {
     ze_kernel_desc_t kd{ZE_STRUCTURE_TYPE_KERNEL_DESC};
     kd.pKernelName = name_;
     STRATA_ZE_CHECK(zeKernelCreate(m, &kd, &h));
+    STRATA_ZE_CHECK(zeKernelSetIndirectAccess(h, ZE_KERNEL_INDIRECT_ACCESS_FLAG_DEVICE | ZE_KERNEL_INDIRECT_ACCESS_FLAG_HOST |
+                                                     ZE_KERNEL_INDIRECT_ACCESS_FLAG_SHARED));
     ze_kernel_properties_t kp{ZE_STRUCTURE_TYPE_KERNEL_PROPERTIES};
     STRATA_ZE_CHECK(zeKernelGetProperties(h, &kp));
     if (kp.numKernelArgs != nparams_ && kp.numKernelArgs != nparams_ + 1) {
@@ -682,7 +706,8 @@ void Stream::launch(const KernelBase& k, Dim3 grid, Dim3 block, void** args) {
 void Stream::memcpy(void* dst, const void* src, size_t bytes) {
     if (bytes == 0) return;
     std::lock_guard<std::recursive_mutex> lk(mu_);
-    const bool src_ok = kind_of(src) != MemKind::Unknown, dst_ok = kind_of(dst) != MemKind::Unknown;
+    const bool src_ok = range_kind(src, bytes, "copy source") != MemKind::Unknown,
+               dst_ok = range_kind(dst, bytes, "copy destination") != MemKind::Unknown;
     if (src_ok && dst_ok) {
         STRATA_ZE_CHECK(zeCommandListAppendMemoryCopy(target(), dst, src, bytes, nullptr, 0, nullptr));
         g_count.copies.fetch_add(1, std::memory_order_relaxed);
@@ -744,7 +769,7 @@ void Stream::memset(void* dst, int value, size_t bytes) {
 void Stream::fill(void* dst, const void* pattern, size_t pattern_bytes, size_t bytes) {
     if (bytes == 0) return;
     std::lock_guard<std::recursive_mutex> lk(mu_);
-    if (kind_of(dst) == MemKind::Unknown) {
+    if (range_kind(dst, bytes, "fill") == MemKind::Unknown) {
         if (cap_) {
             std::fprintf(stderr, "strata ze: a fill of pageable host memory inside a capture (%p)\n", dst);
             std::exit(1);
