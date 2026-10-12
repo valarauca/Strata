@@ -40,11 +40,7 @@
 //    Every comparison still passed at any sane tolerance, the spare key landing 0.4 f32 ulp away; only a
 //    BIT-EXACT assertion plus a full-precision probe of the intermediate found it.  That is the strongest
 //    argument in this file for keeping both.
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
-#include "strata/sycl_queue.hpp"
-#include "strata/core/emulate.hpp"
+#include "strata/port.hpp"
 #include "strata/kernels/qsa.hpp"
 
 #include "strata/kernels/f16_bits.hpp"
@@ -54,71 +50,10 @@
 
 #include <cfloat>
 #include <cmath>
-#include <cstdio>
-#include <cstdlib>
 #include <cstring>
 
 namespace strata::kernels {
 namespace {
-
-constexpr int THREADS = 128;
-
-void fail(const char* what) {
-    std::fprintf(stderr, "qsa: %s\n", what);
-    std::exit(1);
-}
-
-void check_launch(const char* what) {
-    /*
-    DPCT1010: SYCL uses exceptions to report errors and does not use the
-    error codes. The cudaGetLastError function call was replaced with 0. You
-    need to rewrite this code.
-    */
-    const dpct::err0 e = 0;
-}
-
-/// The SYNCHRONOUS entry points must check their own wait.  Without this the sticky error from a kernel that
-/// faulted becomes visible only at the NEXT call's `cudaGetLastError()`, which then names the wrong kernel -
-/// exactly the mis-attribution that made round 198's first `kv_append` failure look like a later one.
-void check_sync(const char *what) try {
-    const dpct::err0 e =
-        DPCT_CHECK_ERROR(dpct::get_current_device().queues_wait_and_throw());
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
-
-/// Geometry validation.  A silently wrong `head_dim % 4` would corrupt the gather's uint2 copy and a silently
-/// wrong `n_head % n_head_kv` would produce a plausible attention with the wrong key, so both are refused.
-void validate(const QsaShapes& s, const char* who) {
-    if (s.n_head <= 0 || s.n_head_kv <= 0 || s.head_dim <= 0 || s.idx_dim <= 0 || s.idx_n_head <= 0 ||
-        s.idx_block < 2 || s.page_size < 1) {
-        std::fprintf(stderr, "qsa: %s: geometry is not set up\n", who);
-        std::exit(1);
-    }
-    if (s.n_head % s.n_head_kv != 0) {
-        std::fprintf(stderr, "qsa: %s: n_head %lld is not a multiple of n_head_kv %lld\n", who,
-                     (long long) s.n_head, (long long) s.n_head_kv);
-        std::exit(1);
-    }
-    if (s.head_dim % 4 != 0) {
-        std::fprintf(stderr, "qsa: %s: head_dim %lld must be a multiple of 4 (the gather copies uint2)\n", who,
-                     (long long) s.head_dim);
-        std::exit(1);
-    }
-    if (s.n_rot <= 0 || s.n_rot % 2 != 0 || s.n_rot > s.head_dim || s.n_rot > s.idx_dim) {
-        std::fprintf(stderr, "qsa: %s: n_rot %lld must be even and <= head_dim %lld and idx_dim %lld\n", who,
-                     (long long) s.n_rot, (long long) s.head_dim, (long long) s.idx_dim);
-        std::exit(1);
-    }
-    if (s.idx_n_head > 32) {
-        std::fprintf(stderr, "qsa: %s: idx_n_head %lld > 32 (one warp per indexer head)\n", who,
-                     (long long) s.idx_n_head);
-        std::exit(1);
-    }
-}
 
 __dpct_inline__ float h2f(uint16_t bits) { return f32_from_f16(bits); }
 
@@ -130,11 +65,6 @@ kv_append_kernel(uint16_t *__restrict__ k_pool, uint16_t *__restrict__ v_pool,
                  const int32_t *__restrict__ step,
                  const float *__restrict__ kcur, const float *__restrict__ vcur,
                  int kv_heads, int head_dim, int page_size, KvHostPools host) {
-    /*
-    DPCT1098: The '*' expression is used instead of the __ldg call. These
-    two expressions do not provide the exact same functionality. Check the
-    generated code for potential precision and/or performance issues.
-    */
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const long long pos = (long long)*(step + kStepPos);
     const int i = item_ct1.get_group(2) * item_ct1.get_local_range(2) +
@@ -177,11 +107,6 @@ __dpct_inline__ void indexer_key_append_kernel(
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     auto s_mean = (double *)dpct_local; // idx_dim doubles
     const int d = item_ct1.get_local_id(2);
-    /*
-    DPCT1098: The '*' expression is used instead of the __ldg call. These
-    two expressions do not provide the exact same functionality. Check the
-    generated code for potential precision and/or performance issues.
-    */
     const int pos = (int)*pos_dev;
     const int slot = pos % r;
 
@@ -204,20 +129,8 @@ __dpct_inline__ void indexer_key_append_kernel(
         // and `__dsqrt_rn` pin the reciprocal square root for the same reason.
         for (int i = 0; i < idx_dim; ++i) {
             const double v = (double) raw[i];
-            /*
-            DPCT1013: The rounding mode could not be specified and the
-            generated code may have different accuracy than the original code.
-            Verify the correctness. SYCL math built-in function rounding mode is
-            aligned with OpenCL C 1.2 standard.
-            */
             ss = ss + v * v;
         }
-        /*
-        DPCT1013: The rounding mode could not be specified and the generated
-        code may have different accuracy than the original code. Verify the
-        correctness. SYCL math built-in function rounding mode is aligned with
-        OpenCL C 1.2 standard.
-        */
         const double inv = 1.0 / sycl::sqrt(ss / (double)idx_dim + (double)eps);
         float y = (float) (p * inv * (double) w_k_norm[d]);
         // The spare rotates at position 0 - ALWAYS row 0 of the table, whatever `pos_base` is, as the native
@@ -234,11 +147,6 @@ __dpct_inline__ void indexer_key_append_kernel(
     }
 
     if (slot != r - 1) return;
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier(); // the tail rows this thread is about to read are
                         // written above
 
@@ -246,44 +154,17 @@ __dpct_inline__ void indexer_key_append_kernel(
     // cell (slot r-1).  The sum of r f32 values is exact in double, so the mean's order cannot matter here -
     // but the order of the SUM OF SQUARES below can, and it is fixed to d ascending on both sides.
     double m = 0.0;
-    /*
-DPCT1013: The rounding mode could not be specified and the generated code
-may have different accuracy than the original code. Verify the correctness. SYCL
-math built-in function rounding mode is aligned with OpenCL C 1.2 standard.
-*/
 #pragma unroll
     for (int j = 0; j < r - 1; ++j)
         m = m + (double)tail[(size_t)j * idx_dim + d];
-    /*
-    DPCT1013: The rounding mode could not be specified and the generated
-    code may have different accuracy than the original code. Verify the
-    correctness. SYCL math built-in function rounding mode is aligned with
-    OpenCL C 1.2 standard.
-    */
     m = m + (double)raw[d];
     m = m / (double) r;
     s_mean[d] = m;
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
 
     double ss = 0.0;
-    /*
-DPCT1013: The rounding mode could not be specified and the generated code
-may have different accuracy than the original code. Verify the correctness. SYCL
-math built-in function rounding mode is aligned with OpenCL C 1.2 standard.
-*/
 #pragma unroll
     for (int i = 0; i < idx_dim; ++i) ss = ss + s_mean[i] * s_mean[i];
-    /*
-    DPCT1013: The rounding mode could not be specified and the generated
-    code may have different accuracy than the original code. Verify the
-    correctness. SYCL math built-in function rounding mode is aligned with
-    OpenCL C 1.2 standard.
-    */
     const double inv = 1.0 / sycl::sqrt(ss / (double)idx_dim + (double)eps);
 
     const int b = pos / r;
@@ -293,11 +174,6 @@ math built-in function rounding mode is aligned with OpenCL C 1.2 standard.
     // The rotation position for this row, kept because a capture reader and the debug dumps want it.  It is the
     // block's first cell's POSITION, `pos_base + b*r`, and NOT the cell index `b*r`.
     if (d == 0) *block_pos = (int32_t) (pos_base + b * r);
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier(); // the row is complete only now; the rotation below
                         // reads TWO elements of it
 
@@ -328,18 +204,8 @@ __dpct_inline__ void qsa_index_kernel(const float *__restrict__ pooled,
                                       int idx_n_head, int idx_dim, long long r,
                                       const int32_t *__restrict__ step,
                                       float *__restrict__ cell_scores) {
-    /*
-    DPCT1098: The '*' expression is used instead of the __ldg call. These
-    two expressions do not provide the exact same functionality. Check the
-    generated code for potential precision and/or performance issues.
-    */
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const long long n_bid = (long long)*(step + kStepNBid);
-    /*
-    DPCT1098: The '*' expression is used instead of the __ldg call. These
-    two expressions do not provide the exact same functionality. Check the
-    generated code for potential precision and/or performance issues.
-    */
     const long long n_kv = (long long)*(step + kStepNKv);
     auto &s_dot =
         *sycl::ext::oneapi::group_local_memory_for_overwrite<double[32]>(
@@ -359,24 +225,8 @@ __dpct_inline__ void qsa_index_kernel(const float *__restrict__ pooled,
     double acc = 0.0;
 #pragma unroll
     for (int d = lane; d < idx_dim; d += 32)
-        /*
-        DPCT1013: The rounding mode could not be specified and the generated
-        code may have different accuracy than the original code. Verify the
-        correctness. SYCL math built-in function rounding mode is aligned with
-        OpenCL C 1.2 standard.
-        */
         acc = acc + (double)pooled[(size_t)b * idx_dim + d] *
                         (double)q_idx[(size_t)wid * idx_dim + d];
-    /*
-DPCT1108: '__shfl_xor_sync' was migrated with the experimental feature
-masked sub_group function which may not be supported by all compilers or
-runtimes. You may need to adjust the code.
-*/
-    /*
-DPCT1013: The rounding mode could not be specified and the generated code
-may have different accuracy than the original code. Verify the correctness. SYCL
-math built-in function rounding mode is aligned with OpenCL C 1.2 standard.
-*/
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) acc =
         acc + dpct::experimental::permute_sub_group_by_xor(
@@ -420,27 +270,11 @@ __dpct_inline__ uint32_t order_key(float s) {
 
 constexpr int TOPK_THREADS = 256;
 
-/*
-DPCT1110: The total declared local variable size in device function
-topk_kernel exceeds 128 bytes and may cause high register pressure. Consult with
-your hardware vendor to find the total register size available and adjust the
-code, or use smaller sub-group size to avoid high register pressure.
-*/
 __dpct_inline__ void topk_kernel(const float *__restrict__ scores,
                                  const int32_t *__restrict__ step,
                                  int *__restrict__ out_ids) {
-    /*
-    DPCT1098: The '*' expression is used instead of the __ldg call. These
-    two expressions do not provide the exact same functionality. Check the
-    generated code for potential precision and/or performance issues.
-    */
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const long long n_kv = (long long)*(step + kStepNKv);
-    /*
-    DPCT1098: The '*' expression is used instead of the __ldg call. These
-    two expressions do not provide the exact same functionality. Check the
-    generated code for potential precision and/or performance issues.
-    */
     const long long width = (long long)*(step + kStepWidth);
     auto &s_a =
         *sycl::ext::oneapi::group_local_memory_for_overwrite<int[TOPK_THREADS]>(
@@ -467,26 +301,13 @@ __dpct_inline__ void topk_kernel(const float *__restrict__ scores,
         for (long long j = lo; j < hi;
              ++j) if (order_key(scores[j]) >= cand)++ c;
         s_a[t] = c;
-        /*
-        DPCT1118: SYCL group functions and algorithms must be encountered in
-        converged control flow. You may need to adjust the code.
-        */
         item_ct1.barrier(sycl::access::fence_space::local_space);
 #pragma unroll
         for (int s = TOPK_THREADS / 2; s > 0; s >>= 1) {
             if (t < s) s_a[t] += s_a[t + s];
-            /*
-            DPCT1118: SYCL group functions and algorithms must be
-            encountered in converged control flow. You may need to adjust the
-            code.
-            */
             item_ct1.barrier(sycl::access::fence_space::local_space);
         }
         const int tot = s_a[0];
-        /*
-        DPCT1118: SYCL group functions and algorithms must be encountered in
-        converged control flow. You may need to adjust the code.
-        */
         item_ct1.barrier(
             sycl::access::fence_space::local_space); // before the next round
                                                      // overwrites s_a
@@ -566,11 +387,6 @@ __dpct_inline__ void kv_gather_kernel(
     const int32_t *__restrict__ table, const int32_t *__restrict__ ids,
     const int32_t *__restrict__ step, int kv_heads, int head_dim, int page_size,
     uint16_t *__restrict__ k_scratch, uint16_t *__restrict__ v_scratch) {
-    /*
-    DPCT1098: The '*' expression is used instead of the __ldg call. These
-    two expressions do not provide the exact same functionality. Check the
-    generated code for potential precision and/or performance issues.
-    */
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const long long n_ids = (long long)*(step + kStepWidth);
     const int per = head_dim / 4;                       // 4 halfs per uint2
@@ -595,11 +411,6 @@ __dpct_inline__ void kv_gather_kernel(
 // ================= 6. qsa_attend =================
 
 __dpct_inline__ float warp_max(float v) {
-    /*
-DPCT1108: '__shfl_xor_sync' was migrated with the experimental feature
-masked sub_group function which may not be supported by all compilers or
-runtimes. You may need to adjust the code.
-*/
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) v = sycl::fmax(
         v, dpct::experimental::permute_sub_group_by_xor(
@@ -609,11 +420,6 @@ runtimes. You may need to adjust the code.
 }
 
 __dpct_inline__ float warp_sum(float v) {
-    /*
-DPCT1108: '__shfl_xor_sync' was migrated with the experimental feature
-masked sub_group function which may not be supported by all compilers or
-runtimes. You may need to adjust the code.
-*/
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) v +=
         dpct::experimental::permute_sub_group_by_xor(
@@ -623,22 +429,11 @@ runtimes. You may need to adjust the code.
 }
 
 /// One block per query head.  `s` holds the scores, which are then overwritten with the softmax weights.
-/*
-DPCT1110: The total declared local variable size in device function
-qsa_attend_kernel exceeds 128 bytes and may cause high register pressure.
-Consult with your hardware vendor to find the total register size available and
-adjust the code, or use smaller sub-group size to avoid high register pressure.
-*/
 __dpct_inline__ void qsa_attend_kernel(
     const float *__restrict__ q, const uint16_t *__restrict__ k_scratch,
     const uint16_t *__restrict__ v_scratch, const int32_t *__restrict__ step,
     int n_head, int n_head_kv, int head_dim, float *__restrict__ attn,
     float *__restrict__ weights, uint8_t *dpct_local) {
-    /*
-    DPCT1098: The '*' expression is used instead of the __ldg call. These
-    two expressions do not provide the exact same functionality. Check the
-    generated code for potential precision and/or performance issues.
-    */
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const long long n_ids = (long long)*(step + kStepWidth);
     auto s_w = (float *)dpct_local; // CAPACITY floats (scores, then weights) +
@@ -671,11 +466,6 @@ __dpct_inline__ void qsa_attend_kernel(
             h2f(krow[i]) * q[(size_t)h * head_dim + i];
         w[j] = acc * scale;
     }
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
 
     float mx = -FLT_MAX;    // not -inf, whose double -> float conversion nvcc warns about
@@ -684,29 +474,14 @@ __dpct_inline__ void qsa_attend_kernel(
         mx = sycl::fmax(mx, w[j]);
     mx = warp_max(mx);
     if (lane == 0) red[wid] = mx;
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
     if (wid == 0) {
         mx = (lane < nwarp) ? red[lane] : -FLT_MAX;
         mx = warp_max(mx);
         if (lane == 0) red[0] = mx;
     }
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
     mx = red[0];
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
 
     float sum = 0.0f;
@@ -717,29 +492,14 @@ __dpct_inline__ void qsa_attend_kernel(
     }
     sum = warp_sum(sum);
     if (lane == 0) red[wid] = sum;
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
     if (wid == 0) {
         sum = (lane < nwarp) ? red[lane] : 0.0f;
         sum = warp_sum(sum);
         if (lane == 0) red[0] = 1.0f / sum;
     }
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
     const float inv = red[0];
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
 
     float acc = 0.0f;
@@ -771,441 +531,7 @@ __dpct_inline__ void qsa_gate_apply_kernel(const float *__restrict__ attn,
     out[i] = f16_from_f32((float) ((double) attn[i] * sig));
 }
 
-inline unsigned grid_for(long long n, int threads) {
-    return (unsigned) ((n + threads - 1) / threads);
-}
-
 }  // namespace
-
-/// THE STEP STATE, UPLOADED.  Every kernel below reads its per-token counts from here rather than from a kernel
-/// argument, because a CUDA graph bakes arguments in at capture time - see the long note in `qsa.hpp`.  This
-/// module-level buffer is what lets the OLD host-scalar signatures keep working unchanged while the kernels
-/// already read the device values; the layer will pass its own buffer once it captures.
-///
-/// It is per-PROCESS and reused, which is safe because the upload and the kernel that reads it are on the same
-/// stream and the host is the only writer.  `cudaMemcpyAsync` on the null stream is ordered against the null
-/// stream's kernels, which is what every direct-launch caller here uses.
-namespace {
-
-int32_t *step_scratch() try {
-    static int32_t* d_step = nullptr;
-    if (d_step == nullptr) {
-        if (DPCT_CHECK_ERROR(
-                d_step = (int32_t *)sycl::malloc_device(
-                    qsa_step_bytes(), dpct::get_in_order_queue())) != 0) {
-            std::fprintf(stderr, "qsa: step upload: cudaMalloc failed\n");
-            std::exit(1);
-        }
-    }
-    return d_step;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
-
-void step_upload_raw(const int32_t *h_step) try {
-    int32_t* d = step_scratch();
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming in
-    the original code the source host memory is pageable memory. If the memory
-    is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    if (DPCT_CHECK_ERROR(dpct::get_in_order_queue().memcpy(
-            d, h_step, qsa_step_bytes()).wait()) != 0) {
-        std::fprintf(stderr, "qsa: step upload: cudaMemcpy failed\n");
-        std::exit(1);
-    }
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
-
-/// From a POSITION: fills all four entries.  This is the form the layer will use, and the only form that cannot
-/// produce an inconsistent `n_kv`/`n_bid`/`width`.
-const int32_t* step_upload(int64_t pos, int64_t n_kv_hint, const QsaShapes& s) {
-    int32_t h[kStepCount];
-    qsa_step_fill(h, pos, s);
-    // A caller that also knows `n_kv` is CHECKED against it rather than believed: a disagreement is exactly the
-    // inconsistency `qsa_step_fill` exists to make impossible, so it is worth an exit rather than a silent
-    // preference for one of the two.
-    if (n_kv_hint >= 0 && n_kv_hint != (int64_t) h[kStepNKv]) {
-        std::fprintf(stderr, "qsa: step upload: n_kv %lld disagrees with pos+1 = %d\n", (long long) n_kv_hint,
-                     h[kStepNKv]);
-        std::exit(1);
-    }
-    step_upload_raw(h);
-    return step_scratch();
-}
-
-/// From a WIDTH.  `kv_gather` and `qsa_attend` are handed the selection width directly and never see `pos`, so
-/// only that entry is meaningful for them; the others are set consistently anyway rather than left stale,
-/// because a stale entry is a value the NEXT kernel might read.
-const int32_t* step_upload_width(int64_t width, const QsaShapes& s) {
-    int32_t h[kStepCount];
-    for (int i = 0; i < kStepCount; ++i) h[i] = 0;
-    h[kStepWidth] = (int32_t) width;
-    (void) s;
-    step_upload_raw(h);
-    return step_scratch();
-}
-
-}  // namespace
-
-// ================= THE CAPTURABLE ENTRY POINTS =================
-//
-// These are the REAL implementations: every launch below is sized from a constant capacity and every per-token
-// count comes from `step`.  The host-scalar entry points further down are wrappers that fill a module-level step
-// buffer and forward this token's counts as the capacities.
-
-void kv_append_step(uint16_t* k_pool, uint16_t* v_pool, const int32_t* page_table, const int32_t* step,
-                    const float* kcur, const float* vcur, const QsaShapes& s, void* stream, const KvHostPools* host) {
-    validate(s, "kv_append");
-    if (step == nullptr) fail("kv_append: step is null");
-    // The grid is the head x dim count, which is a CONSTANT - `kv_append` writes one cell.
-    const long long n = s.n_head_kv * s.head_dim;
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        strata::q_of(stream)
-            ->submit([&](sycl::handler &cgh) {
-                KvHostPools host_host_KvHostPools_ct9 =
-                    host ? *host : KvHostPools{};
-
-                cgh.parallel_for<
-                    dpct_kernel_name<class kv_append_kernel_19f129>>(
-                    sycl::nd_range<3>(sycl::range(1, 1, grid_for(n, THREADS)) *
-                                          sycl::range(1, 1, THREADS),
-                                      sycl::range(1, 1, THREADS)),
-                    exp_props, [=](sycl::nd_item<3> item_ct1) {
-                        kv_append_kernel(k_pool, v_pool, page_table, step, kcur,
-                                         vcur, (int)s.n_head_kv,
-                                         (int)s.head_dim, (int)s.page_size,
-                                         host_host_KvHostPools_ct9);
-                    });
-            });
-    }
-    check_launch("kv_append");
-    if (stream == nullptr) check_sync("kv_append");
-}
-
-void qsa_index_step(const float* pooled, const float* q_idx, const float* bias, const QsaShapes& s,
-                    const int32_t* step, int64_t max_blocks, float* cell_scores, void* stream) {
-    validate(s, "qsa_index");
-    if (step == nullptr) fail("qsa_index: step is null");
-    if (max_blocks <= 0) fail("qsa_index: max_blocks must be positive");
-    // THE GRID IS `max_blocks`, A CONSTANT - not this token's `n_bid + 1`.  The kernel returns for
-    // `b > n_bid`, so the surplus blocks cost a launch and nothing else.
-    const int threads = 32 * (int) s.idx_n_head;
-    /*
-    DPCT1049: The work-group size passed to the SYCL kernel may exceed the
-    limit. To get the device limit, query info::device::max_work_group_size.
-    Adjust the work-group size if needed.
-    */
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-        dpct::has_capability_or_fail(
-            strata::q_of(stream)->get_device(),
-            {sycl::aspect::fp64});
-
-        strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class qsa_index_kernel_bb65cd>>(
-                sycl::nd_range<3>(sycl::range(1, 1, (unsigned)max_blocks) *
-                                      sycl::range(1, 1, threads),
-                                  sycl::range(1, 1, threads)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        qsa_index_kernel(pooled, q_idx, bias, (int)s.idx_n_head,
-                                         (int)s.idx_dim, s.idx_block, step,
-                                         cell_scores);
-                    });
-    }
-    check_launch("qsa_index");
-    if (stream == nullptr) check_sync("qsa_index");
-}
-
-void topk_512_step(const float* cell_scores, const QsaShapes& s, int64_t cap, const int32_t* step,
-                   int32_t* ids, void* stream) {
-    validate(s, "topk_512");
-    if (step == nullptr) fail("topk_512: step is null");
-    // `cap` is checked against the GEOMETRY'S largest possible width rather than this token's, because this
-    // token's is a device value.  The two are the same guarantee: `width = min(n_kv, top_k + r - 1)` and
-    // `n_kv <= kTopkMaxCells`, so this is the most the kernel can ever write.
-    const int64_t width_max = qsa_selection_width(kTopkMaxCells, s);
-    if (cap < width_max) {
-        std::fprintf(stderr, "qsa: topk_512: cap %lld < the largest possible selection width %lld\n",
-                     (long long) cap, (long long) width_max);
-        std::exit(1);
-    }
-    // One block, so the launch is already constant; the kernel reads `n_kv` and `width` from `step`.
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class topk_kernel_97d5c9>>(
-                sycl::nd_range<3>(sycl::range(1, 1, TOPK_THREADS),
-                                  sycl::range(1, 1, TOPK_THREADS)),
-                exp_props, [=](sycl::nd_item<3> item_ct1) {
-                    topk_kernel(cell_scores, step, ids);
-                });
-    }
-    check_launch("topk_512");
-    if (stream == nullptr) check_sync("topk_512");
-}
-
-void kv_gather_step(const uint16_t* k_pool, const uint16_t* v_pool, const int32_t* page_table,
-                    const int32_t* ids, const int32_t* step, int64_t max_ids, const QsaShapes& s,
-                    uint16_t* k_scratch, uint16_t* v_scratch, void* stream) {
-    validate(s, "kv_gather");
-    if (step == nullptr) fail("kv_gather: step is null");
-    if (max_ids <= 0) return;
-    // THE GRID IS THE CAPACITY.  The kernel reads the real `n_ids` from `step` and its `if (i >= total) return;`
-    // guard leaves the surplus threads idle.
-    const long long total = max_ids * s.n_head_kv * (s.head_dim / 4);
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class kv_gather_kernel_3473e7>>(
-                sycl::nd_range<3>(sycl::range(1, 1, grid_for(total, 256)) *
-                                      sycl::range(1, 1, 256),
-                                  sycl::range(1, 1, 256)),
-                exp_props, [=](sycl::nd_item<3> item_ct1) {
-                    kv_gather_kernel(k_pool, v_pool, page_table, ids, step,
-                                     (int)s.n_head_kv, (int)s.head_dim,
-                                     (int)s.page_size, k_scratch, v_scratch);
-                });
-    }
-    check_launch("kv_gather");
-    if (stream == nullptr) check_sync("kv_gather");
-}
-
-void qsa_attend_step(const float *q, const uint16_t *k_scratch,
-                     const uint16_t *v_scratch, const int32_t *step,
-                     int64_t max_ids, const QsaShapes &s, float *attn,
-                     float *weights, void *stream) try {
-    validate(s, "qsa_attend");
-    if (step == nullptr) fail("qsa_attend: step is null");
-    if (max_ids <= 0) fail("qsa_attend: max_ids must be positive");
-    // THE SHARED SIZE IS THE CAPACITY.  Shared memory is part of the LAUNCH CONFIGURATION, so sizing it from
-    // this token's `n_ids` bakes the sequence length in: a captured layer would allocate room for token 1 and
-    // then index past it at token 500.  The kernel reads the real count from `step`, so a larger allocation is
-    // exactly what it wants.  The opt-in therefore happens once, for the capacity.
-    /*
-    DPCT1083: The size of local memory in the migrated code may be different
-    from the original code. Check that the allocated memory size in the migrated
-    code is correct.
-    */
-    const size_t smem = (size_t)(max_ids + 32) * sizeof(float);
-    // per DEVICE: the opt-in is a device setting (a layer split runs this on two cards)
-    static size_t s_configured_dev[64] = {};
-    int cur_dev = 0;
-    cur_dev = dpct::get_current_device_id();
-    size_t& s_configured = s_configured_dev[(cur_dev >= 0 && cur_dev < 64) ? cur_dev : 0];
-    if (smem > s_configured) {
-        int dev = 0, max_shared = 0;
-        dev = dpct::get_current_device_id();
-        /*
-        DPCT1019: local_mem_size in SYCL is not a complete equivalent of
-        cudaDevAttrMaxSharedMemoryPerBlockOptin in CUDA. You may need to adjust
-        the code.
-        */
-        max_shared = dpct::get_device(dev).get_local_mem_size();
-        max_shared = strata::smem_optin_of(max_shared);
-        if ((int) smem > max_shared) {
-            std::fprintf(stderr, "qsa: qsa_attend: max_ids %lld needs %zu B of shared, over the %d B limit\n",
-                         (long long) max_ids, smem, max_shared);
-            std::exit(1);
-        }
-        const dpct::err0 e =
-            /*
-            DPCT1027: The call to cudaFuncSetAttribute was replaced with 0
-            because SYCL currently does not support corresponding setting.
-            */
-            0;
-
-        s_configured = smem;
-    }
-    /*
-    DPCT1049: The work-group size passed to the SYCL kernel may exceed the
-    limit. To get the device limit, query info::device::max_work_group_size.
-    Adjust the work-group size if needed.
-    */
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        strata::q_of(stream)
-            ->submit([&](sycl::handler &cgh) {
-                sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
-                    sycl::range(smem), cgh);
-
-                cgh.parallel_for<
-                    dpct_kernel_name<class qsa_attend_kernel_6a355d>>(
-                    sycl::nd_range<3>(
-                        sycl::range(1, 1, (unsigned)s.n_head) *
-                            sycl::range(1, 1, (unsigned)s.head_dim),
-                        sycl::range(1, 1, (unsigned)s.head_dim)),
-                    exp_props,
-                    [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(
-                        32)]] {
-                        qsa_attend_kernel(
-                            q, k_scratch, v_scratch, step, (int)s.n_head,
-                            (int)s.n_head_kv, (int)s.head_dim, attn, weights,
-                            dpct_local_acc_ct1
-                                .get_multi_ptr<sycl::access::decorated::no>()
-                                .get());
-                    });
-            });
-    }
-    check_launch("qsa_attend");
-    if (stream == nullptr) check_sync("qsa_attend");
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
-
-// ================= host entry points =================
-
-void qsa_step_fill(int32_t* host_step, int64_t pos, const QsaShapes& s) {
-    if (host_step == nullptr) return;
-    if (pos < 0) fail("qsa_step_fill: pos < 0");
-    // ONE PLACE COMPUTES ALL FOUR, which is the whole reason the step state is a BUFFER rather than four
-    // separate parameters.  `n_kv`, `n_bid` and `width` are DERIVED from `pos`, so a caller filling them in
-    // itself could fill them inconsistently - and `qsa_index`'s host guard against exactly that inconsistency
-    // now has a single writer to check against instead of two independent arguments.
-    //
-    // This is the form the LAYER will use: every value a QSA kernel needs derives from one position, so one
-    // H2D per token updates all of them and no entry point takes a per-token scalar.
-    const int64_t n_kv = pos + 1;
-    host_step[kStepPos] = (int32_t) pos;
-    host_step[kStepNKv] = (int32_t) n_kv;
-    host_step[kStepNBid] = (int32_t) (n_kv / s.idx_block);
-    host_step[kStepWidth] = (int32_t) qsa_selection_width(n_kv, s);
-}
-
-void kv_append(uint16_t* k_pool, uint16_t* v_pool, const int32_t* page_table, int64_t pos,
-               const float* kcur, const float* vcur, const QsaShapes& s, void* stream) {
-    if (pos < 0) { validate(s, "kv_append"); fail("kv_append: pos < 0"); }
-    kv_append_step(k_pool, v_pool, page_table, step_upload(pos, -1, s), kcur, vcur, s, stream);
-}
-
-void indexer_key_append(const float* raw, const int32_t* pos_dev, int32_t pos_base, const float* w_k_norm,
-                        float eps, const QsaIndexerBuffers& b, const QsaShapes& s, const float* cos_tab,
-                        const float* sin_tab, void* stream) {
-    validate(s, "indexer_key_append");
-    if (pos_dev == nullptr) fail("indexer_key_append: pos_dev is null");
-    if (b.tail == nullptr || b.dead == nullptr || b.pooled == nullptr || b.block_pos == nullptr)
-        fail("indexer_key_append: the indexer buffers are not all set (tail/dead/pooled/block_pos)");
-    const int threads = (int) s.idx_dim;
-    /*
-    DPCT1083: The size of local memory in the migrated code may be different
-    from the original code. Check that the allocated memory size in the migrated
-    code is correct.
-    */
-    const size_t smem = (size_t)s.idx_dim * sizeof(double);
-    // **ONE LAUNCH, NO HOST BRANCH ON THE POSITION.**  The completion rotation is inside the kernel now.  The
-    // arguments here are identical for every token, which is the property a CUDA graph needs: this function can
-    // be captured and replayed, and the position arrives through `pos_dev` like every other kernel's data.
-    /*
-    DPCT1049: The work-group size passed to the SYCL kernel may exceed the
-    limit. To get the device limit, query info::device::max_work_group_size.
-    Adjust the work-group size if needed.
-    */
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-        dpct::has_capability_or_fail(
-            strata::q_of(stream)->get_device(),
-            {sycl::aspect::fp64});
-
-        strata::q_of(stream)
-            ->submit([&](sycl::handler &cgh) {
-                sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
-                    sycl::range(smem), cgh);
-
-                auto mrope_table_ct14 = mrope_table();
-
-                cgh.parallel_for<
-                    dpct_kernel_name<class indexer_key_append_kernel_9e74e0>>(
-                    sycl::nd_range<3>(sycl::range(1, 1, threads),
-                                      sycl::range(1, 1, threads)),
-                    exp_props, [=](sycl::nd_item<3> item_ct1) {
-                        indexer_key_append_kernel(
-                            raw, pos_dev, (int)pos_base, w_k_norm, eps, b.tail,
-                            b.dead, b.pooled, b.block_pos, (int)s.idx_dim,
-                            (int)s.idx_block, (int)s.n_rot, cos_tab, sin_tab,
-                            mrope_table_ct14,
-                            dpct_local_acc_ct1
-                                .get_multi_ptr<sycl::access::decorated::no>()
-                                .get());
-                    });
-            });
-    }
-    check_launch("indexer_key_append");
-    if (stream == nullptr) check_sync("indexer_key_append");
-}
-
-void qsa_index(const float* pooled, int64_t n_bid, const float* q_idx, const float* bias, const QsaShapes& s,
-               int64_t n_kv, float* cell_scores, void* stream) {
-    validate(s, "qsa_index");
-    if (n_bid < 0 || n_kv <= 0) fail("qsa_index: n_bid < 0 or n_kv <= 0");
-    // `n_kv`, `n_bid` and `width` are DERIVED from one position, so this refuses a caller whose two arguments
-    // disagree rather than launching a kernel that would score the wrong number of blocks.
-    if ((n_kv / s.idx_block) != n_bid) {
-        std::fprintf(stderr, "qsa: qsa_index: n_bid %lld is not n_kv %lld / r %lld\n", (long long) n_bid,
-                     (long long) n_kv, (long long) s.idx_block);
-        std::exit(1);
-    }
-    // THIS TOKEN'S counts as the CAPACITIES: correct for a direct launch, WRONG in a graph.  The layer passes a
-    // constant `max_blocks` from its state instead - see the note in `qsa.hpp`.
-    qsa_index_step(pooled, q_idx, bias, s, step_upload(n_kv - 1, n_kv, s), n_bid + 1, cell_scores, stream);
-}
-
-void topk_512(const float* cell_scores, int64_t n_kv, const QsaShapes& s, int64_t cap, int32_t* ids,
-              void* stream) {
-    validate(s, "topk_512");
-    if (n_kv <= 0) return;
-    if (n_kv > kTopkMaxCells) {
-        std::fprintf(stderr, "qsa: topk_512: n_kv %lld > kTopkMaxCells %lld (one block; phase 3 replaces this)\n",
-                     (long long) n_kv, (long long) kTopkMaxCells);
-        std::exit(1);
-    }
-    topk_512_step(cell_scores, s, cap, step_upload(n_kv - 1, n_kv, s), ids, stream);
-}
-
-void kv_gather(const uint16_t* k_pool, const uint16_t* v_pool, const int32_t* page_table, const int32_t* ids,
-               int64_t n_ids, const QsaShapes& s, uint16_t* k_scratch, uint16_t* v_scratch, void* stream) {
-    validate(s, "kv_gather");
-    if (n_ids <= 0) return;
-    kv_gather_step(k_pool, v_pool, page_table, ids, step_upload_width(n_ids, s), n_ids, s, k_scratch,
-                   v_scratch, stream);
-}
-
-void qsa_attend(const float* q, const uint16_t* k_scratch, const uint16_t* v_scratch, int64_t n_ids,
-                const QsaShapes& s, float* attn, float* weights, void* stream) {
-    validate(s, "qsa_attend");
-    if (n_ids < 0) fail("qsa_attend: n_ids < 0");
-    if (n_ids == 0) {
-        // The empty selection goes through the kernel's own zero path; `max_ids` must still be positive, so the
-        // wrapper gives it the geometry's capacity rather than 0.
-        qsa_attend_step(q, k_scratch, v_scratch, step_upload_width(0, s),
-                        qsa_selection_width(kTopkMaxCells, s), s, attn, weights, stream);
-        return;
-    }
-    qsa_attend_step(q, k_scratch, v_scratch, step_upload_width(n_ids, s), n_ids, s, attn, weights, stream);
-}
 
 /// The same multiply as `qsa_gate_apply_kernel` WITHOUT the fp16 round - see the header for why the caller
 /// whose weight is a K-quant needs the f32 form.  Identical arithmetic up to the last step.
@@ -1224,54 +550,6 @@ __dpct_inline__ void qsa_gate_apply_f32_kernel(const float *__restrict__ attn,
     out[i] = (float) ((double) attn[i] * sig);
 }
 
-void qsa_gate_apply_f32(const float* attn, const float* q_full, const QsaShapes& s, float* out, void* stream) {
-    validate(s, "qsa_gate_apply_f32");
-    const long long n = s.n_head * s.head_dim;
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-        dpct::has_capability_or_fail(
-            strata::q_of(stream)->get_device(),
-            {sycl::aspect::fp64});
-
-        strata::q_of(stream)
-            ->parallel_for<
-                dpct_kernel_name<class qsa_gate_apply_f32_kernel_7cff4f>>(
-                sycl::nd_range<3>(sycl::range(1, 1, grid_for(n, 256)) *
-                                      sycl::range(1, 1, 256),
-                                  sycl::range(1, 1, 256)),
-                exp_props, [=](sycl::nd_item<3> item_ct1) {
-                    qsa_gate_apply_f32_kernel(attn, q_full, (int)s.n_head,
-                                              (int)s.head_dim, out);
-                });
-    }
-    check_launch("qsa_gate_apply_f32");
-    if (stream == nullptr) check_sync("qsa_gate_apply_f32");
-}
-
-void qsa_gate_apply(const float* attn, const float* q_full, const QsaShapes& s, uint16_t* out, void* stream) {
-    validate(s, "qsa_gate_apply");
-    const long long n = s.n_head * s.head_dim;
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-        dpct::has_capability_or_fail(
-            strata::q_of(stream)->get_device(),
-            {sycl::aspect::fp64});
-
-        strata::q_of(stream)
-            ->parallel_for<
-                dpct_kernel_name<class qsa_gate_apply_kernel_650dec>>(
-                sycl::nd_range<3>(sycl::range(1, 1, grid_for(n, 256)) *
-                                      sycl::range(1, 1, 256),
-                                  sycl::range(1, 1, 256)),
-                exp_props, [=](sycl::nd_item<3> item_ct1) {
-                    qsa_gate_apply_kernel(attn, q_full, (int)s.n_head,
-                                          (int)s.head_dim, out);
-                });
-    }
-    check_launch("qsa_gate_apply");
-    if (stream == nullptr) check_sync("qsa_gate_apply");
-}
+#include "qsa.kern.inc"
 
 }  // namespace strata::kernels

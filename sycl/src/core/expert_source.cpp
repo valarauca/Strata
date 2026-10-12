@@ -1,8 +1,6 @@
 // src/core/expert_source.cpp - the adapter.  See the header for the three clauses of the contract.
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
-#include "strata/sycl_queue.hpp"
+#include "strata/ze/ze.hpp"
+#include "strata/intel_gpu.hpp"
 #include "strata/core/expert_source.hpp"
 #include "strata/core/remote_experts.hpp"
 #include "strata/core/peer_experts.hpp"
@@ -592,24 +590,15 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
 void FileExpertSource::close() {
     inputs_.clear();
     if (complement_arena_ != nullptr) {
-        if (complement_pinned_ && !complement_partial_)(void) DPCT_CHECK_ERROR(
-            sycl::free(complement_arena_, dpct::get_in_order_queue()));
+        if (complement_pinned_ && !complement_partial_) strata::ze::free(complement_arena_);
         else {
-            /*
-            DPCT1027: The call to cudaHostUnregister was replaced with 0
-            because SYCL currently does not support registering of existing host
-            memory for use by device. Use USM to allocate memory for use by host
-            and device.
-            */
-            if (complement_partial_)(void) 0;
             if (complement_locked_ > 0)
                 strata::platform::unlock_resident((uint8_t*) complement_arena_ + complement_lock_off_, complement_locked_);
             std::free(complement_arena_);
         }
     }
     if (xstage_ != nullptr) {
-        if (xstage_pinned_)(void)
-            DPCT_CHECK_ERROR(sycl::free(xstage_, dpct::get_in_order_queue()));
+        if (xstage_pinned_) strata::ze::free(xstage_);
         else std::free(xstage_);
     }
     xstage_ = nullptr;
@@ -1651,7 +1640,7 @@ bool FileExpertSource::pin_cache_complement(
     const ExpertCache &cache, std::string &err, bool pin,
     const std::vector<std::pair<int32_t, int32_t>> &additional_gpu_pairs,
     int64_t lend_from_slot, uint64_t headroom_bytes, uint64_t budget_bytes,
-    const std::vector<std::pair<int32_t, int32_t>> *rank) try {
+    const std::vector<std::pair<int32_t, int32_t>> *rank) {
     err.clear();
     const auto pin_t0 = std::chrono::steady_clock::now();
     if (base_ == nullptr) { err = "FileExpertSource: open the mapped experts before pinning a complement"; return false; }
@@ -1661,31 +1650,7 @@ bool FileExpertSource::pin_cache_complement(
         err = "FileExpertSource: the GPU expert cache is not fully filled";
         return false;
     }
-    const dpct::err0 sync =
-        DPCT_CHECK_ERROR(dpct::get_current_device().queues_wait_and_throw());
-    /*
-    DPCT1000: Error handling if-stmt was detected but could not be
-    rewritten.
-    */
-    if (sync != 0) {
-        /*
-        DPCT1009: SYCL reports errors using exceptions and does not use
-        error codes. Please replace the "get_error_string_dummy(...)" with a
-        real error-handling function.
-        */
-        /*
-        DPCT1001: The statement could not be removed.
-        */
-        err = std::string("FileExpertSource: GPU expert cache is not ready: ") +
-              dpct::get_error_string_dummy(sync);
-        /*
-        DPCT1010: SYCL uses exceptions to report errors and does not use
-        the error codes. The cudaGetLastError function call was replaced with 0.
-        You need to rewrite this code.
-        */
-        (void)0;
-        return false;
-    }
+    strata::ze::device_sync();
 
     // The GPU cache's experts, and the bytes each slot's expert takes here (for the lend region below).
     const int64_t n_slots = cache.slots();
@@ -1829,28 +1794,13 @@ bool FileExpertSource::pin_cache_complement(
     uint64_t lock_off = 0;      ///< where the working-set lock starts (after the registered prefix)
     std::string note;
     auto release = [&]() {
-        try {
-    if (arena == nullptr) return;
-        if (pinned_ok)(void)
-            DPCT_CHECK_ERROR(sycl::free(arena, dpct::get_in_order_queue()));
+        if (arena == nullptr) return;
+        if (pinned_ok) strata::ze::free(arena);
         else {
-            /*
-            DPCT1027: The call to cudaHostUnregister was replaced with 0
-            because SYCL currently does not support registering of existing host
-            memory for use by device. Use USM to allocate memory for use by host
-            and device.
-            */
-            if (partial_pin > 0)(void) 0;
             if (locked > 0) strata::platform::unlock_resident((uint8_t*) arena + lock_off, locked);
             std::free(arena);
         }
         arena = nullptr;
-    }
-    catch (sycl::exception const &exc) {
-      std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-                << ", line:" << __LINE__ << std::endl;
-      std::exit(1);
-    }
     };
     if (bytes > 0) {
         std::fprintf(stderr, "FileExpertSource: allocating %.2f GiB %s cache complement\n",
@@ -1858,54 +1808,15 @@ bool FileExpertSource::pin_cache_complement(
         log_complement_memory("before complement allocation", bytes);
         std::fflush(stderr);
         if (pin) {
-            const dpct::err0 allocated = DPCT_CHECK_ERROR(
-                arena = (void *)sycl::malloc_host((size_t)bytes,
-                                                  dpct::get_in_order_queue()));
-            if (allocated == 0) {
-                void* alias = nullptr;
-                const dpct::err0 aliased =
-                    DPCT_CHECK_ERROR(alias = (void *)arena);
-                if (aliased == 0 && alias != nullptr) {
-                    device = (const uint8_t*) alias;
-                    pinned_ok = true;
-                    note = "page-locked and mapped";
-                } else {
-                    /*
-                    DPCT1009: SYCL reports errors using exceptions and does
-                    not use error codes. Please replace the
-                    "get_error_string_dummy(...)" with a real error-handling
-                    function.
-                    */
-                    note = std::string("no device alias (") +
-                           dpct::get_error_string_dummy(aliased) + ")";
-                    /*
-                    DPCT1010: SYCL uses exceptions to report errors and
-                    does not use the error codes. The cudaGetLastError function
-                    call was replaced with 0. You need to rewrite this code.
-                    */
-                    (void)0;
-                    (void)DPCT_CHECK_ERROR(
-                        sycl::free(arena, dpct::get_in_order_queue()));
-                    arena = nullptr;
-                }
+            arena = strata::ze::malloc_host((size_t) bytes);
+            if (arena != nullptr) {
+                device = (const uint8_t*) arena;
+                pinned_ok = true;
+                note = "page-locked and mapped";
             } else {
                 // Refused (the driver's page-locked limit): the same bytes in ordinary memory, locked in the working
                 // set instead, as the arena does - resident either way, only copied by the CPU instead of by DMA.
-                /*
-                DPCT1009: SYCL reports errors using exceptions and does not
-                use error codes. Please replace the
-                "get_error_string_dummy(...)" with a real error-handling
-                function.
-                */
-                note = std::string("page-locking refused (") +
-                       dpct::get_error_string_dummy(allocated) + ")";
-                /*
-                DPCT1010: SYCL uses exceptions to report errors and does
-                not use the error codes. The cudaGetLastError function call was
-                replaced with 0. You need to rewrite this code.
-                */
-                (void)0;
-                arena = nullptr;
+                note = "page-locking refused (out of pinned host memory)";
             }
         }
         if (arena == nullptr) {
@@ -1955,45 +1866,9 @@ bool FileExpertSource::pin_cache_complement(
                             if (offsets[i] < want && offsets[i] + b > want) { w = offsets[i]; break; }
                         }
                         if (w == 0) break;
-                        /*
-                        DPCT1027: The call to cudaHostRegister was replaced
-                        with 0 because SYCL currently does not support
-                        registering of existing host memory for use by device.
-                        Use USM to allocate memory for use by host and device.
-                        */
-                        if (0 == 0) {
-                            void* alias = nullptr;
-                            if (DPCT_CHECK_ERROR(alias = (void *)arena) == 0 &&
-                                alias != nullptr) {
-                                device = (const uint8_t*) alias;
-                                partial_pin = w;
-                            } else {
-                                /*
-                                DPCT1010: SYCL uses exceptions to report
-                                errors and does not use the error codes. The
-                                cudaGetLastError function call was replaced with
-                                0. You need to rewrite this code.
-                                */
-                                (void)0;
-                                /*
-                                DPCT1027: The call to cudaHostUnregister
-                                was replaced with 0 because SYCL currently does
-                                not support registering of existing host memory
-                                for use by device. Use USM to allocate memory
-                                for use by host and device.
-                                */
-                                (void)0;
-                            }
-                            break;
-                        }
-                        /*
-                        DPCT1010: SYCL uses exceptions to report errors and
-                        does not use the error codes. The cudaGetLastError
-                        function call was replaced with 0. You need to rewrite
-                        this code.
-                        */
-                        (void)0;
-                        if (want <= step) break;
+                        device = (const uint8_t*) arena;
+                        partial_pin = w;
+                        break;
                     }
                     char msg[160];
                     std::snprintf(msg, sizeof msg, "%.2f GiB of it registered for the GPU (the hottest)",
@@ -2167,11 +2042,6 @@ bool FileExpertSource::pin_cache_complement(
     std::fflush(stderr);
     return true;
 }
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
 
 const uint8_t* FileExpertSource::resident_blob(size_t index) const {
     if (exchange_storage_.active()) return exchange_storage_.resident(index).host;
@@ -2196,8 +2066,7 @@ bool FileExpertSource::reserve_exchanges(int64_t n, std::string& err) {
     for (const uint64_t b : layer_blob_bytes_) blob = std::max(blob, b);
     if (blob == 0 || n <= 0) { err = "FileExpertSource: no expert geometry for the exchange buffers"; return false; }
     if (xstage_ != nullptr) {
-        if (xstage_pinned_)(void)
-            DPCT_CHECK_ERROR(sycl::free(xstage_, dpct::get_in_order_queue()));
+        if (xstage_pinned_) strata::ze::free(xstage_);
         else std::free(xstage_);
         xstage_ = nullptr;
         xstage_cap_ = 0;
@@ -2212,28 +2081,10 @@ bool FileExpertSource::reserve_exchanges(int64_t n, std::string& err) {
     const bool eligible = requested && uniform && complement_pinned_ && !complement_partial_ &&
                           complement_host_ && complement_device_ && complement_bytes_ > 0;
     const size_t total = (size_t) n * (size_t) blob;
-    void* p = nullptr;
-    /*
-    DPCT1048: The original value cudaHostAllocMapped is not meaningful in the
-    migrated code and was removed or replaced with 0. You may need to check the
-    migrated code.
-    */
-    /*
-    DPCT1048: The original value cudaHostAllocDefault is not meaningful in the
-    migrated code and was removed or replaced with 0. You may need to check the
-    migrated code.
-    */
-    if (DPCT_CHECK_ERROR(p = (void *)sycl::malloc_host(
-                             total, dpct::get_in_order_queue())) == 0 &&
-        p != nullptr) {
+    void* p = strata::ze::malloc_host(total);
+    if (p != nullptr) {
         xstage_pinned_ = true;
     } else {
-        /*
-        DPCT1010: SYCL uses exceptions to report errors and does not use
-        the error codes. The cudaGetLastError function call was replaced with 0.
-        You need to rewrite this code.
-        */
-        (void)0;
         p = std::malloc(total);
         xstage_pinned_ = false;
         if (p == nullptr) { err = "FileExpertSource: cannot allocate the exchange buffers"; return false; }
@@ -2243,9 +2094,8 @@ bool FileExpertSource::reserve_exchanges(int64_t n, std::string& err) {
     xstage_blob_ = blob;
     if (requested) {
         std::string reason = "requires equal-size expert blocks and a fully mapped/pinned RAM complement";
-        void* device = nullptr;
-        if (eligible && xstage_pinned_ &&
-            DPCT_CHECK_ERROR(device = (void *)p) == 0 && device) {
+        void* device = p;
+        if (eligible && xstage_pinned_ && device) {
             try {
                 if (exchange_storage_.initialize(complement_offsets_, (uint8_t*)complement_host_, complement_device_,
                         complement_bytes_, xstage_, (const uint8_t*)device, (size_t)n, (size_t)blob, reason)) {
@@ -2254,12 +2104,6 @@ bool FileExpertSource::reserve_exchanges(int64_t n, std::string& err) {
                 }
             } catch (const std::bad_alloc&) { reason = "buffer metadata allocation failed"; }
         } else if (eligible) {
-            /*
-            DPCT1010: SYCL uses exceptions to report errors and does not use
-            the error codes. The cudaGetLastError function call was replaced
-            with 0. You need to rewrite this code.
-            */
-            (void)0;
             reason = "exchange buffers could not be pinned and mapped";
         }
         if (!exchange_storage_.active())
@@ -2823,10 +2667,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
 }
 
 void expert_hit_run(void *user, void *stream, HitPhase phase,
-                    const int32_t *ids, int64_t k) try {
+                    const int32_t *ids, int64_t k) {
     ExpertDispatch& d = *(ExpertDispatch*) user;
     if (d.failed) return;
-    dpct::queue_ptr cs = strata::q_of(stream);
+    strata::ze::Stream* cs = strata::ze::stream_of(stream);
 
     if (phase == HitPhase::Launch) {
         d.decided = false;
@@ -2879,29 +2723,9 @@ void expert_hit_run(void *user, void *stream, HitPhase phase,
         // `hit_out` is ZEROED rather than overwritten: the kernel writes only the rows this layer's hits own,
         // so a row that was a hit last layer and a miss this one would still hold last layer's expert and
         // `add_inplace` would sum it in.  Finite, plausible, wrong.
-        if (DPCT_CHECK_ERROR(cs->memset(
-                d.hit_out, 0, (size_t)d.parts_elems * sizeof(float))) != 0 ||
-            /*
-            DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy
-            API. While the origin API might be synchronous, it depends on the
-            type of operand memory, so you may need to call wait() on event
-            return by memcpy API to ensure synchronization behavior.
-            */
-            DPCT_CHECK_ERROR(
-                cs->memcpy(d.d_slot, d.h_slot.data(), list_bytes)) != 0 ||
-            /*
-            DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy
-            API. While the origin API might be synchronous, it depends on the
-            type of operand memory, so you may need to call wait() on event
-            return by memcpy API to ensure synchronization behavior.
-            */
-            DPCT_CHECK_ERROR(cs->memcpy(d.d_dst, d.h_dst.data(), list_bytes)) !=
-                0) {
-            d.hit_fail = "the hit list could not be staged";
-            d.failed = true;
-            d.fail = d.hit_fail;
-            return;
-        }
+        cs->memset(d.hit_out, 0, (size_t) d.parts_elems * sizeof(float));
+        cs->memcpy(d.d_slot, d.h_slot.data(), list_bytes);
+        cs->memcpy(d.d_dst, d.h_dst.data(), list_bytes);
         // The activation is quantized HERE rather than reused from `s.moe.x_q8_0`, which `post[l-1]` wrote from
         // the PREVIOUS layer's `mixed`.  `pre[l]` has since overwritten `mixed`, so that buffer is a layer stale
         // - and a stale activation produces a perfectly finite expert for the wrong input.
@@ -2926,11 +2750,10 @@ void expert_hit_run(void *user, void *stream, HitPhase phase,
                 d.x_q8_0_hit, d.hit_scratch, d.hit_out, cs, d.x_q8_0_hit_scale);
         d.hit_pending = true;
         if (d.hit_done != nullptr)
-            dpct::sync_barrier((dpct::event_ptr)d.hit_done, cs);
+            cs->record(*(strata::ze::Event*) d.hit_done);
         // The A/B arm: ONE driver entry here, and nothing else changes.  If the work was waiting for the host
         // to enter the driver, this is what lets it start while the pool runs.
-        if (d.hit_poke && d.hit_done != nullptr)(void)
-            dpct::sycl_event_query((dpct::event_ptr)d.hit_done);
+        if (d.hit_poke && d.hit_done != nullptr) (void) ((strata::ze::Event*) d.hit_done)->query();
         return;
     }
 
@@ -2941,17 +2764,10 @@ void expert_hit_run(void *user, void *stream, HitPhase phase,
     // so it is the LAST chance to observe a late start: a NOT-READY here means the work had not finished by the
     // time the pool returned, and with no poke in front of it that can only be because it began after.
     if (d.hit_done != nullptr) {
-        if (((dpct::event_ptr)d.hit_done)
-                ->get_info<sycl::info::event::command_execution_status>() ==
-            sycl::info::event_command_status::complete)++ d.hit_ready;
+        if (((strata::ze::Event*) d.hit_done)->query()) ++d.hit_ready;
         else ++d.hit_late;
     }
     strata::kernels::add_inplace(d.parts_out, d.hit_out, d.parts_elems, cs);
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
 }
 
 // ================================ THE RESIDENT ARENA (R2.1) ================================
@@ -3475,13 +3291,9 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     std::thread reg;
     if (deferred) {
         int dev = 0;
-        dev = dpct::get_current_device_id();
+        dev = strata::ze::current_device();
         reg = std::thread([a, &ready, dev] {
-            /*
-            DPCT1093: The "dev" device may be not the one intended for use.
-            Adjust the selected device if needed.
-            */
-            dpct::select_device(dev);
+            strata::ze::set_device(dev);
             a->register_slices(ready);
         });
     }
@@ -3542,20 +3354,7 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     slice_bytes_ = a->slice_bytes;
     if (a->registered_bytes > 0) {
         std::vector<uint64_t> starts = a->slice_bytes > 0 ? a->slice_starts : std::vector<uint64_t>{0};
-        for (uint64_t off : starts) {
-            void* d = nullptr;
-            if (DPCT_CHECK_ERROR(d = (void *)(void *)(base_ + off)) != 0) {
-                /*
-                DPCT1010: SYCL uses exceptions to report errors and does
-                not use the error codes. The cudaGetLastError function call was
-                replaced with 0. You need to rewrite this code.
-                */
-                (void)0;
-                dev_slice_.clear();
-                break;
-            }
-            dev_slice_.push_back((const uint8_t*) d);
-        }
+        for (uint64_t off : starts) dev_slice_.push_back((const uint8_t*) (base_ + off));
     }
     blobs_ = n_layers * n_expert;
     n_expert_ = n_expert;

@@ -17,6 +17,10 @@
 #include "strata/device/dpct/util.hpp"
 #include "strata/device/dpct/math.hpp"
 
+// The migrated kernels test __CUDA_ARCH__ as DPCT_COMPATIBILITY_TEMP; dpct.hpp set it to 900 for the reference build.
+#ifndef DPCT_COMPATIBILITY_TEMP
+#define DPCT_COMPATIBILITY_TEMP (900)
+#endif
 #ifndef __dpct_inline__
 #define __dpct_inline__ __inline__ __attribute__((always_inline))
 #endif

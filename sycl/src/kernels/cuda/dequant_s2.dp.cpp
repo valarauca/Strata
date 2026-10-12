@@ -8,13 +8,8 @@
 //
 // Naive on purpose: one thread per block, no vectors, no shared memory, no unrolling.  Phase 3 changes this
 // file and the parity test in src/kernels/dequant_s2_parity.cpp is what says whether a change is still right.
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
+#include "strata/port.hpp"
 #include "strata/kernels/dequant_s2.hpp"
-
-#include <cstdio>
-#include <cstdlib>
 
 namespace strata::kernels {
 namespace {
@@ -42,31 +37,6 @@ __dpct_inline__ void dequant_s2_kernel(const uint8_t *__restrict__ codes,
 
 }  // namespace
 
-void dequant_s2(const uint8_t *codes, const float *scales, float *out,
-                int64_t n_blocks) try {
-    if (n_blocks <= 0) return;
-    const int threads = 256;
-    const long long blocks = (n_blocks + threads - 1) / threads;
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        dpct::get_in_order_queue()
-            .parallel_for<dpct_kernel_name<class dequant_s2_kernel_bdb833>>(
-                sycl::nd_range<3>(sycl::range(1, 1, (unsigned)blocks) *
-                                      sycl::range(1, 1, threads),
-                                  sycl::range(1, 1, threads)),
-                exp_props, [=](sycl::nd_item<3> item_ct1) {
-                    dequant_s2_kernel(codes, scales, out, n_blocks);
-                });
-    }
-    const dpct::err0 e =
-        DPCT_CHECK_ERROR(dpct::get_current_device().queues_wait_and_throw());
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
+#include "dequant_s2.kern.inc"
 
 }  // namespace strata::kernels

@@ -8,8 +8,7 @@
 #include <utility>
 #include <fcntl.h>
 #include <unistd.h>
-#include <dpct/dpct.hpp>
-#include <sycl/sycl.hpp>
+#include "strata/ze/ze.hpp"
 #include <thread>
 
 namespace strata::core {
@@ -21,7 +20,7 @@ constexpr size_t kRing = 512;   // blobs alive at once: the prompt path holds a 
 GgufExpertSource::~GgufExpertSource() { close(); }
 
 void GgufExpertSource::close() {
-    for (uint8_t* c : mirror_chunks_) if (c) sycl::free(c, dpct::get_in_order_queue());
+    for (uint8_t* c : mirror_chunks_) if (c) strata::ze::free(c);
     mirror_chunks_.clear();
     mirror_bytes_ = 0; mirror_ptr_.clear(); layer_first_.clear();
     for (int fd : fds_) if (fd >= 0) ::close(fd);
@@ -138,7 +137,7 @@ int64_t GgufExpertSource::mirror(const std::vector<std::pair<int64_t, int64_t>>&
     struct ChunkCleanup {
         std::vector<uint8_t*>& v;
         bool armed = true;
-        ~ChunkCleanup() { if (armed) for (uint8_t* c : v) if (c) sycl::free(c, dpct::get_in_order_queue()); }
+        ~ChunkCleanup() { if (armed) for (uint8_t* c : v) if (c) strata::ze::free(c); }
     } cleanup{chunks};
     std::vector<uint8_t*> ptrs(take.size(), nullptr);
     uint64_t placed = 0;
@@ -149,15 +148,9 @@ int64_t GgufExpertSource::mirror(const std::vector<std::pair<int64_t, int64_t>>&
         if (cur == nullptr || cur_off + b > cur_size) {
             // never smaller than one blob, so a single blob past kChunk still fits its chunk
             const uint64_t want = std::max(b, std::min<uint64_t>(kChunk, total - placed));
-            uint8_t* nc = nullptr;
-            try {
-                nc = (uint8_t*) sycl::malloc_host((size_t) want, dpct::get_in_order_queue());
-            } catch (const sycl::exception& ex) {
-                err = std::string("mirror: ") + ex.what();
-            }
+            uint8_t* nc = (uint8_t*) strata::ze::malloc_host((size_t) want);
             if (nc == nullptr) {
-                if (err.empty())
-                    err = "mirror: no pinned host memory for " + std::to_string(want >> 20) + " MiB";
+                err = "mirror: no pinned host memory for " + std::to_string(want >> 20) + " MiB";
                 return -1;
             }
             chunks.push_back(nc);
@@ -187,7 +180,7 @@ int64_t GgufExpertSource::mirror(const std::vector<std::pair<int64_t, int64_t>>&
         err = "mirror: reading an expert from the GGUF failed";
         return -1;
     }
-    for (uint8_t* c : mirror_chunks_) if (c) sycl::free(c, dpct::get_in_order_queue());
+    for (uint8_t* c : mirror_chunks_) if (c) strata::ze::free(c);
     mirror_chunks_ = std::move(chunks);
     cleanup.armed = false;                                  // the chunks now belong to the object
     mirror_bytes_ = total;

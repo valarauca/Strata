@@ -1,4 +1,4 @@
-// SYCL port: upstream's src/platform/direct_file.cpp with a deeper default read queue on Linux (see io_threads below).
+// Intel engine: upstream's src/platform/direct_file.cpp with a deeper default read queue on Linux (see io_threads below).
 // src/platform/direct_file.cpp - see include/strata/platform/direct_file.hpp.
 #include "strata/platform/direct_file.hpp"
 
@@ -311,8 +311,8 @@ bool DirectFile::open(const std::string& path, std::string& err) {
     struct stat st;
     if (fstat(impl_->fd, &st) != 0) { err = "DirectFile: cannot size " + path; close(); return false; }
     impl_->size = (uint64_t) st.st_size;
-    // SYCL port (the B70 box, 2026-09-30): the PLE rows of a 2,184-token prompt are ~27k random 4 KB O_DIRECT reads; with
-    // 16 threads they took 466 ms (p50 1.0 ms per read), with 64 332 ms (0.7 ms) - the drive wants a deeper queue than
+    // The B70 box, 2026-09-30: the PLE rows of a 2,184-token prompt are ~27k random 4 KB O_DIRECT reads; with 16
+    // threads they took 466 ms (p50 1.0 ms per read), with 64 332 ms (0.7 ms) - the drive wants a deeper queue than
     // 16 blocking threads give it. STRATA_IO_THREADS still overrides.
     const int n = io_threads(64);
     for (int i = 0; i < n; ++i) impl_->pool.emplace_back([this] { impl_->worker(); });

@@ -18,29 +18,17 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
-#include "strata/sycl_queue.hpp"
+#include "strata/port.hpp"
 #include "strata/kernels/native_flash_attn.hpp"
 #include <cfloat>
 #include <cstddef>
 #include <cstdint>
-#include <limits>
-#include <stdexcept>
-#include <string>
-#include <cmath>
 
 namespace strata::kernels {
 namespace {
 template <int Width> __dpct_inline__ float warp_sum(float x) {
 #pragma unroll
     for (int offset = Width / 2; offset; offset >>= 1)
-        /*
-        DPCT1108: '__shfl_xor_sync' was migrated with the experimental
-        feature masked sub_group function which may not be supported by all
-        compilers or runtimes. You may need to adjust the code.
-        */
         x += dpct::experimental::permute_sub_group_by_xor(
             0xffffffffu, sycl::ext::oneapi::this_work_item::get_sub_group(), x,
             offset, Width);
@@ -49,11 +37,6 @@ template <int Width> __dpct_inline__ float warp_sum(float x) {
 __dpct_inline__ float warp_max(float x) {
 #pragma unroll
     for (int offset = 16; offset; offset >>= 1)
-        /*
-        DPCT1108: '__shfl_xor_sync' was migrated with the experimental
-        feature masked sub_group function which may not be supported by all
-        compilers or runtimes. You may need to adjust the code.
-        */
         x = sycl::fmax(x,
                        dpct::experimental::permute_sub_group_by_xor(
                            0xffffffffu,
@@ -65,12 +48,6 @@ __dpct_inline__ float warp_max(float x) {
 // D=256,ncols=1,F16/F16; 128 threads, nthreads_KQ=nthreads_V=8,
 // four values (float2) per load, four V columns per iteration. Padded length256
 // gives ntiles_KV=ceil(256/D)=1, so the pinned launcher selects grid.y=1.
-/*
-DPCT1110: The total declared local variable size in device function attend
-exceeds 128 bytes and may cause high register pressure. Consult with your
-hardware vendor to find the total register size available and adjust the code,
-or use smaller sub-group size to avoid high register pressure.
-*/
 __dpct_inline__ void
 attend(const float *__restrict__ q, const sycl::half *__restrict__ k,
        const sycl::half *__restrict__ v, const int32_t *__restrict__ step,
@@ -155,11 +132,6 @@ attend(const float *__restrict__ q, const sycl::half *__restrict__ k,
         }
 #pragma unroll
         for (int offset = 8; offset < 32; offset <<= 1)
-            /*
-            DPCT1108: '__shfl_xor_sync' was migrated with the experimental
-            feature masked sub_group function which may not be supported by all
-            compilers or runtimes. You may need to adjust the code.
-            */
             next_max = sycl::fmax(
                 next_max,
                 dpct::experimental::permute_sub_group_by_xor(
@@ -201,41 +173,13 @@ attend(const float *__restrict__ q, const sycl::half *__restrict__ k,
                     // Later columns use fma(V,w,acc). Explicit intrinsics retain
                     // that order despite this adapter's masked-load branches.
                     if (k0 == 0) {
-                        /*
-                        DPCT1013: The rounding mode could not be specified
-                        and the generated code may have different accuracy than
-                        the original code. Verify the correctness. SYCL math
-                        built-in function rounding mode is aligned with OpenCL
-                        C 1.2 standard.
-                        */
                         vkq[i0 / 8 + j].x() =
                             sycl::fma(rescale, vkq[i0 / 8 + j].x(), a * weight);
-                        /*
-                        DPCT1013: The rounding mode could not be specified
-                        and the generated code may have different accuracy than
-                        the original code. Verify the correctness. SYCL math
-                        built-in function rounding mode is aligned with OpenCL
-                        C 1.2 standard.
-                        */
                         vkq[i0 / 8 + j].y() =
                             sycl::fma(rescale, vkq[i0 / 8 + j].y(), b * weight);
                     } else {
-                        /*
-                        DPCT1013: The rounding mode could not be specified
-                        and the generated code may have different accuracy than
-                        the original code. Verify the correctness. SYCL math
-                        built-in function rounding mode is aligned with OpenCL
-                        C 1.2 standard.
-                        */
                         vkq[i0 / 8 + j].x() =
                             sycl::fma(a, weight, vkq[i0 / 8 + j].x());
-                        /*
-                        DPCT1013: The rounding mode could not be specified
-                        and the generated code may have different accuracy than
-                        the original code. Verify the correctness. SYCL math
-                        built-in function rounding mode is aligned with OpenCL
-                        C 1.2 standard.
-                        */
                         vkq[i0 / 8 + j].y() =
                             sycl::fma(b, weight, vkq[i0 / 8 + j].y());
                     }
@@ -244,36 +188,14 @@ attend(const float *__restrict__ q, const sycl::half *__restrict__ k,
         }
     }
     if (warp == 0) { max_shared[lane] = -FLT_MAX / 2.0f; sum_shared[lane] = 0.0f; }
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
     if (lane == 0) max_shared[warp] = maximum;
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
     const float global_max = warp_max(max_shared[lane]);
     const float rescale = sycl::native::exp(maximum - global_max);
 #pragma unroll
     for (int i = 0; i < 16; ++i) {
-        /*
-        DPCT1013: The rounding mode could not be specified and the
-        generated code may have different accuracy than the original code.
-        Verify the correctness. SYCL math built-in function rounding mode is
-        aligned with OpenCL C 1.2 standard.
-        */
         vkq[i].x() = vkq[i].x() * rescale;
-        /*
-        DPCT1013: The rounding mode could not be specified and the
-        generated code may have different accuracy than the original code.
-        Verify the correctness. SYCL math built-in function rounding mode is
-        aligned with OpenCL C 1.2 standard.
-        */
         vkq[i].y() = vkq[i].y() * rescale;
     }
 #pragma unroll
@@ -288,11 +210,6 @@ attend(const float *__restrict__ q, const sycl::half *__restrict__ k,
     sum *= rescale;
     sum = warp_sum<32>(sum);
     if (lane == 0) sum_shared[warp] = sum;
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
     sum = warp_sum<32>(sum_shared[lane]);
 #pragma unroll
@@ -307,76 +224,8 @@ attend(const float *__restrict__ q, const sycl::half *__restrict__ k,
         out[head * 256 + i0 + tid] = result / sum;
     }
 }
-struct Span { const void* p; std::size_t n, alignment; };
-void validate_spans(const Span* spans, int count) {
-    for (int i = 0; i < count; ++i) {
-        const auto a = reinterpret_cast<std::uintptr_t>(spans[i].p);
-        if (!a || a % spans[i].alignment || spans[i].n > UINTPTR_MAX - a)
-            throw std::invalid_argument("native FlashAttention requires nonnull aligned bounded spans");
-        for (int j = 0; j < i; ++j) {
-            const auto b = reinterpret_cast<std::uintptr_t>(spans[j].p);
-            if (a < b + spans[j].n && b < a + spans[i].n)
-                throw std::invalid_argument("native FlashAttention requires disjoint buffers");
-        }
-    }
-}
 } // namespace
 
-void native_flash_attn_short_step(const float* q, const uint16_t* k, const uint16_t* v,
-                                  const int32_t* step, int64_t capacity, int max_context,
-                                  const QsaShapes& shapes, float* output, int32_t* status,
-                                  const uint16_t* mask, void* stream) {
-    if (!stream || shapes.n_head != 24 || shapes.n_head_kv != 2 || shapes.head_dim != 256 ||
-        shapes.idx_block != 4 || shapes.idx_top_k < 256 || capacity < 256 ||
-        uint64_t(capacity) > std::numeric_limits<std::size_t>::max() / 1024 ||
-        max_context < 1 || max_context > 256)
-        throw std::invalid_argument("native FlashAttention supports only Q24x256/KV2x256, capacity>=256 and context1..256 on an explicit stream");
-    const std::size_t kv_bytes = std::size_t(capacity) * 1024;
-    const Span spans[] = {{q, 24 * 256 * 4, 4}, {k, kv_bytes, 2}, {v, kv_bytes, 2},
-                          {step, kStepCount * 4, 4}, {output, 24 * 256 * 4, 4},
-                          {status, 4, 4}, {mask, 256 * 2, 2}};
-    validate_spans(spans, mask ? 7 : 6);
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-        dpct::has_capability_or_fail(
-            ((sycl::queue *)(strata::q_of(stream)))
-                ->get_device(),
-            {sycl::aspect::fp16});
+#include "native_flash_attn.kern.inc"
 
-        ((sycl::queue *)(strata::q_of(stream)))
-            ->parallel_for<dpct_kernel_name<class attend_9d5505>>(
-                sycl::nd_range<3>(sycl::range(1, 1, 24) * sycl::range(1, 4, 32),
-                                  sycl::range(1, 4, 32)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        attend(q, reinterpret_cast<const sycl::half *>(k),
-                               reinterpret_cast<const sycl::half *>(v), step,
-                               max_context, 256, 0.0625f, output, status,
-                               reinterpret_cast<const sycl::half *>(mask));
-                    });
-    }
-    /*
-    DPCT1010: SYCL uses exceptions to report errors and does not use the
-    error codes. The cudaGetLastError function call was replaced with 0. You
-    need to rewrite this code.
-    */
-    const auto result = 0;
-    /*
-    DPCT1000: Error handling if-stmt was detected but could not be
-    rewritten.
-    */
-    if (result != 0)
-        /*
-        DPCT1009: SYCL reports errors using exceptions and does not use
-        error codes. Please replace the "get_error_string_dummy(...)" with a
-        real error-handling function.
-        */
-        /*
-        DPCT1001: The statement could not be removed.
-        */
-        throw std::runtime_error(std::string("native FlashAttention launch: ") +
-                                 dpct::get_error_string_dummy(result));
-}
 } // namespace strata::kernels

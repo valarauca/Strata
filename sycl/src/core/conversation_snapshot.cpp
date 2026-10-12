@@ -1,6 +1,4 @@
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
+#include "strata/ze/ze.hpp"
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "conversation_checked.hpp"
@@ -111,26 +109,13 @@ bool valid(const QsaState& st, const Layout& l, int64_t upto, std::string& error
     return true;
 }
 
-bool transfer(void *dst, const void *src, size_t n, std::string &error) try {
+bool transfer(void *dst, const void *src, size_t n, std::string &error) {
     if (!n) return true;
     if (!src || !dst) { error = "conversation snapshot: missing state buffer"; return false; }
     // Default handles both device allocations and device-mapped host pool aliases.
-    const dpct::err0 e =
-        DPCT_CHECK_ERROR(dpct::get_in_order_queue().memcpy(dst, src, n).wait());
-    if (e == 0) return true;
-    /*
-    DPCT1009: SYCL reports errors using exceptions and does not use error
-    codes. Please replace the "get_error_string_dummy(...)" with a real
-    error-handling function.
-    */
-    error = std::string("conversation snapshot copy: ") +
-            dpct::get_error_string_dummy(e);
-    return false;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+    strata::ze::default_stream().memcpy(dst, src, n);
+    strata::ze::default_stream().sync();
+    return true;
 }
 } // namespace
 
@@ -233,21 +218,7 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
         strata::kernels::kv_ring_restore(qsa_attn_pools(st), st.host, qsa_kv_format(st),
                                         std::max<int64_t>(0, end - st.n_slots), end, st.n_slots, shapes, nullptr);
     }
-    /*
-    DPCT1010: SYCL uses exceptions to report errors and does not use the
-    error codes. The cudaGetLastError function call was replaced with 0. You
-    need to rewrite this code.
-    */
-    const auto status = 0;
-    if (status == 0) return true;
-    /*
-    DPCT1009: SYCL reports errors using exceptions and does not use error
-    codes. Please replace the "get_error_string_dummy(...)" with a real
-    error-handling function.
-    */
-    error = std::string("conversation snapshot residency restore: ") +
-            dpct::get_error_string_dummy(status);
-    return false;
+    return true;
 }
 
 bool conversation_kv_part_sizes(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index,

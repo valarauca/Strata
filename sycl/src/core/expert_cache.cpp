@@ -1,15 +1,12 @@
-#define DPCT_COMPAT_RT_VERSION 12080
 // src/core/expert_cache.cpp - R4's slot storage and residency table.  Read the
 // header first.
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
-#include "strata/sycl_queue.hpp"
+#include "strata/ze/ze.hpp"
+#include "strata/intel_gpu.hpp"
 #include "strata/core/expert_cache.hpp"
 
 // #533's segmented cache uses CUDA's virtual memory management (cuMem*): not on HIP, neither the RDNA backend nor
 // the gfx906 compat build (PR #638), which compiles this file as HIP without STRATA_USE_HIP
-#define STRATA_EC_NO_VMM 1   // SYCL port: no driver virtual memory management on Level Zero (--vram-elastic is CUDA-only, #533)
+#define STRATA_EC_NO_VMM 1   // no driver virtual memory management on Level Zero (--vram-elastic is CUDA-only, #533)
 
 #if !defined(STRATA_EC_NO_VMM)
    // #533: the virtual memory management types (the functions come through the
@@ -66,18 +63,13 @@ static unsigned long long own_drm_local_bytes() {
 // See the header.  NVIDIA's DGX Spark Porting Guide (section 5.5, "Memory reporting on UMA systems") recommends the same:
 // not to rely on cudaMemGetInfo alone but to count the memory the OS can reclaim.  Swap is not counted here (unlike
 // NVIDIA's reference snippet): an expert cache that pushes the system into swap would be far slower than a smaller one.
-size_t device_free_bytes() try {
+size_t device_free_bytes() {
     size_t free_b = 0, total_b = 0;
-    /*
-    DPCT1106: 'cudaMemGetInfo' was migrated with the Intel extensions for
-    device information which may not be supported by all compilers or runtimes.
-    You may need to adjust the code.
-    */
-    dpct::get_current_device().get_memory_info(free_b, total_b);
+    strata::ze::mem_get_info(strata::ze::current_device(), &free_b, &total_b);
     // #1440: own_drm_local_bytes() sums every DRM fd of the process, i.e. both cards on a layer split, and would charge the
     // first card's cache to the second. With more than one GPU it runs only where the driver reports the whole card as
     // free (Arc A750/i915); a one-GPU run keeps the figure it always had.
-    if (const unsigned long long own = (free_b + (16ull << 20) >= total_b || dpct::device_count() <= 1)
+    if (const unsigned long long own = (free_b + (16ull << 20) >= total_b || strata::ze::device_count() <= 1)
                                            ? own_drm_local_bytes() : 0ull;
         own > 0 && total_b > own && total_b - own < free_b) {
         static std::atomic<bool> said{false};
@@ -91,15 +83,15 @@ size_t device_free_bytes() try {
     bool unified_memory = false;
     {
         int dev = 0, v = 0;
-        if (DPCT_CHECK_ERROR(dev = dpct::get_current_device_id()) == 0 &&
-            dev >= 0 && dev < 64) {
+        dev = strata::ze::current_device();
+        if (dev >= 0 && dev < 64) {
             int c = uma_cache[dev].load(std::memory_order_acquire);
             if (c == 0) {
-                c = DPCT_CHECK_ERROR(
-                        v = dpct::get_device(dev).get_integrated()) == 0 &&
-                            v
-                        ? 1
-                        : 2;
+                ze_device_properties_t props{};
+                props.stype = ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES;
+                v = zeDeviceGetProperties(strata::ze::device_handle(dev), &props) == ZE_RESULT_SUCCESS &&
+                    (props.flags & ZE_DEVICE_PROPERTY_FLAG_INTEGRATED) != 0;
+                c = v ? 1 : 2;
                 uma_cache[dev].store(c, std::memory_order_release);
             }
             unified_memory = c == 1;
@@ -129,11 +121,6 @@ size_t device_free_bytes() try {
     }
 #endif
     return free_b;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
 }
 
 bool read_expert_profile(const std::string& path, int64_t n_layers, int64_t n_expert,
@@ -273,57 +260,34 @@ ExpertCache::~ExpertCache() { close(); }
 #if !defined(STRATA_EC_NO_VMM)
 namespace {
 struct Vmm {
-    int(CUDAAPI *device_get)(int *, int) = nullptr;
-    int(CUDAAPI *attribute)(int *, CUdevice_attribute, int) = nullptr;
-    int(CUDAAPI *granularity)(
-        size_t *, const dpct::experimental::mem_prop *,
-        sycl::ext::oneapi::experimental::granularity_mode) = nullptr;
-    int(CUDAAPI *reserve)(dpct::device_ptr *, size_t, size_t, dpct::device_ptr,
-                          unsigned long long) = nullptr;
-    int(CUDAAPI *address_free)(dpct::device_ptr, size_t) = nullptr;
-    int(CUDAAPI *create)(dpct::experimental::physical_mem_ptr *, size_t,
-                         const dpct::experimental::mem_prop *,
-                         unsigned long long) = nullptr;
-    int(CUDAAPI *release)(dpct::experimental::physical_mem_ptr) = nullptr;
-    int(CUDAAPI *map)(dpct::device_ptr, size_t, size_t,
-                      dpct::experimental::physical_mem_ptr,
-                      unsigned long long) = nullptr;
-    int(CUDAAPI *unmap)(dpct::device_ptr, size_t) = nullptr;
-    int(CUDAAPI *set_access)(dpct::device_ptr, size_t,
-                             const dpct::experimental::mem_access_desc *,
-                             size_t) = nullptr;
+    CUresult (CUDAAPI* device_get)(CUdevice*, int) = nullptr;
+    CUresult (CUDAAPI* attribute)(int*, CUdevice_attribute, CUdevice) = nullptr;
+    CUresult (CUDAAPI* granularity)(size_t*, const CUmemAllocationProp*, CUmemAllocationGranularity_flags) = nullptr;
+    CUresult (CUDAAPI* reserve)(CUdeviceptr*, size_t, size_t, CUdeviceptr, unsigned long long) = nullptr;
+    CUresult (CUDAAPI* address_free)(CUdeviceptr, size_t) = nullptr;
+    CUresult (CUDAAPI* create)(CUmemGenericAllocationHandle*, size_t, const CUmemAllocationProp*,
+                               unsigned long long) = nullptr;
+    CUresult (CUDAAPI* release)(CUmemGenericAllocationHandle) = nullptr;
+    CUresult (CUDAAPI* map)(CUdeviceptr, size_t, size_t, CUmemGenericAllocationHandle, unsigned long long) = nullptr;
+    CUresult (CUDAAPI* unmap)(CUdeviceptr, size_t) = nullptr;
+    CUresult (CUDAAPI* set_access)(CUdeviceptr, size_t, const CUmemAccessDesc*, size_t) = nullptr;
     bool ok = false;
 };
 
-template <class F> bool entry(const char *name, F &f) try {
+template <class F> bool entry(const char* name, F& f) {
     void* p = nullptr;
     cudaDriverEntryPointQueryResult q{};
-#if DPCT_COMPAT_RT_VERSION >= 12050
-    /*
-    DPCT1007: Migration of cudaGetDriverEntryPointByVersion is not
-    supported.
-    */
-    const dpct::err0 e = cudaGetDriverEntryPointByVersion(
-        name, &p, 12000, cudaEnableDefault, &q);
+#if CUDART_VERSION >= 12050
+    const cudaError_t e = cudaGetDriverEntryPointByVersion(name, &p, 12000, cudaEnableDefault, &q);
 #else
     const cudaError_t e = cudaGetDriverEntryPoint(name, &p, cudaEnableDefault, &q);
 #endif
-    if (e != 0 || q != cudaDriverEntryPointSuccess || p == nullptr) {
-        /*
-        DPCT1010: SYCL uses exceptions to report errors and does not use the
-        error codes. The cudaGetLastError function call was replaced with 0. You
-        need to rewrite this code.
-        */
-        (void)0;
+    if (e != cudaSuccess || q != cudaDriverEntryPointSuccess || p == nullptr) {
+        (void) cudaGetLastError();
         return false;
     }
     f = reinterpret_cast<F>(p);
     return true;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
 }
 
 const Vmm& vmm() {
@@ -339,30 +303,28 @@ const Vmm& vmm() {
     return v;
 }
 
-dpct::experimental::mem_prop device_prop(int dev) {
-    dpct::experimental::mem_prop prop{};
-    prop.type = 0;
-    prop.location.type = 1;
+CUmemAllocationProp device_prop(int dev) {
+    CUmemAllocationProp prop{};
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
     prop.location.id = dev;
     return prop;
 }
 
 // one segment: a physical allocation mapped at `va`, readable and writable by this device
-bool map_segment(const Vmm &v, int dev, dpct::device_ptr va, size_t bytes,
-                 unsigned long long &handle) {
-    const dpct::experimental::mem_prop prop = device_prop(dev);
-    dpct::experimental::physical_mem_ptr h = 0;
-    if (v.create(&h, bytes, &prop, 0) != 0) return false;
-    if (v.map(va, bytes, 0, h, 0) != 0) {
+bool map_segment(const Vmm& v, int dev, CUdeviceptr va, size_t bytes, unsigned long long& handle) {
+    const CUmemAllocationProp prop = device_prop(dev);
+    CUmemGenericAllocationHandle h = 0;
+    if (v.create(&h, bytes, &prop, 0) != CUDA_SUCCESS) return false;
+    if (v.map(va, bytes, 0, h, 0) != CUDA_SUCCESS) {
         v.release(h);
         return false;
     }
-    dpct::experimental::mem_access_desc access{};
-    access.location.type = 1;
+    CUmemAccessDesc access{};
+    access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
     access.location.id = dev;
-    access.flags =
-        sycl::ext::oneapi::experimental::address_access_mode::read_write;
-    if (v.set_access(va, bytes, &access, 1) != 0) {
+    access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    if (v.set_access(va, bytes, &access, 1) != CUDA_SUCCESS) {
         v.unmap(va, bytes);
         v.release(h);
         return false;
@@ -373,7 +335,7 @@ bool map_segment(const Vmm &v, int dev, dpct::device_ptr va, size_t bytes,
 }  // namespace
 #endif
 
-bool ExpertCache::open_segmented(uint64_t want, std::string &err) try {
+bool ExpertCache::open_segmented(uint64_t want, std::string &err) {
 #if defined(STRATA_EC_NO_VMM)
     (void) want;
     err = "ExpertCache: --vram-elastic (a segmented expert cache) is CUDA-only for now";
@@ -381,32 +343,25 @@ bool ExpertCache::open_segmented(uint64_t want, std::string &err) try {
 #else
     const Vmm& v = vmm();
     int dev = 0, supported = 0;
-    int cu = 0;
-    if (!v.ok || DPCT_CHECK_ERROR(dev = dpct::get_current_device_id()) != 0 ||
-        v.device_get(&cu, dev) != 0 ||
-        v.attribute(&supported,
-                    CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED,
-                    cu) != 0 ||
+    CUdevice cu = 0;
+    if (!v.ok || cudaGetDevice(&dev) != cudaSuccess || v.device_get(&cu, dev) != CUDA_SUCCESS ||
+        v.attribute(&supported, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, cu) != CUDA_SUCCESS ||
         !supported) {
         err = "ExpertCache: --vram-elastic needs the driver's virtual memory management, which this GPU or driver "
               "does not offer";
         return false;
     }
-    const dpct::experimental::mem_prop prop = device_prop(dev);
+    const CUmemAllocationProp prop = device_prop(dev);
     size_t gran = 0;
-    if (v.granularity(
-            &gran, &prop,
-            sycl::ext::oneapi::experimental::granularity_mode::recommended) !=
-            0 ||
-        gran == 0) {
+    if (v.granularity(&gran, &prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED) != CUDA_SUCCESS || gran == 0) {
         err = "ExpertCache: cannot read the driver's allocation granularity";
         return false;
     }
     const uint64_t g = (uint64_t) gran;
     const uint64_t total = (want + g - 1) / g * g;
     seg_ = (int64_t) (((uint64_t) seg_req_ + g - 1) / g * g);
-    dpct::device_ptr va = 0;
-    if (v.reserve(&va, (size_t)total, 0, 0, 0) != 0) {
+    CUdeviceptr va = 0;
+    if (v.reserve(&va, (size_t) total, 0, 0, 0) != CUDA_SUCCESS) {
         err = "ExpertCache: cannot reserve the address range of the segmented expert cache";
         return false;
     }
@@ -417,9 +372,8 @@ bool ExpertCache::open_segmented(uint64_t want, std::string &err) try {
         seg_size_.push_back((int64_t) std::min<uint64_t>((uint64_t) seg_, total - at));
     }
     for (size_t i = 0; i < segs_.size(); ++i) {
-        if (!map_segment(v, dev,
-                         va + (dpct::device_ptr)((uint64_t)i * (uint64_t)seg_),
-                         (size_t)seg_size_[i], segs_[i])) {
+        if (!map_segment(v, dev, va + (CUdeviceptr) ((uint64_t) i * (uint64_t) seg_), (size_t) seg_size_[i],
+                         segs_[i])) {
             char buf[200];
             std::snprintf(buf, sizeof buf, "ExpertCache: cudaMalloc failed: segment %zu of %zu (%.2f GiB) of the "
                           "segmented cache could not be allocated", i + 1, segs_.size(),
@@ -430,28 +384,19 @@ bool ExpertCache::open_segmented(uint64_t want, std::string &err) try {
         }
         mapped_segs_ = (int64_t) i + 1;
     }
-    // the reserved VA, so device_offset_end can place a borrowed prompt buffer or a resident expert inside it (the GEMM
-    // stages an operand that lies more than 4 GiB in; oneMKL misreads such an operand's last partial tile)
-    strata::device_alloc_register(base_, (size_t) reserved_);
     return true;
 #endif
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
 }
 
 void ExpertCache::release_segmented() {
 #if !defined(STRATA_EC_NO_VMM)
     const Vmm& v = vmm();
-    if (base_ != nullptr) dpct::get_current_device().queues_wait_and_throw();
-    const dpct::device_ptr va = reinterpret_cast<dpct::device_ptr>(base_);
+    if (base_ != nullptr) cudaDeviceSynchronize();
+    const CUdeviceptr va = reinterpret_cast<CUdeviceptr>(base_);
     for (size_t i = 0; i < segs_.size(); ++i)
         if (segs_[i] != 0) {
-            v.unmap(va + (dpct::device_ptr)((uint64_t)i * (uint64_t)seg_),
-                    (size_t)seg_size_[i]);
-            v.release((dpct::experimental::physical_mem_ptr)segs_[i]);
+            v.unmap(va + (CUdeviceptr) ((uint64_t) i * (uint64_t) seg_), (size_t) seg_size_[i]);
+            v.release((CUmemGenericAllocationHandle) segs_[i]);
         }
     if (base_ != nullptr && reserved_ > 0) v.address_free(va, (size_t) reserved_);
 #endif
@@ -459,7 +404,6 @@ void ExpertCache::release_segmented() {
     seg_size_.clear();
     mapped_segs_ = 0;
     reserved_ = 0;
-    strata::device_alloc_unregister(base_);
     base_ = nullptr;
 }
 
@@ -478,7 +422,7 @@ int64_t ExpertCache::slots_within(int64_t bytes) const {
     return (int64_t) (std::upper_bound(off_.begin() + 1, off_.end(), (uint64_t) bytes) - (off_.begin() + 1));
 }
 
-bool ExpertCache::shrink(int64_t keep_bytes, std::string &err) try {
+bool ExpertCache::shrink(int64_t keep_bytes, std::string &err) {
     if (segs_.empty()) {
         err = "the expert cache is not segmented (the engine needs --vram-elastic)";
         return false;
@@ -491,29 +435,15 @@ bool ExpertCache::shrink(int64_t keep_bytes, std::string &err) try {
     int64_t keep = 0, at = 0;   // the segments [0, keep) hold the first keep_bytes
     while (keep < (int64_t) segs_.size() && at < keep_bytes) at += seg_size_[(size_t) keep++];
     if (keep >= mapped_segs_) return true;
-    if (DPCT_CHECK_ERROR(dpct::get_current_device().queues_wait_and_throw()) !=
-        0) {
-        /*
-        DPCT1009: SYCL reports errors using exceptions and does not use
-        error codes. Please replace the "get_error_string_dummy(...)" with a
-        real error-handling function.
-        */
-        /*
-        DPCT1010: SYCL uses exceptions to report errors and does not use the
-        error codes. The cudaGetLastError function call was replaced with 0. You
-        need to rewrite this code.
-        */
-        err = std::string("the device failed before the cache shrank: ") +
-              dpct::get_error_string_dummy(0);
+    if (cudaDeviceSynchronize() != cudaSuccess) {
+        err = std::string("the device failed before the cache shrank: ") + cudaGetErrorString(cudaGetLastError());
         return false;
     }
-    const dpct::device_ptr va = reinterpret_cast<dpct::device_ptr>(base_);
+    const CUdeviceptr va = reinterpret_cast<CUdeviceptr>(base_);
     for (int64_t i = mapped_segs_ - 1; i >= keep; --i) {
-        const dpct::device_ptr p =
-            va + (dpct::device_ptr)((uint64_t)i * (uint64_t)seg_);
-        if (v.unmap(p, (size_t)seg_size_[(size_t)i]) != 0 ||
-            v.release((dpct::experimental::physical_mem_ptr)segs_[(size_t)i]) !=
-                0) {
+        const CUdeviceptr p = va + (CUdeviceptr) ((uint64_t) i * (uint64_t) seg_);
+        if (v.unmap(p, (size_t) seg_size_[(size_t) i]) != CUDA_SUCCESS ||
+            v.release((CUmemGenericAllocationHandle) segs_[(size_t) i]) != CUDA_SUCCESS) {
             err = "the driver refused to release an expert-cache segment";
             live_slots_ = slots_within(mapped_bytes());
             return false;
@@ -524,11 +454,6 @@ bool ExpertCache::shrink(int64_t keep_bytes, std::string &err) try {
     live_slots_ = slots_within(mapped_bytes());
     return true;
 #endif
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
 }
 
 bool ExpertCache::grow(int64_t want_bytes, std::string& err) {
@@ -542,20 +467,14 @@ bool ExpertCache::grow(int64_t want_bytes, std::string& err) {
 #else
     const Vmm& v = vmm();
     int dev = 0;
-    dev = dpct::get_current_device_id();
-    const dpct::device_ptr va = reinterpret_cast<dpct::device_ptr>(base_);
+    cudaGetDevice(&dev);
+    const CUdeviceptr va = reinterpret_cast<CUdeviceptr>(base_);
     int64_t at = mapped_bytes();
     while (mapped_segs_ < (int64_t) segs_.size() && at + seg_size_[(size_t) mapped_segs_] <= want_bytes) {
         const size_t i = (size_t) mapped_segs_;
-        if (!map_segment(v, dev,
-                         va + (dpct::device_ptr)((uint64_t)i * (uint64_t)seg_),
-                         (size_t)seg_size_[i], segs_[i])) {
-            /*
-            DPCT1010: SYCL uses exceptions to report errors and does not use
-            the error codes. The cudaGetLastError function call was replaced
-            with 0. You need to rewrite this code.
-            */
-            (void)0;
+        if (!map_segment(v, dev, va + (CUdeviceptr) ((uint64_t) i * (uint64_t) seg_), (size_t) seg_size_[i],
+                         segs_[i])) {
+            (void) cudaGetLastError();
             err = "the driver has no VRAM for another expert-cache segment";
             live_slots_ = slots_within(mapped_bytes());
             return false;
@@ -611,13 +530,7 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
     // `device_slot()` walks off the end. So the free-VRAM figure is read and compared BEFORE the allocation,
     // and the two numbers are named in the refusal.
     size_t free_b = 0, total_b = 0;
-    /*
-    DPCT1106: 'cudaMemGetInfo' was migrated with the Intel extensions for
-    device information which may not be supported by all compilers or runtimes.
-    You may need to adjust the code.
-    */
-    if (DPCT_CHECK_ERROR(
-            dpct::get_current_device().get_memory_info(free_b, total_b)) == 0) {
+    if (strata::ze::mem_get_info(strata::ze::current_device(), &free_b, &total_b)) {
         free_b = device_free_bytes();   // unified memory: what the OS can give back counts (see the header)
         if ((uint64_t) free_b < want) {
             char buf[320];
@@ -646,38 +559,17 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
         }
         base_ = r->base();
         vmm_ = std::move(r);
-    } else if (DPCT_CHECK_ERROR(
-                   base_ = (uint8_t *)strata::malloc_device_guarded(
-                       (size_t)want, dpct::get_in_order_queue(), "expert cache arena")) != 0 ||
-               base_ == nullptr) {   // Level Zero answers a too-large allocation with null, not an exception
-        // (an Arc A750 caps one allocation at 4 GiB unless UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=1)
-        base_ = nullptr;
+    } else if ((base_ = (uint8_t*) strata::ze::malloc_device_guarded((size_t) want, -1, "expert cache arena")) ==
+               nullptr) {   // Level Zero answers a too-large allocation with null, not an exception
         char buf[256];
-        std::snprintf(
-            buf, sizeof buf, "ExpertCache: cudaMalloc(%.2f GiB) failed: %s",
-            /*
-            DPCT1009: SYCL reports errors using exceptions and does not use
-            error codes. Please replace the "get_error_string_dummy(...)" with a
-            real error-handling function.
-            */
-            /*
-            DPCT1010: SYCL uses exceptions to report errors and does not
-            use the error codes. The cudaGetLastError function call was replaced
-            with 0. You need to rewrite this code.
-            */
-            (double)want / 1073741824.0, dpct::get_error_string_dummy(0));
+        std::snprintf(buf, sizeof buf, "ExpertCache: cudaMalloc(%.2f GiB) failed: out of memory",
+                      (double) want / 1073741824.0);
         err = buf;
         return false;
     }
     // Zeroed so a slot read before it is filled is a DETERMINISTIC wrong answer rather than whatever the
     // allocator handed back.  A stale block of a previous process's memory would still sum to finite floats.
-    if (DPCT_CHECK_ERROR(
-            (strata::big_fill_zero(dpct::get_in_order_queue(), base_, (size_t)want), 0)) !=
-        0) {
-        err = "ExpertCache: cudaMemset of the slot arena failed";
-        close();
-        return false;
-    }
+    strata::ze::fill_zero(strata::ze::default_stream(), base_, (size_t) want);
 
     residency_.assign((size_t) (n_layers * n_expert), kNotResident);
     slots_ = n_slots;
@@ -749,11 +641,9 @@ void ExpertCache::close() {
         release_segmented();
     } else if (vmm_) {
         vmm_.reset();   // unmaps and frees every chunk it still holds
-        strata::device_alloc_unregister(base_);
         base_ = nullptr;
     } else if (base_ != nullptr) {
-        strata::device_alloc_unregister(base_);
-        sycl::free(base_, dpct::get_in_order_queue());
+        strata::ze::free(base_);
         base_ = nullptr;
     }
     residency_.clear();
@@ -817,7 +707,7 @@ const uint8_t* ExpertCache::device_slot(int32_t slot) const {
 }
 
 bool ExpertCache::fill_slot(int32_t slot, const uint8_t *host_blob,
-                            void *stream, std::string &err, int64_t bytes) try {
+                            void *stream, std::string &err, int64_t bytes) {
     const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
     uint8_t* dst = device_slot(slot);
     if (dst == nullptr) {
@@ -829,42 +719,13 @@ bool ExpertCache::fill_slot(int32_t slot, const uint8_t *host_blob,
         err = "ExpertCache::fill_slot: the host blob is null";
         return false;
     }
-    /*
-    DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy API. While
-    the origin API might be synchronous, it depends on the type of operand
-    memory, so you may need to call wait() on event return by memcpy API to
-    ensure synchronization behavior.
-    */
-    const dpct::err0 e =
-        DPCT_CHECK_ERROR(strata::q_of(stream)->memcpy(dst, host_blob, n));
-    /*
-    DPCT1000: Error handling if-stmt was detected but could not be
-    rewritten.
-    */
-    if (e != 0) {
-        /*
-        DPCT1009: SYCL reports errors using exceptions and does not use
-        error codes. Please replace the "get_error_string_dummy(...)" with a
-        real error-handling function.
-        */
-        /*
-        DPCT1001: The statement could not be removed.
-        */
-        err = std::string("ExpertCache::fill_slot: ") +
-              dpct::get_error_string_dummy(e);
-        return false;
-    }
+    strata::ze::stream_of(stream)->memcpy(dst, host_blob, n);
     ++fills_;
     return true;
 }
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
 
 bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t *host_blob,
-                                     std::string &err, int64_t bytes) try {
+                                     std::string &err, int64_t bytes) {
     const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
     uint8_t* dst = device_slot(slot);
     if (dst == nullptr) {
@@ -884,44 +745,20 @@ bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t *host_blob,
     }
     std::memcpy(blocking_staging_, host_blob, n);
     const cudaError_t e = cudaMemcpy(dst, blocking_staging_, n, cudaMemcpyHostToDevice);
-#else
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming
-    in the original code the source host memory is pageable memory. If the
-    memory is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    const dpct::err0 e =
-        DPCT_CHECK_ERROR(dpct::get_in_order_queue().memcpy(dst, host_blob, n).wait());
-#endif
-    /*
-    DPCT1000: Error handling if-stmt was detected but could not be
-    rewritten.
-    */
-    if (e != 0) {
-        /*
-        DPCT1009: SYCL reports errors using exceptions and does not use
-        error codes. Please replace the "get_error_string_dummy(...)" with a
-        real error-handling function.
-        */
-        /*
-        DPCT1001: The statement could not be removed.
-        */
-        err = std::string("ExpertCache::fill_slot_blocking: ") +
-              dpct::get_error_string_dummy(e);
+    if (e != cudaSuccess) {
+        err = std::string("ExpertCache::fill_slot_blocking: ") + cudaGetErrorString(e);
         return false;
     }
+#else
+    strata::ze::default_stream().memcpy(dst, host_blob, n);
+    strata::ze::default_stream().sync();
+#endif
     ++fills_;
     return true;
 }
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
 
 bool ExpertCache::fill_slot_queued(int32_t slot, const uint8_t *host_blob,
-                                   std::string &err, int64_t bytes) try {
+                                   std::string &err, int64_t bytes) {
     const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
     uint8_t* dst = device_slot(slot);
     if (dst == nullptr || host_blob == nullptr) {
@@ -929,69 +766,19 @@ bool ExpertCache::fill_slot_queued(int32_t slot, const uint8_t *host_blob,
                              : "ExpertCache::fill_slot_queued: the host blob is null";
         return false;
     }
-    /*
-    DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy API. While
-    the origin API might be synchronous, it depends on the type of operand
-    memory, so you may need to call wait() on event return by memcpy API to
-    ensure synchronization behavior.
-    */
-    const dpct::err0 e =
-        DPCT_CHECK_ERROR(dpct::get_in_order_queue().memcpy(dst, host_blob, n).wait());
-    /*
-    DPCT1000: Error handling if-stmt was detected but could not be
-    rewritten.
-    */
-    if (e != 0) {
-        /*
-        DPCT1009: SYCL reports errors using exceptions and does not use
-        error codes. Please replace the "get_error_string_dummy(...)" with a
-        real error-handling function.
-        */
-        /*
-        DPCT1001: The statement could not be removed.
-        */
-        err = std::string("ExpertCache::fill_slot_queued: ") +
-              dpct::get_error_string_dummy(e);
-        return false;
-    }
+    strata::ze::default_stream().memcpy(dst, host_blob, n);
+    strata::ze::default_stream().sync();
     ++fills_;
     return true;
 }
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
 
-bool ExpertCache::sync_queued(std::string &err) try {
-    const dpct::err0 e = DPCT_CHECK_ERROR(dpct::get_in_order_queue().wait());
-    /*
-    DPCT1000: Error handling if-stmt was detected but could not be
-    rewritten.
-    */
-    if (e != 0) {
-        /*
-        DPCT1009: SYCL reports errors using exceptions and does not use
-        error codes. Please replace the "get_error_string_dummy(...)" with a
-        real error-handling function.
-        */
-        /*
-        DPCT1001: The statement could not be removed.
-        */
-        err = std::string("ExpertCache::sync_queued: ") +
-              dpct::get_error_string_dummy(e);
-        return false;
-    }
+bool ExpertCache::sync_queued(std::string &err) {
+    strata::ze::default_stream().sync();
     return true;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
 }
 
 bool ExpertCache::verify_slot(int32_t slot, const uint8_t *host_blob,
-                              std::string &err, int64_t bytes) try {
+                              std::string &err, int64_t bytes) {
     const int64_t nb = bytes > 0 && bytes <= blob_ ? bytes : blob_;
     const uint8_t* src = device_slot(slot);
     if (src == nullptr) {
@@ -1002,25 +789,8 @@ bool ExpertCache::verify_slot(int32_t slot, const uint8_t *host_blob,
     // has happened is not a check.  It also synchronises the fills queued before it, which is what makes the
     // comparison meaningful.
     std::vector<uint8_t> got((size_t) nb);
-    const dpct::err0 e = DPCT_CHECK_ERROR(
-        dpct::get_in_order_queue().memcpy(got.data(), src, (size_t)nb).wait());
-    /*
-    DPCT1000: Error handling if-stmt was detected but could not be
-    rewritten.
-    */
-    if (e != 0) {
-        /*
-        DPCT1009: SYCL reports errors using exceptions and does not use
-        error codes. Please replace the "get_error_string_dummy(...)" with a
-        real error-handling function.
-        */
-        /*
-        DPCT1001: The statement could not be removed.
-        */
-        err = std::string("ExpertCache::verify_slot: ") +
-              dpct::get_error_string_dummy(e);
-        return false;
-    }
+    strata::ze::default_stream().memcpy(got.data(), src, (size_t) nb);
+    strata::ze::default_stream().sync();
     if (std::memcmp(got.data(), host_blob, (size_t) nb) != 0) {
         size_t first = 0;
         while (first < (size_t) nb && got[first] == host_blob[first]) ++first;
@@ -1036,11 +806,6 @@ bool ExpertCache::verify_slot(int32_t slot, const uint8_t *host_blob,
         return false;
     }
     return true;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
 }
 
 }  // namespace strata::core

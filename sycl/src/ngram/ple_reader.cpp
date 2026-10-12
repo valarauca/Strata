@@ -1,4 +1,4 @@
-// sycl/src/ngram/ple_reader.cpp - SYCL port: upstream src/ngram/ple_reader.cpp plus a per-gather timing trace
+// sycl/src/ngram/ple_reader.cpp - Intel engine: upstream src/ngram/ple_reader.cpp plus a per-gather timing trace
 // (STRATA_PLE_TRACE=1: where a decode round's PLE wait goes). See include/strata/ngram/ple_reader.hpp.
 #include <cstdio>
 #include <cstdlib>
@@ -90,7 +90,7 @@ struct Job {
 
 struct TicketState {
     uint32_t pending = 0;  // jobs not yet completed
-    uint32_t jobs = 0;     // SYCL port trace: jobs issued, and when it was issued / first submitted / last completed
+    uint32_t jobs = 0;     // Intel engine trace: jobs issued, and when it was issued / first submitted / last completed
     double t_issue = 0, t_first = 0, t_last = 0;
 };
 bool ple_trace() {

@@ -1,9 +1,10 @@
 # cmake/ze_device.cmake - the engine's device code, compiled offline into native Level Zero modules.
 #
-# strata_ze_bundle(<name> SOURCES <dev.cpp...> [KERN <x.kern.inc...>]) compiles each source with the SYCL device
+# strata_ze_bundle(<name> SOURCES <dev.cpp...> [KERN <x.kern.inc...>] [OCLOC_OPTIONS "..."]) compiles each source with the SYCL device
 # compiler alone (icpx -fsycl-device-only: no host code, no SYCL runtime), then tools/ze_devlink.py links the group,
 # splits it where kernels need different properties, compiles it for STRATA_ZE_DEVICE with ocloc and writes
-# <name>.szeb. strata_ze_embed(<target> <bundles...>) links the bundles into <target> as read-only data.
+# <name>.szeb. OCLOC_OPTIONS adds module-wide compile options (-ze-opt-large-register-file: 256 GRF for every
+# kernel of the bundle; a per-kernel SYCL property for it drops a free-function kernel). strata_ze_embed(<target> <bundles...>) links the bundles into <target> as read-only data.
 include_guard(GLOBAL)
 
 find_program(STRATA_ICPX icpx REQUIRED)
@@ -15,7 +16,7 @@ set(STRATA_ZE_COMPILER_DIR "${_strata_icpx_bin}/compiler" CACHE PATH "icpx's int
 
 set(STRATA_ZE_DEVICE_FLAGS -fsycl -fsycl-device-only -fsycl-targets=spir64_gen -fsycl-default-sub-group-size=32
     -fno-sycl-dead-args-optimization -O3 -DNDEBUG -fp-model=precise -std=c++20 -Wno-unused-parameter
-    -Wno-unused-variable -Wno-deprecated-declarations -Wno-unknown-pragmas)
+    -Wno-unused-variable -Wno-deprecated-declarations -Wno-unknown-pragmas -Wno-ignored-attributes)
 set(STRATA_ZE_OCLOC_OPTIONS "-cl-fp32-correctly-rounded-divide-sqrt" CACHE STRING "ocloc -options for the device modules")
 
 set_property(GLOBAL PROPERTY STRATA_ZE_INCLUDES "")
@@ -28,7 +29,7 @@ function(strata_ze_device_defines)
 endfunction()
 
 function(strata_ze_bundle name)
-  cmake_parse_arguments(B "" "" "SOURCES;KERN" ${ARGN})
+  cmake_parse_arguments(B "" "OCLOC_OPTIONS" "SOURCES;KERN" ${ARGN})
   get_property(incs GLOBAL PROPERTY STRATA_ZE_INCLUDES)
   get_property(defs GLOBAL PROPERTY STRATA_ZE_DEFINES)
   set(iflags "")
@@ -57,10 +58,14 @@ function(strata_ze_bundle name)
   foreach(k IN LISTS B_KERN)
     list(APPEND expect --expect ${k})
   endforeach()
+  set(opts "${STRATA_ZE_OCLOC_OPTIONS}")
+  if(B_OCLOC_OPTIONS)
+    string(APPEND opts " ${B_OCLOC_OPTIONS}")
+  endif()
   set(out ${CMAKE_BINARY_DIR}/ze/${name}.szeb)
   add_custom_command(OUTPUT ${out}
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/ze_devlink.py --out ${out} --work ${dir}/link
-            --device ${STRATA_ZE_DEVICE} --ocloc-options=${STRATA_ZE_OCLOC_OPTIONS} --compiler-dir ${STRATA_ZE_COMPILER_DIR}
+            --device ${STRATA_ZE_DEVICE} --ocloc-options=${opts} --compiler-dir ${STRATA_ZE_COMPILER_DIR}
             --ocloc ${STRATA_OCLOC} ${expect} ${bcs}
     DEPENDS ${bcs} ${B_KERN} ${CMAKE_CURRENT_SOURCE_DIR}/tools/ze_devlink.py
     COMMENT "device ${name}: link + ocloc ${STRATA_ZE_DEVICE}"

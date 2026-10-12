@@ -1,7 +1,5 @@
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
-#include "strata/sycl_queue.hpp"
+#include "strata/ze/ze.hpp"
+#include "strata/intel_gpu.hpp"
 #include "strata/core/native_dense.hpp"
 #include <cstdlib>
 #include "strata/core/weights.hpp"
@@ -94,7 +92,7 @@ bool eligible(const strata::TensorInfo& tensor, bool include_ple_key) {
 struct DeviceFree {
     void
     operator()(void *p) const {
-        if (p) sycl::free(p, dpct::get_in_order_queue());
+        if (p) strata::ze::free(p);
     }
 };
 using DevicePtr = std::unique_ptr<void, DeviceFree>;
@@ -137,15 +135,15 @@ bool NativeDense::keep_unquantized_ple_key(const std::string& pack_dir, std::set
 
 NativeDense::~NativeDense() {
     for (const void* p : packed_keys_) strata::kernels::native_q8_0_packed_unregister(p);
-    if (scratch_) sycl::free(scratch_, dpct::get_in_order_queue());
+    if (scratch_) strata::ze::free(scratch_);
     for (void *p : weights_)
-        DPCT_CHECK_ERROR(sycl::free(p, dpct::get_in_order_queue()));
+        strata::ze::free(p);
 }
 
 bool NativeDense::load(const std::vector<std::string> &shards,
                        WeightTable &table, std::string &err,
                        bool include_ple_key, int64_t layer_lo,
-                       int64_t layer_hi) try {
+                       int64_t layer_hi) {
     auto outside = [&](const std::string& name) {   // a blk.<l>. tensor of another stage's layers
         if (layer_hi < 0 || name.rfind("blk.", 0) != 0) return false;
         const long l = std::strtol(name.c_str() + 4, nullptr, 10);
@@ -244,34 +242,14 @@ bool NativeDense::load(const std::vector<std::string> &shards,
                 }
                 const auto bytes = strata::kernels::native_mmvq_weight_bytes(
                     tensor.type, (int) ref.ne0, (int) ref.ne1);
-                void* allocation = nullptr;
-                auto status =
-                    DPCT_CHECK_ERROR(allocation = (void *)strata::malloc_device_guarded(
-                                         bytes, dpct::get_in_order_queue()));
+                void* allocation = strata::ze::malloc_device_guarded(bytes, -1, "device buffer");
                 DevicePtr data(allocation);
-                if (status == 0)
-                    status = DPCT_CHECK_ERROR(
-                        dpct::get_in_order_queue()
-                            .memcpy(data.get(), gguf.tensor_data(tensor), bytes)
-                            .wait());
-                /*
-                DPCT1000: Error handling if-stmt was detected but could not
-                be rewritten.
-                */
-                if (status != 0) {
-                    /*
-                    DPCT1009: SYCL reports errors using exceptions and does
-                    not use error codes. Please replace the
-                    "get_error_string_dummy(...)" with a real error-handling
-                    function.
-                    */
-                    /*
-                    DPCT1001: The statement could not be removed.
-                    */
-                    err = "native dense upload " + tensor.name + ": " +
-                          dpct::get_error_string_dummy(status);
+                if (allocation == nullptr) {
+                    err = "native dense upload " + tensor.name + ": out of device memory";
                         return false;
                 }
+                strata::ze::default_stream().memcpy(data.get(), gguf.tensor_data(tensor), bytes);
+                strata::ze::default_stream().sync();
                 max_in = (std::max)(max_in, (int) ref.ne0);
                 total += bytes;
                 // STRATA_Q8_PACKED=1: a second, packed copy of an eligible Q8_0 matrix for the decode MMVQ (the GGUF
@@ -283,35 +261,14 @@ bool NativeDense::load(const std::vector<std::string> &shards,
                     std::vector<uint8_t> host(bytes);
                     strata::kernels::native_q8_0_pack_host(gguf.tensor_data(tensor), host.data(), (int) ref.ne0,
                                                            (int) ref.ne1);
-                    void* packed_allocation = nullptr;
-                    auto packed_status = DPCT_CHECK_ERROR(
-                        packed_allocation = (void *)strata::malloc_device_guarded(
-                            bytes, dpct::get_in_order_queue()));
+                    void* packed_allocation = strata::ze::malloc_device_guarded(bytes, -1, "device buffer");
                     packed.reset(packed_allocation);
-                    if (packed_status == 0)
-                        packed_status = DPCT_CHECK_ERROR(
-                            dpct::get_in_order_queue()
-                                .memcpy(packed.get(), host.data(), bytes)
-                                .wait());
-                    /*
-                    DPCT1000: Error handling if-stmt was detected but could
-                    not be rewritten.
-                    */
-                    if (packed_status != 0) {
-                        /*
-                        DPCT1009: SYCL reports errors using exceptions and
-                        does not use error codes. Please replace the
-                        "get_error_string_dummy(...)" with a real error-handling
-                        function.
-                        */
-                        /*
-                        DPCT1001: The statement could not be removed.
-                        */
-                        err = "native dense packed upload " + tensor.name +
-                              ": " +
-                              dpct::get_error_string_dummy(packed_status);
+                    if (packed_allocation == nullptr) {
+                        err = "native dense packed upload " + tensor.name + ": out of device memory";
                         return false;
                     }
+                    strata::ze::default_stream().memcpy(packed.get(), host.data(), bytes);
+                    strata::ze::default_stream().sync();
                 }
                 pending.push_back(Pending{&ref, (int) tensor.type, bytes, std::move(data), std::move(packed)});
             }
@@ -329,53 +286,25 @@ bool NativeDense::load(const std::vector<std::string> &shards,
                         err = "native dense (STRATA_HC_Q8): incompatible matrix " + tensor.name; return false;
                     }
                     const uint64_t bytes = (uint64_t) ref.ne0 / 32 * 34 * (uint64_t) ref.ne1;
-                    void* p = nullptr;
                     std::vector<uint8_t> q8;
                     if (f32_inject) q8 = q8_0_of((const float*) gguf.tensor_data(tensor), (uint64_t) ref.ne0 * (uint64_t) ref.ne1);
-                    if (DPCT_CHECK_ERROR(
-                            p = (void *)strata::malloc_device_guarded(
-                                bytes, dpct::get_in_order_queue())) != 0 ||
-                        /*
-                        DPCT1114: cudaMemcpy is migrated to
-                        asynchronization memcpy, assuming in the original code
-                        the source host memory is pageable memory. If the memory
-                        is not pageable, call wait() on event return by memcpy
-                        API to ensure synchronization behavior.
-                        */
-                        DPCT_CHECK_ERROR(dpct::get_in_order_queue().memcpy(
-                            p,
-                            f32_inject ? (const void *)q8.data()
-                                       : gguf.tensor_data(tensor),
-                            bytes).wait()) != 0) {
+                    void* p = strata::ze::malloc_device_guarded(bytes, -1, "device buffer");
+                    if (p == nullptr) {
                         err = "native dense (STRATA_HC_Q8) upload " + tensor.name; return false;
                     }
+                    strata::ze::default_stream().memcpy(p, f32_inject ? (const void *)q8.data() : gguf.tensor_data(tensor),
+                                                        bytes);
+                    strata::ze::default_stream().sync();
                     ref.hc_q8 = p;
                     weights_.push_back(p);
                     hc_q8_bytes += bytes;
                 }
         }
         if (pending.empty()) { err = "native dense: no supported GDN/QSA matrices in supplied shards"; return false; }
-        void* allocation = nullptr;
-        const auto status =
-            DPCT_CHECK_ERROR(allocation = (void *)strata::malloc_device_guarded(
-                                 strata::kernels::native_q8_1_bytes(max_in),
-                                 dpct::get_in_order_queue()));
+        void* allocation = strata::ze::malloc_device_guarded(strata::kernels::native_q8_1_bytes(max_in), -1, "device buffer");
         DevicePtr scratch(allocation);
-        /*
-        DPCT1009: SYCL reports errors using exceptions and does not use
-        error codes. Please replace the "get_error_string_dummy(...)" with a
-        real error-handling function.
-        */
-        /*
-        DPCT1001: The statement could not be removed.
-        */
-        /*
-        DPCT1000: Error handling if-stmt was detected but could not be
-        rewritten.
-        */
-        if (status != 0) {
-            err = std::string("native dense scratch: ") +
-                  dpct::get_error_string_dummy(status);
+        if (allocation == nullptr) {
+            err = "native dense scratch: out of device memory";
             return false;
         }
         // All checks and allocations finish before publishing any reference.
@@ -409,10 +338,5 @@ bool NativeDense::load(const std::vector<std::string> &shards,
         err = std::string("native dense: ") + error.what();
         return false;
     }
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
 }
 } // namespace strata::core

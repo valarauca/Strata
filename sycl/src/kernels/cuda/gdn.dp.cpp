@@ -2,15 +2,8 @@
 //
 // See include/strata/kernels/gdn.hpp for the state layout (S, h_v, S) and for why the recurrence needs no
 // barrier at all: every line of it touches only one (j, h) column, so one thread owns a column end to end.
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
-#include "strata/sycl_queue.hpp"
+#include "strata/port.hpp"
 #include "strata/kernels/gdn.hpp"
-
-#include <cmath>
-#include <cstdio>
-#include <cstdlib>
 
 namespace strata::kernels {
 namespace {
@@ -83,11 +76,6 @@ auto &ks =
             beta_s[hi] = beta[h];
         }
     }
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
     if (j >= S) return;
 
@@ -154,11 +142,6 @@ __dpct_inline__ void gdn_l2_kernel(float *__restrict__ x, int cols, float eps) {
     for (int i = item_ct1.get_local_id(2); i < cols;
          i += item_ct1.get_local_range(2)) acc += (double)p[i] * (double)p[i];
     // warp reduction
-    /*
-DPCT1108: '__shfl_down_sync' was migrated with the experimental feature
-masked sub_group function which may not be supported by all compilers or
-runtimes. You may need to adjust the code.
-*/
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) acc +=
         dpct::experimental::shift_sub_group_left(
@@ -167,11 +150,6 @@ runtimes. You may need to adjust the code.
     auto &ssum = *sycl::ext::oneapi::group_local_memory_for_overwrite<double>(
         sycl::ext::oneapi::this_work_item::get_work_group<3>());
     if (item_ct1.get_local_id(2) == 0) ssum = acc;
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
     const float inv = (float)(1.0 / sycl::sqrt(ssum + (double)eps));
 #pragma unroll
@@ -194,11 +172,6 @@ __dpct_inline__ void gdn_out_norm_kernel(const float *__restrict__ o,
 #pragma unroll
     for (int i = item_ct1.get_local_id(2); i < S;
          i += item_ct1.get_local_range(2)) acc += (double)po[i] * (double)po[i];
-    /*
-DPCT1108: '__shfl_down_sync' was migrated with the experimental feature
-masked sub_group function which may not be supported by all compilers or
-runtimes. You may need to adjust the code.
-*/
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) acc +=
         dpct::experimental::shift_sub_group_left(
@@ -216,107 +189,6 @@ runtimes. You may need to adjust the code.
 }
 
 }  // namespace
-
-void gdn_step(float *state, const float *q, const float *k, const float *v,
-              const float *gate, const float *beta, float *o,
-              const GdnShapes &s, void *stream) try {
-    if (s.S <= 0 || s.h_k <= 0 || s.h_v <= 0) return;
-    if (s.S > 128) {
-        std::fprintf(stderr, "gdn_step: S = %lld exceeds the staged 128 (`ks`/`qs` are [8][128])\n",
-                     (long long) s.S);
-        std::exit(1);
-    }
-    const dpct::dim3 grid((unsigned)((s.S + JTHREADS - 1) / JTHREADS),
-                          (unsigned)((s.h_v + MAX_H - 1) / MAX_H));
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class gdn_step_kernel_34b62e>>(
-                sycl::nd_range<3>(grid * sycl::range(1, 1, JTHREADS),
-                                  sycl::range(1, 1, JTHREADS)),
-                exp_props, [=](sycl::nd_item<3> item_ct1) {
-                    gdn_step_kernel(state, q, k, v, gate, beta, o, (int)s.S,
-                                    (int)s.h_k, (int)s.h_v);
-                });
-    }
-    if (stream == nullptr) {
-        const dpct::err0 e = DPCT_CHECK_ERROR(
-            dpct::get_current_device().queues_wait_and_throw());
-    }
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
-
-void gdn_conv_step(float *conv_state, const float *x, const float *kW,
-                   float *out, int64_t channels, int64_t d_conv,
-                   void *stream) try {
-    if (channels <= 0 || d_conv < 1) return;
-    const int blocks = (int) ((channels + 255) / 256);
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class gdn_conv_kernel_b12e73>>(
-                sycl::nd_range<3>(sycl::range(1, 1, blocks) *
-                                      sycl::range(1, 1, 256),
-                                  sycl::range(1, 1, 256)),
-                exp_props, [=](sycl::nd_item<3> item_ct1) {
-                    gdn_conv_kernel(conv_state, x, kW, out, (int)channels,
-                                    (int)d_conv);
-                });
-    }
-    if (stream == nullptr) {
-        const dpct::err0 e = DPCT_CHECK_ERROR(
-            dpct::get_current_device().queues_wait_and_throw());
-    }
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
-
-void gdn_l2_norm(float *x, int64_t rows, int64_t cols, float eps,
-                 void *stream) try {
-    if (rows <= 0 || cols <= 0) return;
-    if (cols > 1024) {
-        std::fprintf(stderr, "gdn_l2_norm: cols = %lld exceeds the 1024-wide warp reduction\n", (long long) cols);
-        std::exit(1);
-    }
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-        dpct::has_capability_or_fail(
-            strata::q_of(stream)->get_device(),
-            {sycl::aspect::fp64});
-
-        strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class gdn_l2_kernel_fcfb3d>>(
-                sycl::nd_range<3>(sycl::range(1, 1, (unsigned)rows) *
-                                      sycl::range(1, 1, 32),
-                                  sycl::range(1, 1, 32)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        gdn_l2_kernel(x, (int)cols, eps);
-                    });
-    }
-    if (stream == nullptr) {
-        const dpct::err0 e = DPCT_CHECK_ERROR(
-            dpct::get_current_device().queues_wait_and_throw());
-    }
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
 
 /// `beta = sigmoid(beta)`, in place, over the `h_v` per-head scalars.
 ///
@@ -337,65 +209,6 @@ __dpct_inline__ void gdn_beta_gate_kernel(float *__restrict__ beta, int n) {
     if (i < n) beta[i] = sigmoid_f(beta[i]);
 }
 
-void gdn_beta_gate(float *beta, int64_t h_v, void *stream) try {
-    if (beta == nullptr || h_v <= 0) return;
-    const int n = (int) h_v;
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class gdn_beta_gate_kernel_e2ab3e>>(
-                sycl::nd_range<3>(
-                    sycl::range(1, 1, (unsigned)((n + 127) / 128)) *
-                        sycl::range(1, 1, 128),
-                    sycl::range(1, 1, 128)),
-                exp_props, [=](sycl::nd_item<3> item_ct1) {
-                    gdn_beta_gate_kernel(beta, n);
-                });
-    }
-    if (stream == nullptr) {
-        const dpct::err0 e = DPCT_CHECK_ERROR(
-            dpct::get_current_device().queues_wait_and_throw());
-    }
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
-
-void gdn_out_norm(const float *o, const float *z, const float *ssm_norm,
-                  float *y, int64_t h_v, int64_t S, float eps,
-                  void *stream) try {
-    if (h_v <= 0 || S <= 0) return;
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-        dpct::has_capability_or_fail(
-            strata::q_of(stream)->get_device(),
-            {sycl::aspect::fp64});
-
-        strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class gdn_out_norm_kernel_9883e0>>(
-                sycl::nd_range<3>(sycl::range(1, 1, (unsigned)h_v) *
-                                      sycl::range(1, 1, 32),
-                                  sycl::range(1, 1, 32)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        gdn_out_norm_kernel(o, z, ssm_norm, y, (int)S, eps);
-                    });
-    }
-    if (stream == nullptr) {
-        const dpct::err0 e = DPCT_CHECK_ERROR(
-            dpct::get_current_device().queues_wait_and_throw());
-    }
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
+#include "gdn.kern.inc"
 
 }  // namespace strata::kernels

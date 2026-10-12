@@ -1,4 +1,3 @@
-#define DPCT_COMPAT_RT_VERSION 12080
 // src/program/generate.cpp - P2.S6: `strata generate`.
 //
 // THE DRIVER, and the first program in this project that answers a question.
@@ -21,10 +20,8 @@
 // (`phase-2-correct-engine.md:5-9`).  What it is FOR is the honest tok/s figure
 // and the logit dump.
 
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
-#include "strata/sycl_queue.hpp"
+#include "strata/ze/ze.hpp"
+#include "strata/intel_gpu.hpp"
 #include "strata/sycl_doorbell.hpp"
 #include "strata/core/arch_defaults.hpp"
 #include "strata/core/dma_batch.hpp"
@@ -138,38 +135,13 @@ bool under_wddm() {
 }
 
 // #620 #486: " (N MiB of M MiB VRAM free on this GPU)" for an allocation's failure message (clears the error first)
-std::string vram_free_note() try {
-    /*
-    DPCT1010: SYCL uses exceptions to report errors and does not use the
-    error codes. The cudaGetLastError function call was replaced with 0. You
-    need to rewrite this code.
-    */
-    (void)0;
+std::string vram_free_note() {
     size_t free_b = 0, total_b = 0;
-    /*
-    DPCT1106: 'cudaMemGetInfo' was migrated with the Intel extensions for
-    device information which may not be supported by all compilers or runtimes.
-    You may need to adjust the code.
-    */
-    if (DPCT_CHECK_ERROR(
-            dpct::get_current_device().get_memory_info(free_b, total_b)) != 0) {
-        /*
-        DPCT1010: SYCL uses exceptions to report errors and does not use
-        the error codes. The cudaGetLastError function call was replaced with 0.
-        You need to rewrite this code.
-        */
-        (void)0;
-        return {};
-    }
+    if (!strata::ze::mem_get_info(strata::ze::current_device(), &free_b, &total_b)) return {};
     char buf[96];
     std::snprintf(buf, sizeof buf, " (%llu MiB of %llu MiB VRAM free on this GPU)", (unsigned long long) (free_b >> 20),
                   (unsigned long long) (total_b >> 20));
     return buf;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
 }
 
 // perf-review D-4: the lent slots are refilled with queued copies and one wait; STRATA_REFILL_BLOCKING=1 waits on each
@@ -195,8 +167,8 @@ bool pin_blobs_on() {
 // AND SDMA together (any one off avoids it; the barrier packet that never passes is a ROCm-side problem, #884).  This keeps
 // the swaps off SDMA without turning SDMA off for the prompt read (HSA_ENABLE_SDMA=0 costs 10-24% of it).  Needs the source to
 // be mapped, 16-byte aligned memory (the registered arena); anything else takes the normal cudaMemcpyAsync.
-dpct::err0 adapt_copy_h2d(void *dst, const void *src, size_t bytes,
-                          dpct::queue_ptr st) try {
+int adapt_copy_h2d(void *dst, const void *src, size_t bytes,
+                          strata::ze::Stream* st) {
 #if defined(STRATA_USE_HIP)
     static const bool kernel = [] {
         const char* e = std::getenv("STRATA_HIP_ADAPT_KERNEL_COPY");
@@ -213,18 +185,8 @@ dpct::err0 adapt_copy_h2d(void *dst, const void *src, size_t bytes,
         (void) cudaGetLastError();   // not registered / not mapped: the ordinary copy
     }
 #endif
-    /*
-    DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy API. While
-    the origin API might be synchronous, it depends on the type of operand
-    memory, so you may need to call wait() on event return by memcpy API to
-    ensure synchronization behavior.
-    */
-    return DPCT_CHECK_ERROR(st->memcpy(dst, src, bytes));
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+    st->memcpy(dst, src, bytes);
+    return 0;
 }
 int pin_blobs(std::vector<std::pair<uintptr_t, uintptr_t>> r, std::vector<void*>& live) {
     int failed = 0;   // ranges left pageable (a copy from them still works, through the driver's staging)
@@ -253,18 +215,6 @@ int pin_blobs(std::vector<std::pair<uintptr_t, uintptr_t>> r, std::vector<void*>
     return failed;
 }
 void unpin_blobs(std::vector<void*>& v) {
-    /*
-    DPCT1027: The call to cudaHostUnregister was replaced with 0 because
-    SYCL currently does not support registering of existing host memory for use
-    by device. Use USM to allocate memory for use by host and device.
-    */
-    for (void *p : v)(void) 0;
-    /*
-    DPCT1010: SYCL uses exceptions to report errors and does not use the
-    error codes. The cudaGetLastError function call was replaced with 0. You
-    need to rewrite this code.
-    */
-    (void)0;
     v.clear();
 }
 
@@ -311,14 +261,14 @@ static const char* pipe_dbg_env(const char* name) {
 // split then computed some experts from the wrong weights after the first adaptive swaps (garbage output).
 struct SwapHome {
     strata::core::ExpertCache* cache;
-    dpct::queue_ptr stream;
+    strata::ze::Stream* stream;
     int dev;
 };
 template <class Swap, class Locate>
 bool resident_stage_swaps(strata::core::FileExpertSource &src,
                           const std::vector<int32_t> &host_res,
                           int64_t n_expert, std::vector<Swap> &swaps,
-                          Locate locate) try {
+                          Locate locate) {
     if (!src.complement_ready() || swaps.empty()) return true;
     struct Staged { int32_t layer, in, out; int64_t q; };
     std::vector<Staged> staged;
@@ -333,13 +283,8 @@ bool resident_stage_swaps(strata::core::FileExpertSource &src,
         if (slot < 0) continue;
         const SwapHome home = locate(s.layer);
         const strata::core::OnDevice on(home.dev);
-        /*
-        DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy API.
-        While the origin API might be synchronous, it depends on the type of
-        operand memory, so you may need to call wait() on event return by memcpy
-        API to ensure synchronization behavior.
-        */
-
+        home.stream->memcpy(src.exchange_buffer(q), home.cache->device_slot(slot),
+                            (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer));
         bool seen = false;
         for (const SwapHome& u : used) seen = seen || u.stream == home.stream;
         if (!seen) used.push_back(home);
@@ -349,6 +294,7 @@ bool resident_stage_swaps(strata::core::FileExpertSource &src,
     if (!staged.empty()) {
         for (const SwapHome& u : used) {
             const strata::core::OnDevice on(u.dev);
+            u.stream->sync();
         }
         for (const Staged& x : staged)
             if (!src.stage_exchange(x.layer, x.in, x.out, x.q)) {
@@ -359,11 +305,6 @@ bool resident_stage_swaps(strata::core::FileExpertSource &src,
     }
     swaps.swap(kept);
     return true;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
 }
 
 struct Options {
@@ -1059,15 +1000,15 @@ struct GpuStage {
     strata::core::NativeDense dense;
     strata::core::NativeHead head;
     strata::core::SessionState ss;
-    dpct::queue_ptr stream = &dpct::get_in_order_queue();
+    strata::ze::Stream* stream = &strata::ze::default_stream();
     strata::core::ExpertCache cache;
     std::vector<std::pair<int32_t, int32_t>> profile;   ///< its layers' share of the profile, hottest first
     int32_t* d_res = nullptr;                            ///< the residency table on its device
     strata::core::Verifier ver;
     strata::core::Verifier ver_b;                        ///< --pipeline-windows: the odd windows' verifier
     strata::prefill::Prefill sp;
-    dpct::queue_ptr adapt_stream = &dpct::get_in_order_queue();
-    dpct::event_ptr adapt_ev = nullptr;
+    strata::ze::Stream* adapt_stream = &strata::ze::default_stream();
+    strata::ze::Event* adapt_ev = nullptr;
     bool adapt_live = false;                             ///< swaps of this request are in flight on it
     int32_t* mrope = nullptr;                            ///< --vision: the image-position table on its device
 };
@@ -1253,12 +1194,7 @@ void mem_mark(const char* where) {
     static const bool on = std::getenv("STRATA_TRACE") != nullptr;
     if (!on) return;
     size_t free_b = 0, total_b = 0;
-    /*
-    DPCT1106: 'cudaMemGetInfo' was migrated with the Intel extensions for
-    device information which may not be supported by all compilers or runtimes.
-    You may need to adjust the code.
-    */
-    dpct::get_current_device().get_memory_info(free_b, total_b);
+    strata::ze::mem_get_info(strata::ze::current_device(), &free_b, &total_b);
     std::fprintf(stderr, "strata trace: %lld MiB free after %s\n", (long long) (free_b >> 20), where);
 }
 
@@ -1500,22 +1436,24 @@ bool load_control_vectors(const Options& o, const strata::core::ModelGeometry& g
 // median would still follow a disturbance that lasts through half the bursts).  Each burst takes ~10 ms on an x16
 // PCIe 4 link, so the probe takes no longer than the one 1 GiB burst did.  `samples`, when given, gets every
 // burst's reading for the log.
-double probe_pcie_h2d_gbps(std::string *samples = nullptr, bool pin_source = false) try {
+double probe_pcie_h2d_gbps(std::string *samples = nullptr, bool pin_source = false) {
     constexpr size_t kBytes = 256ull << 20;
     constexpr int kBursts = 4;
     void* h = nullptr;
     void* d = nullptr;
     // PR #1669: a pageable source made the copy engine fault on a layer split (VM_NOT_FOUND), so a split pins it. A single card keeps the
     // pageable source of 0.1.41: pinned reads 1.7x faster, which moves the default pcie_frac (A750 0.28 -> 0.47, 10% slower decode).
-    if (DPCT_CHECK_ERROR(h = pin_source ? (void *)sycl::malloc_host(kBytes, dpct::get_in_order_queue()) : (void *)malloc(kBytes)) != 0 || h == nullptr) return -1.0;
-    if (DPCT_CHECK_ERROR(d = (void *)sycl::malloc_device(
-                             kBytes, dpct::get_in_order_queue())) != 0) {
-        if (pin_source) sycl::free(h, dpct::get_in_order_queue()); else free(h);
+    h = pin_source ? strata::ze::malloc_host(kBytes) : malloc(kBytes);
+    if (h == nullptr) return -1.0;
+    d = strata::ze::malloc_device(kBytes);
+    if (d == nullptr) {
+        if (pin_source) strata::ze::free(h); else free(h);
         return -1.0;
     }
     std::memset(h, 0, kBytes);   // fault the pages in before timing
-    dpct::get_in_order_queue().memcpy(
-        d, h, kBytes).wait(); // warmup: context up, copy engine primed
+    strata::ze::Stream& s0 = strata::ze::default_stream();
+    s0.memcpy(d, h, kBytes);   // warmup: context up, copy engine primed
+    s0.sync();
     float ms[kBursts] = {};
 #if defined(STRATA_USE_HIP) && defined(_WIN32)
     // Windows HIP: the events do not bracket the copies there (an RX 6800 read 3,300-26,000 GB/s, so every link kept
@@ -1530,36 +1468,18 @@ double probe_pcie_h2d_gbps(std::string *samples = nullptr, bool pin_source = fal
     }
 #else
     // the bursts run back to back on the stream, an event between each two
-    dpct::event_ptr ev[kBursts + 1];
-    int n_ev = 0;
-    while (n_ev <= kBursts &&
-           DPCT_CHECK_ERROR(ev[n_ev] = new sycl::event()) == 0)++ n_ev;
-    bool ok = n_ev == kBursts + 1;
-    if (ok) {
-        dpct::sync_barrier(ev[0]);
-        for (int b = 0; b < kBursts; ++b) {
-            /*
-            DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy
-            API. While the origin API might be synchronous, it depends on the
-            type of operand memory, so you may need to call wait() on event
-            return by memcpy API to ensure synchronization behavior.
-            */
-            dpct::get_in_order_queue().memcpy(d, h, kBytes).wait();
-            dpct::sync_barrier(ev[b + 1]);
-        }
-        ok = DPCT_CHECK_ERROR(ev[kBursts]->wait_and_throw()) == 0;
-        for (int b = 0; b < kBursts && ok; ++b) ok =
-            DPCT_CHECK_ERROR(
-                ms[b] =
-                    (ev[b + 1]
-                         ->get_profiling_info<
-                             sycl::info::event_profiling::command_end>() -
-                     ev[b]
-                         ->get_profiling_info<
-                             sycl::info::event_profiling::command_start>()) /
-                    1000000.0f) == 0;
+    strata::ze::Event* ev[kBursts + 1];
+    for (int i = 0; i <= kBursts; ++i) ev[i] = new strata::ze::Event(true);
+    const bool ok = true;
+    s0.record(*ev[0]);
+    for (int b = 0; b < kBursts; ++b) {
+        s0.memcpy(d, h, kBytes);
+        s0.sync();
+        s0.record(*ev[b + 1]);
     }
-    for (int i = 0; i < n_ev; ++i) dpct::destroy_event(ev[i]);
+    ev[kBursts]->sync();
+    for (int b = 0; b < kBursts; ++b) ms[b] = ev[b + 1]->elapsed_ms_since(*ev[b]);
+    for (int i = 0; i <= kBursts; ++i) delete ev[i];
 #endif
     double bw = -1.0;
     if (samples != nullptr) samples->clear();
@@ -1572,20 +1492,9 @@ double probe_pcie_h2d_gbps(std::string *samples = nullptr, bool pin_source = fal
             *samples += buf;
         }
     }
-    /*
-    DPCT1010: SYCL uses exceptions to report errors and does not use the
-    error codes. The cudaGetLastError function call was replaced with 0. You
-    need to rewrite this code.
-    */
-    if (!ok)(void) 0;
-    sycl::free(d, dpct::get_in_order_queue());
-    if (pin_source) sycl::free(h, dpct::get_in_order_queue()); else free(h);
+    strata::ze::free(d);
+    if (pin_source) strata::ze::free(h); else free(h);
     return bw;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
 }
 
 // The PCIe share of the missed experts for a link measured at `gbps`: `base` (the share measured on x16 links) from
@@ -1624,7 +1533,7 @@ static double ple_direct_rows_per_s(strata::kernels::PleTable& t) {
     return el > 0 ? (double) done / el : -1.0;
 }
 
-int main(int argc, char **argv) try {
+int main(int argc, char **argv) {
     // **UNBUFFERED, BECAUSE THE INTERESTING OUTPUT IS THE OUTPUT BEFORE A CRASH.**  `stdout` redirected to a
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
     // turns "it crashed at step 7" into "it crashed somewhere", and the difference is a debugging session.
@@ -2000,12 +1909,8 @@ int main(int argc, char **argv) try {
     bool split_auto = false, split_same = false;
     if (!o.layer_split.empty()) {
         int n_dev = 1;
-        if (DPCT_CHECK_ERROR(n_dev = dpct::device_count()) != 0 || n_dev < 1)
-            n_dev = 1;
-        /*
-        DPCT1026: The call to cudaGetLastError was removed because this
-        functionality is redundant in SYCL.
-        */
+        n_dev = strata::ze::device_count();
+        if (n_dev < 1) n_dev = 1;
         auto ints = [](const std::string &str, auto &out) -> bool {
             using V = typename std::decay_t<decltype(out)>::value_type;
             size_t a = 0;
@@ -2110,17 +2015,7 @@ int main(int argc, char **argv) try {
                 std::vector<int> devs = {0};
                 for (const int d : split_devs) devs.push_back(d);
                 for (const int d : devs) {
-                    dpct::device_info prop{};
-                    /*
-                    DPCT1026: The call to cudaGetLastError was removed
-                    because this functionality is redundant in SYCL.
-                    */
-                    if (DPCT_CHECK_ERROR(
-                            dpct::get_device(d).get_device_info(prop)) != 0) {
-                        ; own = false; break;
-                    }
-                    const int64_t total_mib =
-                        (int64_t)(prop.get_global_mem_size() >> 20);
+                    const int64_t total_mib = (int64_t) (strata::ze::device_info(d).total_mem >> 20);
                     if (reserve_mib * 100 > 12 * total_mib) {
                         own = false;
                         why = "CUDA" + std::to_string(d) + " has " + std::to_string(total_mib) + " MiB";
@@ -2140,12 +2035,8 @@ int main(int argc, char **argv) try {
             }
         }
         int n_vis = 1;
-        if (DPCT_CHECK_ERROR(n_vis = dpct::device_count()) != 0 || n_vis < 1)
-            n_vis = 1;
-        /*
-        DPCT1026: The call to cudaGetLastError was removed because this
-        functionality is redundant in SYCL.
-        */
+        n_vis = strata::ze::device_count();
+        if (n_vis < 1) n_vis = 1;
         int next_free = 1;
         for (int r = 0; r < 3; ++r) {
             if (o.expert_cache_remote[(size_t) r] <= 0) continue;
@@ -2185,10 +2076,10 @@ int main(int argc, char **argv) try {
             try {
                 // PCI device ids, the same table setup_intel.py uses: 56a0 A770, 56a1 A750, 56a2 A580, 56a5 A380,
                 // 56a6 A310, 5690 A770M
-                const unsigned id = dpct::get_current_device().get_info<sycl::ext::intel::info::device::device_id>();
+                const unsigned id = strata::ze::device_info(strata::ze::current_device()).device_id;
                 // Only a card with room for an expert cache past 4 GiB can hit it: on an 8 GB A750 the cache was 0.34 GiB
                 // and the own-buffers reservation cost experts (prompt 72 -> 52 tok/s, decode -6%, 4K prompt, 4 rounds)
-                if (dpct::get_current_device().get_info<sycl::info::device::global_mem_size>() < (12ull << 30)) return false;
+                if (strata::ze::device_info(strata::ze::current_device()).total_mem < (12ull << 30)) return false;
                 switch (id & 0xffffu) {
                 case 0x56a0: case 0x56a1: case 0x56a2: case 0x56a5: case 0x56a6: case 0x5690: return true;
                 default: return false;
@@ -2771,31 +2662,12 @@ int main(int argc, char **argv) try {
         std::fprintf(stderr, "strata generate: %s\n", err.c_str());
         return 1;
     }
-    void* arena = nullptr;
-    /*
-    DPCT1000: Error handling if-stmt was detected but could not be
-    rewritten.
-    */
-    if (const dpct::err0 ce =
-            DPCT_CHECK_ERROR(arena = (void *)strata::malloc_device_guarded(
-                                 pool_bytes, dpct::get_in_order_queue()));
-        ce != 0) {
+    void* arena = strata::ze::malloc_device_guarded(pool_bytes, -1, "weight arena");
+    if (arena == nullptr) {
         // #486: the arena is the first large allocation and its size does not depend on the context, so what is
         // missing is held by something else: say how much was free
-        /*
-        DPCT1026: The call to cudaGetLastError was removed because this
-        functionality is redundant in SYCL.
-        */
-        /*
-        DPCT1001: The statement could not be removed.
-        */
         size_t free_b = 0, total_b = 0;
-        /*
-        DPCT1106: 'cudaMemGetInfo' was migrated with the Intel extensions
-        for device information which may not be supported by all compilers or
-        runtimes. You may need to adjust the code.
-        */
-        dpct::get_current_device().get_memory_info(free_b, total_b);
+        strata::ze::mem_get_info(strata::ze::current_device(), &free_b, &total_b);
         std::fprintf(
             stderr,
             "strata generate: cudaMalloc(%llu) for the weight arena failed "
@@ -2805,12 +2677,7 @@ int main(int argc, char **argv) try {
             "caches: another program (or an engine that is still exiting) "
             "holds the rest - "
             "nvidia-smi / rocm-smi lists them\n",
-            /*
-            DPCT1009: SYCL reports errors using exceptions and does not use
-            error codes. Please replace the "get_error_string_dummy(...)" with a
-            real error-handling function.
-            */
-            (unsigned long long)pool_bytes, dpct::get_error_string_dummy(ce),
+            (unsigned long long)pool_bytes, "out of device memory",
             (unsigned long long)(free_b >> 20),
             (unsigned long long)(total_b >> 20));
         return 1;
@@ -2870,21 +2737,13 @@ int main(int argc, char **argv) try {
         mrope_host.resize((size_t) cells * 3);
         for (int64_t c = 0; c < cells; ++c)
             mrope_host[(size_t) c * 3] = mrope_host[(size_t) c * 3 + 1] = mrope_host[(size_t) c * 3 + 2] = (int32_t) c;
-        if (DPCT_CHECK_ERROR(
-                d_mrope = sycl::malloc_device<int32_t>(
-                    mrope_host.size(), dpct::get_in_order_queue())) != 0 ||
-            /*
-            DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-            assuming in the original code the source host memory is pageable
-            memory. If the memory is not pageable, call wait() on event return
-            by memcpy API to ensure synchronization behavior.
-            */
-            DPCT_CHECK_ERROR(dpct::get_in_order_queue().memcpy(
-                d_mrope, mrope_host.data(),
-                mrope_host.size() * sizeof(int32_t)).wait()) != 0) {
+        d_mrope = (int32_t*) strata::ze::malloc_device(mrope_host.size() * sizeof(int32_t));
+        if (d_mrope == nullptr) {
             std::fprintf(stderr, "strata generate: cannot allocate the image position table\n");
             return 1;
         }
+        strata::ze::default_stream().memcpy(d_mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t));
+        strata::ze::default_stream().sync();
         strata::kernels::mrope_table_set(d_mrope);
     }
     strata::kernels::ple_set_native_postops(o.native_ple_postops);
@@ -2913,16 +2772,7 @@ int main(int argc, char **argv) try {
     // on 10,240 floats being indistinguishable, which is a fixed per-launch cost and not execution.
     // `bench/micro/graph_node_cost.cu` measures the same kernels on a real stream at 3.63 us ungrapped and
     // 0.805 us inside a graph.  **That is an ~8x penalty on every launch in the engine.**
-    dpct::queue_ptr main_stream = &dpct::get_in_order_queue();
-    /*
-    DPCT1025: The SYCL queue is created ignoring the flag and priority
-    options.
-    */
-    if (DPCT_CHECK_ERROR(
-            main_stream = dpct::get_current_device().create_queue(true)) != 0) {
-        std::fprintf(stderr, "strata generate: cannot create the main stream\n");
-        return 1;
-    }
+    strata::ze::Stream* main_stream = new strata::ze::Stream();
     void* const main_cs = (void*) main_stream;
 
     // ---- **THE HALF-LEVEL DUMP HAS TO BE ARMED BEFORE `session_capture`, AND THE LADDER MUST NOT BE.**  The
@@ -2942,13 +2792,8 @@ int main(int argc, char **argv) try {
             return 1;
         }
         const size_t n = (size_t) g.n_layers * (size_t) half_stride;
-        /*
-        DPCT1048: The original value cudaHostAllocDefault is not meaningful
-        in the migrated code and was removed or replaced with 0. You may need to
-        check the migrated code.
-        */
-        if (DPCT_CHECK_ERROR(half_stage = sycl::malloc_host<float>(
-                                 n, dpct::get_in_order_queue())) != 0) {
+        half_stage = (float*) strata::ze::malloc_host((n) * sizeof(float));
+        if (half_stage == nullptr) {
             std::fprintf(stderr, "strata generate: cannot pin the half-dump staging buffer\n");
             return 1;
         }
@@ -3102,12 +2947,9 @@ int main(int argc, char **argv) try {
         // `ss.ple.hist` and the ready() check wait for `session_init`, which carves the history - the session is
         // now allocated after the layer-split search (see the carve), and the wiring lands there
         ss.ple.emb_host = ple_emb_host.data();
-        if (DPCT_CHECK_ERROR(ple_emb_dev = (float *)sycl::malloc_device(
-                                 (size_t)strata::kernels::NG_N_EMBD * 4,
-                                 dpct::get_in_order_queue())) != 0 ||
-            DPCT_CHECK_ERROR(ple_scratch = (float *)sycl::malloc_device(
-                                 strata::core::ple_run_scratch_bytes(),
-                                 dpct::get_in_order_queue())) != 0) {
+        ple_emb_dev = (float*) strata::ze::malloc_device((size_t) strata::kernels::NG_N_EMBD * 4);
+        ple_scratch = (float*) strata::ze::malloc_device(strata::core::ple_run_scratch_bytes());
+        if (ple_emb_dev == nullptr || ple_scratch == nullptr) {
             std::fprintf(stderr, "strata generate: the PLE buffers failed\n");
             return 1;
         }
@@ -3120,15 +2962,13 @@ int main(int argc, char **argv) try {
     }
 
     float* d_parts = nullptr;
-    if (DPCT_CHECK_ERROR(
-            d_parts = (float *)sycl::malloc_device(
-                (size_t)K * g.n_embd * 4, dpct::get_in_order_queue())) != 0 ||
-        DPCT_CHECK_ERROR(dpct::get_in_order_queue()
-                             .memset(d_parts, 0, (size_t)K * g.n_embd * 4)
-                             .wait()) != 0) {
+    d_parts = (float*) strata::ze::malloc_device((size_t) K * g.n_embd * 4);
+    if (d_parts == nullptr) {
         std::fprintf(stderr, "strata generate: the parts buffer failed\n");
         return 1;
     }
+    strata::ze::default_stream().memset(d_parts, 0, (size_t) K * g.n_embd * 4);
+    strata::ze::default_stream().sync();
 
     // ---- --split-skip-if-fits: before any later stage loads, does CUDA0 alone hold every profiled pair?  What it
     // still has to allocate on one GPU is the whole session (the KV of every layer), the drafter and the head
@@ -3149,17 +2989,11 @@ int main(int argc, char **argv) try {
             for (const auto& pr : prof)
                 pairs_bytes += native_pack ? ((int64_t) lay.blob_bytes(pr.first) + 255) / 256 * 256 : (int64_t) lay.max_blob;
             size_t fb = 0, tb = 0;
-            /*
-            DPCT1106: 'cudaMemGetInfo' was migrated with the Intel
-            extensions for device information which may not be supported by all
-            compilers or runtimes. You may need to adjust the code.
-            */
-            dpct::get_current_device().get_memory_info(fb, tb);
+            strata::ze::mem_get_info(strata::ze::current_device(), &fb, &tb);
             const int64_t session = (int64_t) strata::core::session_bytes(g, o.max_context, K, 0, g.n_layers);
             const int64_t held_back = session + (((int64_t) o.vram_reserve_mib + 1000 + 96) << 20);   // + drafter/head, windows
             const int64_t room = (int64_t) fb - held_back;
-            dpct::device_info dp{};
-            dpct::get_device(0).get_device_info(dp);
+            const char* dp_name = strata::ze::device_info(0).name.c_str();
             if (pairs_bytes <= room) {
                 std::fprintf(stderr,
                              "strata generate: layer split skipped "
@@ -3168,7 +3002,7 @@ int main(int argc, char **argv) try {
                              "(%.2f GiB, %lld-token context), "
                              "the drafter and the reserve: %.2f GiB free, %.2f "
                              "GiB to spare - one GPU\n",
-                             dp.get_name(), prof.size(),
+                             dp_name, prof.size(),
                              (double)pairs_bytes / 1073741824.0,
                              (double)session / 1073741824.0,
                              (long long)o.max_context,
@@ -3186,7 +3020,7 @@ int main(int argc, char **argv) try {
                              "profile's %.2f GiB (%.2f GiB free, %.2f GiB for "
                              "the session, drafter and "
                              "reserve): the split stays\n",
-                             dp.get_name(),
+                             dp_name,
                              (double)std::max<int64_t>(room, 0) / 1073741824.0,
                              (double)pairs_bytes / 1073741824.0,
                              (double)fb / 1073741824.0,
@@ -3220,8 +3054,7 @@ int main(int argc, char **argv) try {
     // One stage's dense weights on its device (the caller has made it current): `trim` = only layers [lb, le).
     auto load_stage_weights = [&](GpuStage &st, int64_t lb, int64_t le,
                                   bool trim) -> bool {
-        try {
-    std::set<std::string> skip_s = skip_base;
+        std::set<std::string> skip_s = skip_base;
         uint64_t pool_s = pool_bytes;
         if (trim) {
             add_foreign(lb, le, skip_s, false);
@@ -3235,22 +3068,12 @@ int main(int argc, char **argv) try {
         } else {
             skip_s = skip;
         }
-        void* arena_s = nullptr;
-        if (DPCT_CHECK_ERROR(arena_s = (void *)strata::malloc_device_guarded(
-                                 pool_s, dpct::get_in_order_queue())) != 0 ||
+        void* arena_s = strata::ze::malloc_device_guarded(pool_s, -1, "weight arena");
+        if (arena_s == nullptr ||
             !st.wt.load(o.pack, arena_s, pool_s, err,
                         skip_s.empty() ? nullptr : &skip_s)) {
-            /*
-            DPCT1026: The call to cudaGetLastError was removed because this
-            functionality is redundant in SYCL.
-            */
             size_t free_b = 0, total_b = 0; // #486: what that card had free
-            /*
-            DPCT1106: 'cudaMemGetInfo' was migrated with the Intel
-            extensions for device information which may not be supported by all
-            compilers or runtimes. You may need to adjust the code.
-            */
-            dpct::get_current_device().get_memory_info(free_b, total_b);
+            strata::ze::mem_get_info(strata::ze::current_device(), &free_b, &total_b);
             std::fprintf(stderr, "strata generate: layer split, CUDA%d weights: %s (%llu MiB needed, %llu MiB of %llu "
                                  "MiB free on that card)\n", st.dev,
                          err.empty() ? "the weight arena does not fit" : err.c_str(),
@@ -3264,12 +3087,6 @@ int main(int argc, char **argv) try {
             return false;
         }
         return true;
-    }
-    catch (sycl::exception const &exc) {
-      std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-                << ", line:" << __LINE__ << std::endl;
-      std::exit(1);
-    }
     };
     for (size_t i = 0; multi_gpu && i < split_devs.size(); ++i) {
         stages.push_back(std::make_unique<GpuStage>());
@@ -3291,24 +3108,9 @@ int main(int argc, char **argv) try {
         // THE SESSION AND THE HEAD WAIT FOR THE SPLIT SEARCH.  `session_bytes` prices a stage's session by its
         // LAYER RANGE (the carve - every stage used to hold all 48 layers' state whatever it ran), so the
         // sessions are allocated after the search below has set `st.lb`/`st.le`; the last stage's head follows.
-        /*
-        DPCT1025: The SYCL queue is created ignoring the flag and priority
-        options.
-        */
-        if (DPCT_CHECK_ERROR(
-                st.stream = dpct::get_current_device().create_queue(true)) !=
-                0 ||
-            /*
-            DPCT1025: The SYCL queue is created ignoring the flag and
-            priority options.
-            */
-            DPCT_CHECK_ERROR(
-                st.adapt_stream =
-                    dpct::get_current_device().create_queue(true)) != 0 ||
-            DPCT_CHECK_ERROR(st.adapt_ev = new sycl::event()) != 0) {
-            std::fprintf(stderr, "strata generate: layer split, CUDA%d: its streams failed\n", st.dev);
-            return 1;
-        }
+        st.stream = new strata::ze::Stream();
+        st.adapt_stream = new strata::ze::Stream();
+        st.adapt_ev = new strata::ze::Event();
         // a control vector (the speed projection): its tables on this device too - the stage's layers apply it here
         if (!strata::kernels::cvec_replicate(err)) {
             std::fprintf(stderr, "strata generate: layer split, CUDA%d: %s\n", st.dev, err.c_str());
@@ -3317,21 +3119,13 @@ int main(int argc, char **argv) try {
         // --vision: this device's image-position table (the identity until a picture request), read by every rope
         // kernel its stage runs - set before any of its graphs is captured
         if (o.vision) {
-            if (DPCT_CHECK_ERROR(
-                    st.mrope = sycl::malloc_device<int32_t>(
-                        mrope_host.size(), dpct::get_in_order_queue())) != 0 ||
-                /*
-                DPCT1114: cudaMemcpy is migrated to asynchronization
-                memcpy, assuming in the original code the source host memory is
-                pageable memory. If the memory is not pageable, call wait() on
-                event return by memcpy API to ensure synchronization behavior.
-                */
-                DPCT_CHECK_ERROR(dpct::get_in_order_queue().memcpy(
-                    st.mrope, mrope_host.data(),
-                    mrope_host.size() * sizeof(int32_t)).wait()) != 0) {
+            st.mrope = (int32_t*) strata::ze::malloc_device(mrope_host.size() * sizeof(int32_t));
+            if (st.mrope == nullptr) {
                 std::fprintf(stderr, "strata generate: layer split, CUDA%d: the image position table failed\n", st.dev);
                 return 1;
             }
+            strata::ze::default_stream().memcpy(st.mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t));
+            strata::ze::default_stream().sync();
             strata::kernels::mrope_table_set(st.mrope);
         }
         // its own PCIe share of the missed experts (the same rule as CUDA0's above: its link is probed).  A given
@@ -3346,12 +3140,7 @@ int main(int argc, char **argv) try {
         }
         if (!late_weights) {
             size_t fb = 0, tb = 0;
-            /*
-            DPCT1106: 'cudaMemGetInfo' was migrated with the Intel
-            extensions for device information which may not be supported by all
-            compilers or runtimes. You may need to adjust the code.
-            */
-            dpct::get_current_device().get_memory_info(fb, tb);
+            strata::ze::mem_get_info(strata::ze::current_device(), &fb, &tb);
             std::fprintf(stderr, "strata generate: layer split: CUDA%d holds its weights; %.2f GiB free (its session "
                                  "follows the split search)\n", st.dev, (double) fb / 1073741824.0);
         }
@@ -3475,15 +3264,9 @@ int main(int argc, char **argv) try {
     }();
     auto stage_room = [&](int dev, bool later, bool drafter,
                           bool search = false) -> int64_t {
-        try {
-    const strata::core::OnDevice on(dev);
+        const strata::core::OnDevice on(dev);
         size_t fb = 0, tb = 0;
-        dpct::get_current_device().get_memory_info(fb, tb);   // #423 (tmking01): dpct dropped cudaMemGetInfo here
-        /*
-        DPCT1106: 'cudaMemGetInfo' was migrated with the Intel extensions
-        for device information which may not be supported by all compilers or
-        runtimes. You may need to adjust the code.
-        */
+        strata::ze::mem_get_info(strata::ze::current_device(), &fb, &tb);   // #423 (tmking01): dpct dropped cudaMemGetInfo here
 
         const int64_t pf = search && split_own_auto && !place_with_reserve ? 0 : split_pf_mib;
         const int64_t base_reserve =
@@ -3491,12 +3274,6 @@ int main(int argc, char **argv) try {
         const int64_t reserve = (base_reserve + pf + (later ? kWindowMib : kPipeSnapMib) +
                                  kPipeWindowMib + (drafter ? kDrafterMib : 0)) << 20;
         return std::max<int64_t>((int64_t) fb - reserve, 0);
-    }
-    catch (sycl::exception const &exc) {
-      std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-                << ", line:" << __LINE__ << std::endl;
-      std::exit(1);
-    }
     };
     if (multi_gpu && split_auto) {
         const auto& lay = strata::kernels::cpu::expert_layout();
@@ -3508,15 +3285,11 @@ int main(int argc, char **argv) try {
             cap[(size_t) i] = stage_room(i == 0 ? -1 : dev, i > 0, i + 1 == ns, true);
             if (late_weights) cap[(size_t) i] = std::max<int64_t>(cap[(size_t) i] - (int64_t) stage_pool[(size_t) i], 0);
             int sms = 0, khz = 0;
-            sms = dpct::get_device(dev).get_max_compute_units();
-            if (DPCT_CHECK_ERROR(
-                    khz = dpct::get_device(dev).get_max_clock_frequency()) !=
-                    0 ||
-                khz <= 0) khz = 1800000;
-            /*
-            DPCT1026: The call to cudaGetLastError was removed because this
-            functionality is redundant in SYCL.
-            */
+            sms = (int) strata::ze::device_info(dev).eu_count;
+            ze_device_properties_t zp{ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES};
+            if (zeDeviceGetProperties(strata::ze::device_handle(dev), &zp) == ZE_RESULT_SUCCESS)
+                khz = (int) zp.coreClockRate * 1000;
+            if (khz <= 0) khz = 1800000;
             const double speed =
                 std::max(1.0, (double)sms * (double)khz / 1e6); // SMs x GHz
             layer_ms[(size_t) i] = 0.33 * (84.0 * 2.617) / speed;
@@ -3748,12 +3521,7 @@ int main(int argc, char **argv) try {
             const strata::core::OnDevice on(st.dev);
             if (!load_stage_weights(st, st.lb, st.le, true)) return 1;
             size_t fb = 0, tb = 0;
-            /*
-            DPCT1106: 'cudaMemGetInfo' was migrated with the Intel
-            extensions for device information which may not be supported by all
-            compilers or runtimes. You may need to adjust the code.
-            */
-            dpct::get_current_device().get_memory_info(fb, tb);
+            strata::ze::mem_get_info(strata::ze::current_device(), &fb, &tb);
             std::fprintf(stderr, "strata generate: layer split: CUDA%d holds its weights; %.2f GiB free (its session "
                                  "follows)\n", st.dev, (double) fb / 1073741824.0);
         }
@@ -3784,10 +3552,8 @@ int main(int argc, char **argv) try {
             strata::core::qsa_set_kv_elastic(on, iv != nullptr && std::atoll(iv) > 0 ? std::atoll(iv) : 16384);
             strata::core::ExpertCache::set_vmm(on);
         }
-        if (DPCT_CHECK_ERROR(
-                sbuf = (void *)sycl::malloc_device(
-                    strata::core::session_bytes(g, o.max_context, K, 0, hi0),
-                    dpct::get_in_order_queue())) != 0) {
+        sbuf = (void *)strata::ze::malloc_device(strata::core::session_bytes(g, o.max_context, K, 0, hi0));
+        if (sbuf == nullptr) {
             std::fprintf(stderr, "strata generate: session state allocation failed\n");
             return 1;
         }
@@ -3805,11 +3571,7 @@ int main(int argc, char **argv) try {
         // (#167) generate mode starts from an empty sequence, and nothing else zeroes this state before the prompt
         // path or the verifier reads it (--serve zeroes it per request when nothing is reused)
         strata::core::session_zero(ss, g, nullptr, main_cs);
-        if (DPCT_CHECK_ERROR(
-                dpct::get_current_device().queues_wait_and_throw()) != 0) {
-            std::fprintf(stderr, "strata generate: zeroing the session state failed\n");
-            return 1;
-        }
+        strata::ze::device_sync();
         if (!o.ple_gguf.empty()) {
             if (!ss.ple.ready()) {
                 std::fprintf(stderr, "strata generate: the PLE run is not ready after construction\n");
@@ -3822,11 +3584,8 @@ int main(int argc, char **argv) try {
     for (size_t i = 0; i < stages.size(); ++i) {
         GpuStage& st = *stages[i];
         const strata::core::OnDevice on(st.dev);
-        void* sbuf_s = nullptr;
-        if (DPCT_CHECK_ERROR(sbuf_s = (void *)sycl::malloc_device(
-                                 strata::core::session_bytes(g, o.max_context,
-                                                             K, st.lb, st.le),
-                                 dpct::get_in_order_queue())) != 0 ||
+        void* sbuf_s = strata::ze::malloc_device(strata::core::session_bytes(g, o.max_context, K, st.lb, st.le));
+        if (sbuf_s == nullptr ||
             strata::core::session_init(g, o.max_context, K, sbuf_s, st.ss,
                                        st.lb, st.le) == 0) {
             std::fprintf(stderr, "strata generate: layer split, CUDA%d: the session state failed\n", st.dev);
@@ -3842,12 +3601,7 @@ int main(int argc, char **argv) try {
             return 1;
         }
         size_t fb = 0, tb = 0;
-        /*
-        DPCT1106: 'cudaMemGetInfo' was migrated with the Intel extensions
-        for device information which may not be supported by all compilers or
-        runtimes. You may need to adjust the code.
-        */
-        dpct::get_current_device().get_memory_info(fb, tb);
+        strata::ze::mem_get_info(strata::ze::current_device(), &fb, &tb);
         std::fprintf(stderr, "strata generate: layer split: CUDA%d holds its weights, session [%lld, %lld)%s; "
                              "%.2f GiB free\n", st.dev, (long long) st.lb, (long long) st.le,
                      last ? " and the head" : "", (double) fb / 1073741824.0);
@@ -3902,26 +3656,14 @@ int main(int argc, char **argv) try {
             if (k == 0) bytes0 = bytes;
             for (int b = 0; b < fit; ++b) {
                 auto u = std::make_unique<strata::core::SessionState>();
-                void* buf = nullptr;
-                if (DPCT_CHECK_ERROR(buf = (void *)sycl::malloc_device(
-                                         bytes, dpct::get_in_order_queue())) !=
-                        0 ||
+                void* buf = strata::ze::malloc_device(bytes);
+                if (buf == nullptr ||
                     strata::core::session_init(g, o.max_context, K, buf, *u, lo,
                                                hi) == 0) {
-                    /*
-                    DPCT1026: The call to cudaGetLastError was removed
-                    because this functionality is redundant in SYCL.
-                    */
                     if (buf != nullptr)
-                        sycl::free(buf, dpct::get_in_order_queue());
+                        strata::ze::free(buf);
                     size_t fb = 0, tb = 0;
-                    /*
-                    DPCT1106: 'cudaMemGetInfo' was migrated with the Intel
-                    extensions for device information which may not be supported
-                    by all compilers or runtimes. You may need to adjust the
-                    code.
-                    */
-                    dpct::get_current_device().get_memory_info(fb, tb);
+                    strata::ze::mem_get_info(strata::ze::current_device(), &fb, &tb);
                     std::fprintf(stderr, "strata generate: WARNING: --batch %d: slot %d's session does not fit on CUDA%d "
                                          "(%.2f GiB each, %.2f GiB free); %d slot%s\n", o.batch, b, dev,
                                  (double) bytes / 1073741824.0, (double) fb / 1073741824.0, b, b == 1 ? "" : "s");
@@ -3931,14 +3673,9 @@ int main(int argc, char **argv) try {
                 strata::core::session_zero(*u, g, nullptr, nullptr);
                 bslot_ss[k].push_back(std::move(u));
             }
-            dpct::get_current_device().queues_wait_and_throw();
+            strata::ze::device_sync();
             size_t fb = 0, tb = 0;
-            /*
-            DPCT1106: 'cudaMemGetInfo' was migrated with the Intel
-            extensions for device information which may not be supported by all
-            compilers or runtimes. You may need to adjust the code.
-            */
-            dpct::get_current_device().get_memory_info(fb, tb);
+            strata::ze::mem_get_info(strata::ze::current_device(), &fb, &tb);
             std::fprintf(stderr, "strata generate: --batch: %d slot sessions on CUDA%d (%.2f GiB each); %.2f GiB free\n",
                          (int) bslot_ss[k].size(), dev, (double) bytes / 1073741824.0, (double) fb / 1073741824.0);
         }
@@ -4020,14 +3757,8 @@ int main(int argc, char **argv) try {
     }
     std::vector<float> logits((size_t) n_vocab);
     float* d_logits = nullptr;
-    if (DPCT_CHECK_ERROR(
-            d_logits = (float *)sycl::malloc_device(
-                (size_t)n_vocab * 4, dpct::get_in_order_queue())) != 0) {
-        /*
-        DPCT1010: SYCL uses exceptions to report errors and does not use
-        the error codes. The cudaGetLastError function call was replaced with 0.
-        You need to rewrite this code.
-        */
+    d_logits = (float *)strata::ze::malloc_device((size_t)n_vocab * 4);
+    if (d_logits == nullptr) {
         (void)0;
         std::fprintf(stderr, "strata generate: the logits buffer failed%s\n", vram_free_note().c_str());
         return 1;
@@ -4067,19 +3798,19 @@ int main(int argc, char **argv) try {
     strata::core::FileExpertSource src;
     {   // the card, and whether this build has code for it (a binary built for other GPUs fails at its first kernel
         // otherwise, after the whole expert arena has loaded) - before the arena starts loading
-        int dev = 0;
-        dpct::device_info p{};
-        const bool named =
-            DPCT_CHECK_ERROR(dev = dpct::get_current_device_id()) == 0 &&
-            DPCT_CHECK_ERROR(dpct::get_device(dev).get_device_info(p)) == 0;
-        /*
-        DPCT1010: SYCL uses exceptions to report errors and does not use
-        the error codes. The cudaGetLastError function call was replaced with 0.
-        You need to rewrite this code.
-        */
-        if (!named) 0;
-        const char *name =
-            named && p.get_name()[0] ? p.get_name() : "(an unnamed GPU)";
+        const int dev = strata::ze::current_device();
+        const strata::ze::DeviceInfo& p = strata::ze::device_info(dev);
+        int ip_major = 0, ip_minor = 0;
+        {
+            ze_device_ip_version_ext_t ip{ZE_STRUCTURE_TYPE_DEVICE_IP_VERSION_EXT};
+            ze_device_properties_t zp{ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES};
+            zp.pNext = &ip;
+            if (zeDeviceGetProperties(strata::ze::device_handle(dev), &zp) == ZE_RESULT_SUCCESS) {
+                ip_major = (int) (ip.ipVersion >> 22);
+                ip_minor = (int) ((ip.ipVersion >> 14) & 0xff);
+            }
+        }
+        const char *name = !p.name.empty() ? p.name.c_str() : "(an unnamed GPU)";
 #if defined(STRATA_USE_HIP)
         std::fprintf(stderr, "strata generate: GPU %d: %s (%s)\n", dev, name, named ? p.gcnArchName : "?");
 #if defined(_WIN32)
@@ -4094,43 +3825,11 @@ int main(int argc, char **argv) try {
         std::fprintf(
             stderr, "strata generate: GPU %d: %s, compute capability %d.%d%s\n",
             dev, name,
-            /*
-            DPCT1005: The SYCL device version is different from CUDA
-            Compute Compatibility. You may need to rewrite this code.
-            */
-            strata::cc_major_of(p.get_major_version()),
-            strata::cc_minor_of(p.get_minor_version()),
+            strata::cc_major_of(ip_major),
+            strata::cc_minor_of(ip_minor),
             strata::emulated_cc()
                 ? " (STRATA_EMULATE_CC: a test mode, the card is emulated)"
                 : "");
-#if 0 // the SYCL port has no CUDA runtime to mismatch (#542): dpct::get_major_version is the device version
-#if !defined(STRATA_HIP_GFX906) // a CUDA toolkit mismatch; the gfx906 HIP build
-                                // has no DPCT_COMPAT_RT_VERSION
-        {   // #542: a build whose libcudart is older than its headers (a CUDA 13 kit with a dangling libcudart.so that
-            // CMake resolved to the system's CUDA 12 one) reads cudaDeviceProp shifted - silently, and slowly
-            int rt = 0;
-            /*
-            DPCT1043: The version-related API is different in SYCL. An
-            initial code was generated, but you need to adjust it.
-            */
-            if (DPCT_CHECK_ERROR(rt = dpct::get_major_version(
-                                     dpct::get_current_device())) == 0 &&
-                rt / 1000 != DPCT_COMPAT_RT_VERSION / 1000)
-                std::fprintf(
-                    stderr,
-                    "strata generate: WARNING: this engine was compiled with "
-                    "CUDA %d.%d headers but "
-                    "loaded a CUDA %d.%d runtime (libcudart): GPU properties "
-                    "can read wrong and some "
-                    "kernels go unused. Rebuild it against one toolkit (cmake "
-                    "-DCUDAToolkit_ROOT=<the "
-                    "toolkit>, with its libcudart.so present) (#542)\n",
-                    DPCT_COMPAT_RT_VERSION / 1000,
-                    DPCT_COMPAT_RT_VERSION % 1000 / 10, rt / 1000,
-                    rt % 1000 / 10);
-        }
-#endif
-#endif // #if 0
 #endif
         const std::string e = strata::core::device_code_error();
         if (!e.empty()) {
@@ -4138,12 +3837,8 @@ int main(int argc, char **argv) try {
                 stderr,
                 "strata generate: this engine has no code for %s (sm_%d%d): %s "
                 "- rebuild it for this "
-                /*
-                DPCT1005: The SYCL device version is different from CUDA
-                Compute Compatibility. You may need to rewrite this code.
-                */
                 "card (setup does: START-HERE.bat --setup)\n",
-                name, p.get_major_version(), p.get_minor_version(), e.c_str());
+                name, ip_major, ip_minor, e.c_str());
             return 1;
         }
     }
@@ -4388,12 +4083,7 @@ int main(int argc, char **argv) try {
     uint64_t per_layer_bytes = 0;
     if (native_pack && o.expert_cache > 0 && o.expert_cache_per_layer) {
         size_t free_b = 0, total_b = 0;
-        /*
-        DPCT1106: 'cudaMemGetInfo' was migrated with the Intel extensions
-        for device information which may not be supported by all compilers or
-        runtimes. You may need to adjust the code.
-        */
-        dpct::get_current_device().get_memory_info(free_b, total_b);
+        strata::ze::mem_get_info(strata::ze::current_device(), &free_b, &total_b);
         const auto& lay = strata::kernels::cpu::expert_layout();
         const int asked = o.expert_cache;
         const uint64_t budget = (uint64_t) asked * lay.max_blob;
@@ -4542,8 +4232,8 @@ int main(int argc, char **argv) try {
                 return 1;
             }
             if (!auto_cache || attempt - failed >= 6) break;
-            if (uint8_t* slot0 = xcache.device_slot(0)) strata::big_fill_zero(dpct::get_in_order_queue(), slot0, (size_t)xcache.bytes());
-            dpct::get_current_device().queues_wait_and_throw();
+            if (uint8_t* slot0 = xcache.device_slot(0)) strata::ze::fill_zero(strata::ze::default_stream(), slot0, (size_t)xcache.bytes());
+            strata::ze::device_sync();
             size_t free_b = 0, total_b = 0;
             free_b = strata::core::device_free_bytes(); (void) total_b;
             const int64_t want = ((int64_t) o.vram_reserve_mib << 20) + pipe_first;
@@ -4625,20 +4315,20 @@ int main(int argc, char **argv) try {
             const auto& lay = strata::kernels::cpu::expert_layout();
             constexpr size_t kBatch = 64;
             const size_t blob_cap = (size_t) lay.max_blob;
-            sycl::queue& q = dpct::get_in_order_queue();
-            uint8_t* pin = sycl::malloc_host<uint8_t>(2 * kBatch * blob_cap, q);
+            strata::ze::Stream& q = strata::ze::default_stream();
+            uint8_t* pin = (uint8_t*) strata::ze::malloc_host((2 * kBatch * blob_cap) * sizeof(uint8_t));
             if (pin == nullptr) {
                 std::fprintf(stderr, "strata generate: the profile fill could not pin %zu MiB\n",
                              (2 * kBatch * blob_cap) >> 20);
                 return 1;
             }
             const int nthreads = std::max(2, std::min(8, (int) std::thread::hardware_concurrency()));
-            sycl::event done[2];
+            strata::ze::Event done[2];
             bool read_ok = true;
             for (size_t b0 = 0, k = 0; b0 < fills.size() && read_ok; b0 += kBatch, ++k) {
                 const size_t n = std::min(kBatch, fills.size() - b0);
                 uint8_t* set = pin + (k % 2) * kBatch * blob_cap;
-                done[k % 2].wait();                       // the copies that last read this half are finished
+                done[k % 2].sync();                       // the copies that last read this half are finished
                 std::atomic<size_t> next{0};
                 std::atomic<bool> ok{true};
                 std::vector<std::thread> ts;
@@ -4654,12 +4344,13 @@ int main(int argc, char **argv) try {
                 for (size_t j = 0; j < n; ++j) {
                     const Fill& f = fills[b0 + j];
                     const size_t nb = (size_t) lay.blob_bytes(f.l);
-                    done[k % 2] = q.memcpy(xcache.device_slot(f.slot), set + j * blob_cap, nb);
+                    q.memcpy(xcache.device_slot(f.slot), set + j * blob_cap, nb);
                     fill_bytes += nb;
                 }
+                q.record(done[k % 2]);
             }
-            q.wait();
-            sycl::free(pin, q);
+            q.sync();
+            strata::ze::free(pin);
             if (!read_ok) {
                 std::fprintf(stderr, "strata generate: the profile fill could not read an expert from the GGUF\n");
                 return 1;
@@ -4668,15 +4359,16 @@ int main(int argc, char **argv) try {
             if (std::getenv("STRATA_VERIFY_ALL_SLOTS") != nullptr) {   // debug: every filled slot read back and compared with the GGUF
                 auto fl = std::make_shared<std::vector<Fill>>(fills);
                 verify_all_slots = [&, fl, blob_cap](const char* when) {
-                    sycl::queue& vq = dpct::get_in_order_queue();
-                    vq.wait();
+                    strata::ze::Stream& vq = strata::ze::default_stream();
+                    vq.sync();
                     std::vector<uint8_t> want_b(blob_cap), got_b(blob_cap);
                     int64_t bad = 0, first_bad = -1;
                     for (size_t i = 0; i < fl->size(); ++i) {
                         const Fill& f = (*fl)[i];
                         const size_t nb = (size_t) lay.blob_bytes(f.l);
                         if (!gguf_src.read_into(f.l, f.e, want_b.data(), blob_cap)) { ++bad; continue; }
-                        vq.memcpy(got_b.data(), xcache.device_slot(f.slot), nb).wait();
+                        vq.memcpy(got_b.data(), xcache.device_slot(f.slot), nb);
+                        vq.sync();
                         if (std::memcmp(want_b.data(), got_b.data(), nb) != 0) {
                             if (first_bad < 0) first_bad = (int64_t) i;
                             ++bad;
@@ -4829,8 +4521,9 @@ int main(int argc, char **argv) try {
                     for (int64_t e = 0; e < g.n_expert; ++e)
                         if (gguf_src.pinned(l, e))
                             tab[(size_t) (l * g.n_expert + e)] = (unsigned long long) gguf_src.device_alias(l, e);
-                mirror_table_d = sycl::malloc_device<unsigned long long>(tab.size(), dpct::get_in_order_queue());
-                dpct::get_in_order_queue().memcpy(mirror_table_d, tab.data(), tab.size() * sizeof(unsigned long long)).wait();
+                mirror_table_d = (unsigned long long*) strata::ze::malloc_device((tab.size()) * sizeof(unsigned long long));
+                strata::ze::default_stream().memcpy(mirror_table_d, tab.data(), tab.size() * sizeof(unsigned long long));
+                strata::ze::default_stream().sync();
             }
         }
         unmirrored_misses = (int64_t) n_true_miss - (int64_t) (gguf_src.mirrored_bytes() ? std::count_if(miss.begin(), miss.begin() + (ptrdiff_t) n_true_miss,
@@ -4861,12 +4554,7 @@ int main(int argc, char **argv) try {
         const strata::core::OnDevice on(st.dev);
         {
             size_t fb = 0, tb = 0;
-            /*
-            DPCT1106: 'cudaMemGetInfo' was migrated with the Intel
-            extensions for device information which may not be supported by all
-            compilers or runtimes. You may need to adjust the code.
-            */
-            dpct::get_current_device().get_memory_info(fb, tb);
+            strata::ze::mem_get_info(strata::ze::current_device(), &fb, &tb);
             std::fprintf(stderr, "strata generate: layer split, CUDA%d: %.2f GiB free of %.2f, room for experts %.2f GiB\n",
                          st.dev, (double) fb / 1073741824.0, (double) tb / 1073741824.0, (double) room / 1073741824.0);
         }
@@ -4886,12 +4574,6 @@ int main(int argc, char **argv) try {
             stage_open = native_pack ? st.cache.open_sized(sized, g.n_layers, g.n_expert, err)
                                      : st.cache.open((int64_t) sized.size(), g.n_layers, g.n_expert, (int64_t) lay.max_blob, err);
             if (stage_open || attempt >= 3) break;
-            /*
-            DPCT1010: SYCL uses exceptions to report errors and does not
-            use the error codes. The cudaGetLastError function call was replaced
-            with 0. You need to rewrite this code.
-            */
-            (void)0;
             const size_t keep = sized.size() * 9 / 10;
             std::fprintf(stderr, "strata generate: layer split, CUDA%d expert cache: %s; trying %zu of %zu slots "
                                  "(try %d of 3)\n", st.dev, err.c_str(), keep, sized.size(), attempt + 1);
@@ -5073,22 +4755,14 @@ int main(int argc, char **argv) try {
                  w->bytes == (uint64_t) (g.n_expert * g.n_embd) * 2;
             if (!ok) break;
             routers[(size_t) l].resize((size_t) (g.n_expert * g.n_embd));
-            ok = DPCT_CHECK_ERROR(dpct::get_in_order_queue()
-                                      .memcpy(routers[(size_t)l].data(),
-                                              w->data, (size_t)w->bytes)
-                                      .wait()) == 0;
+            strata::ze::default_stream().memcpy(routers[(size_t) l].data(), w->data, (size_t) w->bytes);
+            strata::ze::default_stream().sync();
         }
         const char* kv = std::getenv("STRATA_LOOKAHEAD_K");
         if (ok && lookahead.start(std::move(routers), g.n_embd, g.n_expert, kv ? std::atoi(kv) : 10, &src, err)) {
             drive.d.lookahead = &lookahead;
             std::fprintf(stderr, "strata generate: routing-aware prefetch of the file tier on (the next layer's router)\n");
         } else {
-            /*
-            DPCT1010: SYCL uses exceptions to report errors and does not
-            use the error codes. The cudaGetLastError function call was replaced
-            with 0. You need to rewrite this code.
-            */
-            (void)0;
             std::fprintf(stderr, "strata generate: routing-aware prefetch off (%s)\n",
                          ok ? err.c_str() : "the routers are not BF16 in the arena");
             err.clear();
@@ -5105,27 +4779,19 @@ int main(int argc, char **argv) try {
     float* d_hit_out = nullptr;
     if (o.expert_cache > 0 && !o.no_pool) {
         const uint64_t sb = strata::kernels::moe_hit_grouped_scratch_bytes(K, g.n_embd, strata::kernels::cpu::FF);
-        if (DPCT_CHECK_ERROR(hit_scratch = (void *)sycl::malloc_device(
-                                 (size_t)sb, dpct::get_in_order_queue())) !=
-                0 ||
-            DPCT_CHECK_ERROR(d_hit_slot = sycl::malloc_device<int32_t>(
-                                 (size_t)K, dpct::get_in_order_queue())) != 0 ||
-            DPCT_CHECK_ERROR(d_hit_dst = sycl::malloc_device<int32_t>(
-                                 (size_t)K, dpct::get_in_order_queue())) != 0 ||
-            DPCT_CHECK_ERROR(d_hit_q8 = (uint8_t *)sycl::malloc_device(
-                                 (size_t)(g.n_embd / 32) * 34,
-                                 dpct::get_in_order_queue())) != 0 ||
-            // R4.2h: the fp32 activation scales.  Without this the GPU's hits
-            // use the block's fp16 `d` while the CPU's misses use
-            // `ActQ::scale`, which is fp32 - a 4.761e-04 relative disagreement
-            // on every chunk, and the reason enabling the cache changed the
-            // tokens.
-            DPCT_CHECK_ERROR(d_hit_q8_scale = sycl::malloc_device<float>(
-                                 (size_t)(g.n_embd / 32),
-                                 dpct::get_in_order_queue())) != 0 ||
-            DPCT_CHECK_ERROR(d_hit_out = (float *)sycl::malloc_device(
-                                 (size_t)K * g.n_embd * 4,
-                                 dpct::get_in_order_queue())) != 0) {
+        hit_scratch = strata::ze::malloc_device((size_t) sb);
+        d_hit_slot = (int32_t*) strata::ze::malloc_device((size_t) K * sizeof(int32_t));
+        d_hit_dst = (int32_t*) strata::ze::malloc_device((size_t) K * sizeof(int32_t));
+        d_hit_q8 = (uint8_t*) strata::ze::malloc_device((size_t) (g.n_embd / 32) * 34);
+        // R4.2h: the fp32 activation scales.  Without this the GPU's hits
+        // use the block's fp16 `d` while the CPU's misses use
+        // `ActQ::scale`, which is fp32 - a 4.761e-04 relative disagreement
+        // on every chunk, and the reason enabling the cache changed the
+        // tokens.
+        d_hit_q8_scale = (float*) strata::ze::malloc_device((size_t) (g.n_embd / 32) * sizeof(float));
+        d_hit_out = (float*) strata::ze::malloc_device((size_t) K * g.n_embd * 4);
+        if (hit_scratch == nullptr || d_hit_slot == nullptr || d_hit_dst == nullptr || d_hit_q8 == nullptr ||
+            d_hit_q8_scale == nullptr || d_hit_out == nullptr) {
             std::fprintf(stderr, "strata generate: the R4 hit path could not allocate its device buffers\n");
             return 1;
         }
@@ -5144,11 +4810,7 @@ int main(int argc, char **argv) try {
         drive.d.d_slot = d_hit_slot;
         drive.d.d_dst = d_hit_dst;
         drive.d.h_slot.resize((size_t) K);
-        dpct::event_ptr hit_done = nullptr;
-        if (DPCT_CHECK_ERROR(hit_done = new sycl::event()) != 0) {
-            std::fprintf(stderr, "strata generate: the hit path could not create its probe event\n");
-            return 1;
-        }
+        strata::ze::Event* hit_done = new strata::ze::Event();
         drive.d.hit_done = (void*) hit_done;
         drive.d.hit_poke = !o.no_hit_poke;
         drive.d.h_dst.resize((size_t) K);
@@ -5283,10 +4945,8 @@ int main(int argc, char **argv) try {
         return strata::core::lm_head_mix(wt, g, ss.block, stream, err) &&
                native_head.run(ss.block.mixed, d_logits, stream, err);
     };
-    float* d_emb = nullptr;
-    if (DPCT_CHECK_ERROR(
-            d_emb = (float *)sycl::malloc_device(
-                (size_t)g.n_embd * 4, dpct::get_in_order_queue())) != 0) {
+    float* d_emb = (float*) strata::ze::malloc_device((size_t) g.n_embd * 4);
+    if (d_emb == nullptr) {
         std::fprintf(stderr, "strata generate: the embedding buffer failed\n");
         return 1;
     }
@@ -5294,9 +4954,8 @@ int main(int argc, char **argv) try {
     // written on the device.  Passing `logits.data()` - the host vector - faults inside the kernel and the
     // error surfaces at the NEXT synchronising call, which here was the next token's `embed_row`, reporting an
     // illegal access on a weight plane.  Nothing in the parameter names said device.
-    int* d_next = nullptr;
-    if (DPCT_CHECK_ERROR(d_next = sycl::malloc_device<int>(
-                             1, dpct::get_in_order_queue())) != 0) {
+    int* d_next = (int*) strata::ze::malloc_device(sizeof(int));
+    if (d_next == nullptr) {
         std::fprintf(stderr, "strata generate: the sampler output buffer failed\n");
         return 1;
     }
@@ -5307,8 +4966,7 @@ int main(int argc, char **argv) try {
     // broadcast is done directly.  Getting this wrong is invisible for exactly one token.
     void* token_stream = o.stream_token ? main_cs : nullptr;
     auto put_input = [&](int64_t tok, int64_t pos) -> bool {
-        try {
-    if (!strata::core::embed_row(wt, g, tok, d_emb, token_stream, err)) {
+        if (!strata::core::embed_row(wt, g, tok, d_emb, token_stream, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return false;
         }
@@ -5316,29 +4974,10 @@ int main(int argc, char **argv) try {
             strata::core::session_zero(ss, g, d_emb, token_stream);
         } else {
             for (int64_t c = 0; c < g.hc; ++c)
-                /*
-                DPCT1124: cudaMemcpyAsync is migrated to asynchronous
-                memcpy API. While the origin API might be synchronous, it
-                depends on the type of operand memory, so you may need to call
-                wait() on event return by memcpy API to ensure synchronization
-                behavior.
-                */
-                if (DPCT_CHECK_ERROR(strata::q_of(token_stream)->memcpy(
-                        ss.R + (size_t)c * g.n_embd, d_emb,
-                        (size_t)g.n_embd * 4)) != 0) {
-                    std::fprintf(stderr, "strata generate: the residual broadcast failed\n");
-                    return false;
-                }
+                strata::ze::stream_of(token_stream)->memcpy(ss.R + (size_t) c * g.n_embd, d_emb, (size_t) g.n_embd * 4);
         }
-        return o.stream_token ||
-               DPCT_CHECK_ERROR(
-                   dpct::get_current_device().queues_wait_and_throw()) == 0;
-    }
-    catch (sycl::exception const &exc) {
-      std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-                << ", line:" << __LINE__ << std::endl;
-      std::exit(1);
-    }
+        if (!o.stream_token) strata::ze::device_sync();
+        return true;
     };
 
     strata::kernels::SamplerParams sp;
@@ -5398,14 +5037,8 @@ int main(int argc, char **argv) try {
             std::fprintf(stderr, "strata generate: cannot write %s\n", o.dump_layers.c_str());
             return 1;
         }
-        /*
-        DPCT1048: The original value cudaHostAllocDefault is not meaningful
-        in the migrated code and was removed or replaced with 0. You may need to
-        check the migrated code.
-        */
-        if (DPCT_CHECK_ERROR(layer_stage = sycl::malloc_host<float>(
-                                 layer_floats, dpct::get_in_order_queue())) !=
-            0) {
+        layer_stage = (float*) strata::ze::malloc_host(layer_floats * sizeof(float));
+        if (layer_stage == nullptr) {
             std::fprintf(stderr, "strata generate: cannot pin the layer-dump staging buffer\n");
             return 1;
         }
@@ -5585,7 +5218,7 @@ int main(int argc, char **argv) try {
         std::printf("  three sum slightly above it because each launch carries the driver's gap.\n");
         strata::core::session_graphs_free(gr);
         strata::core::doorbell_free(db);
-        sycl::free(d_next, dpct::get_in_order_queue());
+        strata::ze::free(d_next);
         return 0;
     }
 
@@ -5596,11 +5229,7 @@ int main(int argc, char **argv) try {
             std::fprintf(stderr, "strata generate: session_replay warm: %s\n", err.c_str());
             return 1;
         }
-        if (DPCT_CHECK_ERROR(
-                dpct::get_current_device().queues_wait_and_throw()) != 0) {
-            std::fprintf(stderr, "strata generate: session_replay warm faulted\n");
-            return 1;
-        }
+        strata::ze::device_sync();
         const int reps = 20;
         const Clock::time_point t0 = Clock::now();
         for (int r = 0; r < reps; ++r) {
@@ -5609,23 +5238,7 @@ int main(int argc, char **argv) try {
                 return 1;
             }
         }
-        if (DPCT_CHECK_ERROR(
-                dpct::get_current_device().queues_wait_and_throw()) != 0) {
-            /*
-            DPCT1009: SYCL reports errors using exceptions and does not use
-            error codes. Please replace the "get_error_string_dummy(...)" with a
-            real error-handling function.
-            */
-            /*
-            DPCT1010: SYCL uses exceptions to report errors and does not
-            use the error codes. The cudaGetLastError function call was replaced
-            with 0. You need to rewrite this code.
-            */
-            std::fprintf(stderr,
-                         "strata generate: session_replay faulted: %s\n",
-                         dpct::get_error_string_dummy(0));
-            return 1;
-        }
+        strata::ze::device_sync();
         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count() / (double) reps;
         std::printf("pre graphs only   %8.2f ms per token over %lld layers  ->  %.2f tok/s of GPU work\n", ms,
                     (long long) g.n_layers, ms > 0 ? 1000.0 / ms : 0.0);
@@ -5654,46 +5267,13 @@ int main(int argc, char **argv) try {
                 return 1;
             }
             // The sync is INSIDE the interval on purpose: it is the wait for the GPU, so t1 - t0 is GPU time.
-            if (DPCT_CHECK_ERROR(strata::q_of(main_cs)->wait()) != 0) {
-                std::fprintf(
-                    stderr,
-                    "strata generate: gpu-only-full layers faulted: %s\n",
-                    /*
-                    DPCT1009: SYCL reports errors using exceptions and does
-                    not use error codes. Please replace the
-                    "get_error_string_dummy(...)" with a real error-handling
-                    function.
-                    */
-                    /*
-                    DPCT1010: SYCL uses exceptions to report errors and
-                    does not use the error codes. The cudaGetLastError function
-                    call was replaced with 0. You need to rewrite this code.
-                    */
-                    dpct::get_error_string_dummy(0));
-                return 1;
-            }
+            strata::ze::stream_of(main_cs)->sync();
             const Clock::time_point t1 = Clock::now();
             if (!run_head(main_cs)) {
                 std::fprintf(stderr, "strata generate: gpu-only-full lm_head: %s\n", err.c_str());
                 return 1;
             }
-            if (DPCT_CHECK_ERROR(strata::q_of(main_cs)->wait()) != 0) {
-                std::fprintf(
-                    stderr, "strata generate: gpu-only-full head faulted: %s\n",
-                    /*
-                    DPCT1009: SYCL reports errors using exceptions and does
-                    not use error codes. Please replace the
-                    "get_error_string_dummy(...)" with a real error-handling
-                    function.
-                    */
-                    /*
-                    DPCT1010: SYCL uses exceptions to report errors and
-                    does not use the error codes. The cudaGetLastError function
-                    call was replaced with 0. You need to rewrite this code.
-                    */
-                    dpct::get_error_string_dummy(0));
-                return 1;
-            }
+            strata::ze::stream_of(main_cs)->sync();
             const Clock::time_point t2 = Clock::now();
             if (r < 0) continue;
             ms_layers += std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -5741,15 +5321,11 @@ int main(int argc, char **argv) try {
     // The residency table is read by kernels on non-blocking streams, which do not wait for the legacy stream a plain
     // cudaMemcpy runs on, and a pageable copy can return before its DMA has landed: each upload waits for its own copy
     // (the current device's legacy stream, stream 0 - nothing else; HIP has no cudaStreamLegacy name, #550).
-    auto res_put = [&host_res](int32_t *dst) -> dpct::err0 {
-        // SYCL port: the in-order queue's memcpy, waited for: the copy is complete when this returns
-        try {
-            dpct::get_in_order_queue().memcpy(dst, host_res.data(), host_res.size() * sizeof(int32_t)).wait();
-            return 0;
-        } catch (sycl::exception const& exc) {
-            std::cerr << exc.what() << " (res_put)" << std::endl;
-            return 1;
-        }
+    auto res_put = [&host_res](int32_t *dst) -> int {
+        // the default stream's memcpy, waited for: the copy is complete when this returns
+        strata::ze::default_stream().memcpy(dst, host_res.data(), host_res.size() * sizeof(int32_t));
+        strata::ze::default_stream().sync();
+        return 0;
     };
     int32_t* d_res = nullptr;
     int32_t* d_hit_count = nullptr;
@@ -5765,12 +5341,9 @@ int main(int argc, char **argv) try {
                 host_res[(size_t) (l * g.n_expert + e)] = slot;
                 if (slot != strata::core::kNotResident) ++resident;
             }
-        if (DPCT_CHECK_ERROR(
-                d_res = sycl::malloc_device<int32_t>(
-                    host_res.size(), dpct::get_in_order_queue())) != 0 ||
-            DPCT_CHECK_ERROR(d_hit_count = sycl::malloc_device<int32_t>(
-                                 1, dpct::get_in_order_queue())) != 0 ||
-            res_put(d_res) != 0) {
+        d_res = (int32_t*) strata::ze::malloc_device(host_res.size() * sizeof(int32_t));
+        d_hit_count = (int32_t*) strata::ze::malloc_device(sizeof(int32_t));
+        if (d_res == nullptr || d_hit_count == nullptr || res_put(d_res) != 0) {
             std::fprintf(stderr, "strata generate: the device residency table could not be staged\n");
             return 1;
         }
@@ -5803,10 +5376,8 @@ int main(int argc, char **argv) try {
         }
         for (auto& st : stages) {   // layer split across GPUs: the same table on every device
             const strata::core::OnDevice on(st->dev);
-            if (DPCT_CHECK_ERROR(
-                    st->d_res = sycl::malloc_device<int32_t>(
-                        host_res.size(), dpct::get_in_order_queue())) != 0 ||
-                res_put(st->d_res) != 0) {
+            st->d_res = (int32_t*) strata::ze::malloc_device(host_res.size() * sizeof(int32_t));
+            if (st->d_res == nullptr || res_put(st->d_res) != 0) {
                 std::fprintf(stderr, "strata generate: layer split: CUDA%d residency table failed\n", st->dev);
                 return 1;
             }
@@ -6129,13 +5700,12 @@ int main(int argc, char **argv) try {
                     vi = cold.back().second;
                     const int32_t vs = host_res[(size_t) vi];
                     if (xcache.slot_offset(vs + 1) - xcache.slot_offset(vs) <
-                            lay.blob_bytes(layer) ||
-                        DPCT_CHECK_ERROR(dpct::get_in_order_queue().memcpy(
-                            xcache.device_slot(vs),
-                            xcache.device_slot((int32_t)kvg.lo),
-                            (size_t)lay.blob_bytes(layer)).wait()) != 0)
+                            lay.blob_bytes(layer))
                         vi = -1;
                     else {
+                        strata::ze::default_stream().memcpy(xcache.device_slot(vs), xcache.device_slot((int32_t) kvg.lo),
+                                                            (size_t) lay.blob_bytes(layer));
+                        strata::ze::default_stream().sync();
                         cold.pop_back();
                         host_res[(size_t) oi] = vs;
                         host_res[(size_t) vi] = strata::core::kNotResident;
@@ -6148,24 +5718,7 @@ int main(int argc, char **argv) try {
         }
         // a device-to-device cudaMemcpy does not wait for the copy: the moves still read the slots given up, and a
         // chunk unmapped under a copy faults it (the error then sticks to whatever runs next)
-        if (gave > 0 &&
-            DPCT_CHECK_ERROR(
-                dpct::get_current_device().queues_wait_and_throw()) != 0) {
-            /*
-            DPCT1009: SYCL reports errors using exceptions and does not use
-            error codes. Please replace the "get_error_string_dummy(...)" with a
-            real error-handling function.
-            */
-            /*
-            DPCT1010: SYCL uses exceptions to report errors and does not
-            use the error codes. The cudaGetLastError function call was replaced
-            with 0. You need to rewrite this code.
-            */
-            std::fprintf(stderr,
-                         "strata: moving experts for the K/V failed: %s\n",
-                         dpct::get_error_string_dummy(0));
-            return false;
-        }
+        if (gave > 0) strata::ze::device_sync();
         {
             const int64_t c0 = (int64_t) ((xcache.slot_offset(kvg.lo) + G - 1) / G);
             const int64_t c1 = (int64_t) (xcache.slot_offset(kvg.top) / G);
@@ -6173,30 +5726,9 @@ int main(int argc, char **argv) try {
                 if (r.mapped(c))
                     if (const strata::core::VmmChunk h = r.unmap(c)) kvg.spare.push_back(h);
         }
-        if (gave > 0 &&
-            /*
-            DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-            assuming in the original code the source host memory is pageable
-            memory. If the memory is not pageable, call wait() on event return
-            by memcpy API to ensure synchronization behavior.
-            */
-            DPCT_CHECK_ERROR(dpct::get_in_order_queue().memcpy(
-                d_res, host_res.data(), host_res.size() * sizeof(int32_t)).wait()) !=
-                0) {
-            /*
-            DPCT1009: SYCL reports errors using exceptions and does not use
-            error codes. Please replace the "get_error_string_dummy(...)" with a
-            real error-handling function.
-            */
-            /*
-            DPCT1010: SYCL uses exceptions to report errors and does not
-            use the error codes. The cudaGetLastError function call was replaced
-            with 0. You need to rewrite this code.
-            */
-            std::fprintf(stderr,
-                         "strata: the residency table upload failed: %s\n",
-                         dpct::get_error_string_dummy(0));
-            return false;
+        if (gave > 0) {
+            strata::ze::default_stream().memcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t));
+            strata::ze::default_stream().sync();
         }
         int64_t fresh = 0;
         const bool ok = strata::core::qsa_kv_elastic_grow(target, [&]() -> strata::core::VmmChunk {
@@ -6215,21 +5747,7 @@ int main(int argc, char **argv) try {
                      (long long) xcache.slots(),
                      fresh > 0 ? " - and new VRAM, the cache being at its floor" : "");
         if (!ok)
-            std::fprintf(
-                stderr, "strata: the K/V could not grow to %lld cells (%s)\n",
-                (long long)target,
-                /*
-                DPCT1009: SYCL reports errors using exceptions and does not
-                use error codes. Please replace the
-                "get_error_string_dummy(...)" with a real error-handling
-                function.
-                */
-                /*
-                DPCT1010: SYCL uses exceptions to report errors and does
-                not use the error codes. The cudaGetLastError function call was
-                replaced with 0. You need to rewrite this code.
-                */
-                dpct::get_error_string_dummy(0));
+            std::fprintf(stderr, "strata: the K/V could not grow to %lld cells\n", (long long) target);
         return ok;
     };
     // A request that needs far fewer cells than the K/V holds gives the rest back: the slots refill with the
@@ -6276,50 +5794,18 @@ int main(int argc, char **argv) try {
                 if (host_res[i] >= 0 || lay.blob_bytes(l) > room) continue;
                 const uint8_t* b = srcp->blob(l, e);
                 if (b == nullptr) continue;
-                /*
-                DPCT1124: cudaMemcpyAsync is migrated to asynchronous
-                memcpy API. While the origin API might be synchronous, it
-                depends on the type of operand memory, so you may need to call
-                wait() on event return by memcpy API to ensure synchronization
-                behavior.
-                */
-                dpct::get_in_order_queue().memcpy(
-                    xcache.device_slot((int32_t)s), b,
-                    (size_t)lay.blob_bytes(l)).wait();
+                strata::ze::default_stream().memcpy(xcache.device_slot((int32_t)s), b, (size_t)lay.blob_bytes(l));
+                strata::ze::default_stream().sync();
                 filled.emplace_back(i, (int32_t) s);
                 ++pi;
                 break;
             }
         }
-        if (DPCT_CHECK_ERROR(
-                dpct::get_current_device().queues_wait_and_throw()) != 0) {
-            /*
-            DPCT1009: SYCL reports errors using exceptions and does not use
-            error codes. Please replace the "get_error_string_dummy(...)" with a
-            real error-handling function.
-            */
-            /*
-            DPCT1010: SYCL uses exceptions to report errors and does not
-            use the error codes. The cudaGetLastError function call was replaced
-            with 0. You need to rewrite this code.
-            */
-            std::fprintf(stderr,
-                         "strata: refilling the expert cache failed: %s\n",
-                         dpct::get_error_string_dummy(0));
-            return false;
-        }
+        strata::ze::device_sync();
         for (const auto& [i, s] : filled) host_res[i] = s;
         kvg.refilled += (int64_t) filled.size();
-        /*
-        DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-        assuming in the original code the source host memory is pageable memory.
-        If the memory is not pageable, call wait() on event return by memcpy API
-        to ensure synchronization behavior.
-        */
-        if (DPCT_CHECK_ERROR(dpct::get_in_order_queue().memcpy(
-                d_res, host_res.data(), host_res.size() * sizeof(int32_t)).wait()) !=
-            0)
-            return false;
+        strata::ze::default_stream().memcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t));
+        strata::ze::default_stream().sync();
         for (const strata::core::VmmChunk h : kvg.spare) strata::core::vmm_chunk_free(h);   // new ones, if any
         kvg.spare.clear();
         ++kvg.trims;
@@ -6625,18 +6111,6 @@ int main(int argc, char **argv) try {
                     const PfPart& p = pf_parts[i];
                     if (fits_one(p, alone, o.prefill_auto)) continue;
                     const int dev = p.dev < 0 ? 0 : p.dev;
-                    dpct::device_info prop{};
-                    if (DPCT_CHECK_ERROR(
-                            dpct::get_device(dev).get_device_info(prop)) != 0) {
-                        /*
-                        DPCT1010: SYCL uses exceptions to report errors and
-                        does not use the error codes. The cudaGetLastError
-                        function call was replaced with 0. You need to rewrite
-                        this code.
-                        */
-                        (void)0;
-                        prop.get_name()[0] = 0;
-                    }
                     const std::string pct =
                         o.prefill_auto ? ", and lend at most " + std::to_string(kAutoLendPct) + "%" : "";
                     std::fprintf(stderr,
@@ -6647,7 +6121,7 @@ int main(int argc, char **argv) try {
                                  "(it must keep 128%s) - prompts read slower "
                                  "than on CUDA0 alone (#448)\n",
                                  (long long)chunk, (long long)alone, dev,
-                                 prop.get_name(), (long long)p.cache->slots(),
+                                 strata::ze::device_info(dev).name.c_str(), (long long)p.cache->slots(),
                                  (long long)alone,
                                  (long long)part_slots(p, alone), pct.c_str());
                     // the helper tiers start at CUDA1 without a split (and are enabled in order)
@@ -6687,23 +6161,7 @@ int main(int argc, char **argv) try {
                     for (PfPart& p : pf_parts) {
                         const strata::core::OnDevice on(p.dev);
                         size_t fb = 0, tb = 0;
-                        /*
-                        DPCT1010: SYCL uses exceptions to report errors and
-                        does not use the error codes. The cudaGetLastError
-                        function call was replaced with 0. You need to rewrite
-                        this code.
-                        */
-                        /*
-                        DPCT1106: 'cudaMemGetInfo' was migrated with the
-                        Intel extensions for device information which may not be
-                        supported by all compilers or runtimes. You may need to
-                        adjust the code.
-                        */
-                        if (DPCT_CHECK_ERROR(
-                                dpct::get_current_device().get_memory_info(
-                                    fb, tb)) != 0) {
-                            (void)0; continue;
-                        }
+                        if (!strata::ze::mem_get_info(strata::ze::current_device(), &fb, &tb)) continue;
                         const uint64_t need = strata::prefill::Prefill::bytes_needed(g, *p.ses, chunk);
                         if ((uint64_t) fb >= need + (3ull << 29)) {
                             std::fprintf(stderr, "strata serve:   CUDA%d keeps its own prompt buffers (%.2f GiB of "
@@ -6786,20 +6244,13 @@ int main(int argc, char **argv) try {
             const int64_t kHeadroom = 512ll << 20;
             auto own_fits = [&](int64_t c, int &dev_out, int64_t &need_out,
                                 int64_t &free_out) -> bool {
-                try {
-            for (size_t i = 0; i <= stages.size(); ++i) {
+                for (size_t i = 0; i <= stages.size(); ++i) {
                     const bool loan = i == 0 ? borrow != nullptr : (i < pf_parts.size() && pf_parts[i].first >= 0);
                     if (loan) continue;
                     const int dev = i == 0 ? -1 : stages[i - 1]->dev;
                     const strata::core::OnDevice on(dev);
                     size_t fb = 0, tb = 0;
-                    /*
-                    DPCT1106: 'cudaMemGetInfo' was migrated with the Intel
-                    extensions for device information which may not be supported
-                    by all compilers or runtimes. You may need to adjust the
-                    code.
-                    */
-                    dpct::get_current_device().get_memory_info(fb, tb);
+                    strata::ze::mem_get_info(strata::ze::current_device(), &fb, &tb);
                     const int64_t need = (int64_t) strata::prefill::Prefill::bytes_needed(g, i == 0 ? ss : stages[i - 1]->ss, c);
                     if (need + kHeadroom > (int64_t) fb) {
                         dev_out = dev < 0 ? 0 : dev; need_out = need; free_out = (int64_t) fb;
@@ -6807,12 +6258,6 @@ int main(int argc, char **argv) try {
                     }
                 }
                 return true;
-            }
-            catch (sycl::exception const &exc) {
-              std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-                        << ", line:" << __LINE__ << std::endl;
-              std::exit(1);
-            }
             };
             int dev = 0;
             int64_t need = 0, fb = 0;
@@ -6844,19 +6289,9 @@ int main(int argc, char **argv) try {
                 for (auto& stp : stages) {
                     const strata::core::OnDevice on(stp->dev);
                     stp->sp.reset();
-                    /*
-                    DPCT1010: SYCL uses exceptions to report errors and
-                    does not use the error codes. The cudaGetLastError function
-                    call was replaced with 0. You need to rewrite this code.
-                    */
                     (void)0;
                 }
                 sp.reset();
-                /*
-                DPCT1010: SYCL uses exceptions to report errors and does
-                not use the error codes. The cudaGetLastError function call was
-                replaced with 0. You need to rewrite this code.
-                */
                 (void)0;
                 o.prefill_chunk = next;
                 if (any_loan) {                  // smaller loans for the smaller chunk
@@ -6948,9 +6383,7 @@ int main(int argc, char **argv) try {
         std::vector<int32_t> hist_stage(kHistSlots, -1);
         const int hist_dev = last_st ? last_st->dev : -1;   // with the head: the last stage's device
         if (const strata::core::OnDevice on_h(hist_dev);
-            DPCT_CHECK_ERROR(d_hist = sycl::malloc_device<int32_t>(
-                                 kHistSlots, dpct::get_in_order_queue())) !=
-            0) {
+            (d_hist = (int32_t*) strata::ze::malloc_device(kHistSlots * sizeof(int32_t))) == nullptr) {
             std::fprintf(stderr, "strata serve: the penalty-history allocation failed\n");
             return 1;
         }
@@ -6979,30 +6412,14 @@ int main(int argc, char **argv) try {
         const bool pipe = o.pipeline_windows > 0 && n_stages == 2 && !split_same && stages.size() == 1;
         strata::core::Verifier ver_b;
         SplitDrive split_drive_b;
-        dpct::queue_ptr pl_stream[2] = {&dpct::get_in_order_queue(),
-                                        &dpct::get_in_order_queue()};
+        strata::ze::Stream* pl_stream[2] = {&strata::ze::default_stream(),
+                                        &strata::ze::default_stream()};
         if (pipe) {
-            /*
-            DPCT1025: The SYCL queue is created ignoring the flag and
-            priority options.
-            */
-            bool ok_p =
-                DPCT_CHECK_ERROR(
-                    pl_stream[0] =
-                        dpct::get_current_device().create_queue(true)) == 0;
+            pl_stream[0] = new strata::ze::Stream();
             {
                 const strata::core::OnDevice on(stages[0]->dev);
-                /*
-                DPCT1025: The SYCL queue is created ignoring the flag and
-                priority options.
-                */
-                ok_p =
-                    ok_p &&
-                    DPCT_CHECK_ERROR(
-                        pl_stream[1] =
-                            dpct::get_current_device().create_queue(true)) == 0;
+                pl_stream[1] = new strata::ze::Stream();
             }
-            if (!ok_p) { std::fprintf(stderr, "strata serve: --pipeline-windows: stream creation failed\n"); return 1; }
             for (strata::core::Verifier* v : {&ver, &ver_b}) {
                 v->set_stream(pl_stream[0]);
                 v->set_always_publish(true);
@@ -7017,21 +6434,9 @@ int main(int argc, char **argv) try {
                               (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
             std::vector<float*> hand((size_t) n_stages - 1, nullptr);
             for (float*& h : hand) {
-                float* hh = nullptr;
-                /*
-                DPCT1048: The original value cudaHostAllocMapped is not
-                meaningful in the migrated code and was removed or replaced with
-                0. You may need to check the migrated code.
-                */
-                /*
-                DPCT1048: The original value cudaHostAllocPortable is not
-                meaningful in the migrated code and was removed or replaced with
-                0. You may need to check the migrated code.
-                */
-                if (DPCT_CHECK_ERROR(hh = (float *)sycl::malloc_host(
-                                         hb, dpct::get_in_order_queue())) !=
-                        0 ||
-                    DPCT_CHECK_ERROR(*(void **)&h = (float *)hh) != 0) {
+                float* hh = (float*) strata::ze::malloc_host(hb);
+                h = hh;
+                if (hh == nullptr) {
                     std::fprintf(stderr, "strata serve: the layer-split hand-off allocation failed\n");
                     return 1;
                 }
@@ -7085,20 +6490,9 @@ int main(int argc, char **argv) try {
         if (pipe) {
             const size_t hb = (size_t) strata::kernels::kVerifyMaxT *
                               (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
-            float *hh = nullptr, *hand_b = nullptr;
-            /*
-            DPCT1048: The original value cudaHostAllocMapped is not
-            meaningful in the migrated code and was removed or replaced with 0.
-            You may need to check the migrated code.
-            */
-            /*
-            DPCT1048: The original value cudaHostAllocPortable is not
-            meaningful in the migrated code and was removed or replaced with 0.
-            You may need to check the migrated code.
-            */
-            if (DPCT_CHECK_ERROR(hh = (float *)sycl::malloc_host(
-                                     hb, dpct::get_in_order_queue())) != 0 ||
-                DPCT_CHECK_ERROR(*(void **)&hand_b = (float *)hh) != 0) {
+            float* hh = (float*) strata::ze::malloc_host(hb);
+            float* hand_b = hh;
+            if (hh == nullptr) {
                 std::fprintf(stderr, "strata serve: --pipeline-windows: the second hand-off allocation failed\n");
                 return 1;
             }
@@ -7121,10 +6515,9 @@ int main(int argc, char **argv) try {
                                  gs.dev, err.c_str());
                     return 1;
                 }
-                if (DPCT_CHECK_ERROR(pl_mtp_R = sycl::malloc_device<float>(
-                                         (size_t)strata::kernels::kVerifyMaxT *
-                                             (size_t)(g.hc * g.n_embd),
-                                         dpct::get_in_order_queue())) != 0) {
+                pl_mtp_R = (float*) strata::ze::malloc_device((size_t) strata::kernels::kVerifyMaxT *
+                                                              (size_t) (g.hc * g.n_embd) * sizeof(float));
+                if (pl_mtp_R == nullptr) {
                     std::fprintf(stderr, "strata serve: --pipeline-windows: the drafter's row buffer does not fit\n");
                     return 1;
                 }
@@ -7146,23 +6539,13 @@ int main(int argc, char **argv) try {
             return 1;
         }
         if (pipe) mtp.set_source_R(ver.final_R_all());   // the serial decode's rows (the last stage's even verifier)
-        auto free_slot_mtp_rows = [](float *p) {
-                                                 try {
-        if (p != nullptr) (void) DPCT_CHECK_ERROR(sycl::free(p, dpct::get_in_order_queue())); }
-        catch (sycl::exception const &exc) {
-          std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-                    << ", line:" << __LINE__ << std::endl;
-          std::exit(1);
-        }
-        };
+        auto free_slot_mtp_rows = [](float* p) { if (p != nullptr) strata::ze::free(p); };
         std::vector<std::unique_ptr<float, decltype(free_slot_mtp_rows)>> slot_mtp_rows;
         if (batch_mtp) {
             for (int b = 0; b < o.batch; ++b) {
-                float* r = nullptr;
                 const size_t bytes = (size_t) o.spec * (size_t) g.hc * (size_t) g.n_embd * sizeof(float);
-                if (DPCT_CHECK_ERROR(r = (float *)sycl::malloc_device(
-                                         bytes, dpct::get_in_order_queue())) !=
-                    0) {
+                float* r = (float*) strata::ze::malloc_device(bytes);
+                if (r == nullptr) {
                     std::fprintf(stderr, "strata serve: batch MTP slot %d residual buffer does not fit%s\n",
                                  b, vram_free_note().c_str());
                     return 1;
@@ -7220,45 +6603,24 @@ int main(int argc, char **argv) try {
         // (STRATA_PIPELINE_SNAP_OVERLAP=0: one buffer, copied on the critical path).
         const size_t pl_snap_bytes = pipe ? gdn_snapshot_bytes(ss) : 0;
         float* pl_snap2[2] = {nullptr, nullptr};
-        dpct::queue_ptr pl_snap_stream = &dpct::get_in_order_queue();
-        dpct::event_ptr pl_snap_pre[2] = {nullptr, nullptr},
-                        pl_snap_ev[2] = {nullptr, nullptr};
+        strata::ze::Stream* pl_snap_stream = &strata::ze::default_stream();
+        strata::ze::Event* pl_snap_pre[2] = {nullptr, nullptr}, *pl_snap_ev[2] = {nullptr, nullptr};
         bool pl_snap_overlap = false;
         if (pipe && o.pipeline_windows >= 2) {
-            if (DPCT_CHECK_ERROR(
-                    pl_snap2[0] = (float *)sycl::malloc_device(
-                        pl_snap_bytes, dpct::get_in_order_queue())) != 0) {
+            pl_snap2[0] = (float*) strata::ze::malloc_device(pl_snap_bytes);
+            if (pl_snap2[0] == nullptr) {
                 std::fprintf(stderr, "strata serve: --pipeline-windows 2: the GDN snapshot (%.1f MiB) does not fit; the "
                                      "decode stays serial\n", (double) pl_snap_bytes / 1048576.0);
-                /*
-                DPCT1026: The call to cudaGetLastError was removed because
-                this functionality is redundant in SYCL.
-                */
-                pl_snap2[0] = nullptr;
             } else if ([] { const char* v = pipe_dbg_env("STRATA_PIPELINE_SNAP_OVERLAP"); return v == nullptr || std::atoi(v) != 0; }()) {
-                pl_snap_overlap =
-                    DPCT_CHECK_ERROR(
-                        pl_snap2[1] = (float *)sycl::malloc_device(
-                            pl_snap_bytes, dpct::get_in_order_queue())) == 0 &&
-                    /*
-                    DPCT1025: The SYCL queue is created ignoring the flag
-                    and priority options.
-                    */
-                    DPCT_CHECK_ERROR(
-                        pl_snap_stream =
-                            dpct::get_current_device().create_queue(true)) == 0;
-                for (int i = 0; i < 2 && pl_snap_overlap; ++i)
-                    pl_snap_overlap =
-                        DPCT_CHECK_ERROR(pl_snap_pre[i] = new sycl::event()) ==
-                            0 &&
-                        DPCT_CHECK_ERROR(pl_snap_ev[i] = new sycl::event()) ==
-                            0;
-                /*
-                DPCT1010: SYCL uses exceptions to report errors and does
-                not use the error codes. The cudaGetLastError function call was
-                replaced with 0. You need to rewrite this code.
-                */
-                if (!pl_snap_overlap) 0;
+                pl_snap2[1] = (float*) strata::ze::malloc_device(pl_snap_bytes);
+                pl_snap_overlap = pl_snap2[1] != nullptr;
+                if (pl_snap_overlap) {
+                    pl_snap_stream = new strata::ze::Stream();
+                    for (int i = 0; i < 2; ++i) {
+                        pl_snap_pre[i] = new strata::ze::Event();
+                        pl_snap_ev[i] = new strata::ze::Event();
+                    }
+                }
             }
         }
         if (pipe)
@@ -7270,13 +6632,12 @@ int main(int argc, char **argv) try {
         // stage-1 window waits until the drafter has read the rows of the same parity's previous window)
         strata::core::Verifier* PV[2][2] = {{&ver, &ver_b}, {pipe ? &stages[0]->ver : nullptr, pipe ? &stages[0]->ver_b : nullptr}};
         SplitDrive* PSD[2] = {&split_drive, &split_drive_b};
-        dpct::event_ptr pl_mtp_ev[2] = {nullptr, nullptr};
+        strata::ze::Event* pl_mtp_ev[2] = {nullptr, nullptr};
         bool pl_mtp_live[2] = {false, false};
         bool pl_prepared = false;
         // every graph captured and the drafter's prompt path sized while nothing is in flight (a capture syncs its stream)
         auto pl_prepare = [&](std::string &e) -> bool {
-            try {
-        if (pl_prepared) return true;
+            if (pl_prepared) return true;
             for (int st = 0; st < 2; ++st)
                 for (int par = 0; par < 2; ++par) {
                     const strata::core::OnDevice on(PV[st][par]->device());
@@ -7285,27 +6646,16 @@ int main(int argc, char **argv) try {
             if (!mtp.prepare_prefill(e)) return false;
             if (o.pipeline_windows >= 2 && pl_snap2[0] != nullptr && !mtp.prepare_chain(e)) return false;
             const strata::core::OnDevice on(mtp.device());
-            for (dpct::event_ptr &ev : pl_mtp_ev)
-                if (ev == nullptr &&
-                    DPCT_CHECK_ERROR(ev = new sycl::event()) != 0) {
-                    e = "pipeline: event creation failed";
-                    return false;
-                }
+            for (strata::ze::Event* &ev : pl_mtp_ev)
+                if (ev == nullptr) ev = new strata::ze::Event();
             pl_prepared = true;
             return true;
-        }
-        catch (sycl::exception const &exc) {
-          std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-                    << ", line:" << __LINE__ << std::endl;
-          std::exit(1);
-        }
         };
         // INVARIANT: nothing pipelined is in flight outside read_windows_pl and the pipelined decode loop - both end
         // here (a checkpoint, a park, the next request and the serial paths all find both stages and the drafter idle).
         // Every window in flight is served to its end (its picks discarded), then both stages and the drafter idle.
         auto pl_drain = [&]() {
-            try {
-        std::string e2;
+            std::string e2;
             for (int round = 0; round < 10000000; ++round) {
                 bool any = false;
                 for (int st = 0; st < 2; ++st)
@@ -7321,16 +6671,10 @@ int main(int argc, char **argv) try {
             }
             for (int st = 0; st < 2; ++st) {
                 const strata::core::OnDevice on(PV[st][0]->device());
-                PV[st][0]->stream()->wait();
+                PV[st][0]->stream()->sync();
             }
             const strata::core::OnDevice on(mtp.device());
-            mtp.stream()->wait();
-        }
-        catch (sycl::exception const &exc) {
-          std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-                    << ", line:" << __LINE__ << std::endl;
-          std::exit(1);
-        }
+            mtp.stream()->sync();
         };
         std::vector<int64_t> cur;
         // ---- the conversation cache (see ConvCheckpoint).  `live` is what the session holds right now: the tokens
@@ -7523,10 +6867,7 @@ int main(int argc, char **argv) try {
                 for (size_t k = 0; k < n_st; ++k) {   // the later stages (the last one with the draft layer's K/V)
                     auto& st = stages[k];
                     const strata::core::OnDevice on(st->dev);
-                    if (DPCT_CHECK_ERROR(dpct::get_current_device()
-                                             .queues_wait_and_throw()) != 0) {
-                        err = "stage sync failed"; return false;
-                    }
+                    strata::ze::device_sync();
                     const strata::core::ConversationView view_k{live, live_imgs, cs.parts[k], cvec_cached};
                     strata::core::SavedConversation part;
                     if (!strata::core::conversation_snapshot_save(part, view_k, st->ss, g, draft_of(k), err,
@@ -7584,25 +6925,8 @@ int main(int argc, char **argv) try {
         // not the checkpoint, and the error says so
         std::string ckpt_why;
         auto gpu_sync_ok = [&]() -> bool {
-            try {
-        const dpct::err0 e = DPCT_CHECK_ERROR(
-            dpct::get_current_device().queues_wait_and_throw());
-            if (e == 0) return true;
-            /*
-            DPCT1009: SYCL reports errors using exceptions and does not use
-            error codes. Please replace the "get_error_string_dummy(...)" with a
-            real error-handling function.
-            */
-            ckpt_why = std::string(": the GPU stopped responding before it (") +
-                       dpct::get_error_string_dummy(e) +
-                       ") - a GPU hang; on Windows the driver is then reset";
-            return false;
-        }
-        catch (sycl::exception const &exc) {
-          std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-                    << ", line:" << __LINE__ << std::endl;
-          std::exit(1);
-        }
+            strata::ze::device_sync();
+            return true;
         };
         auto checkpoint_at = [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr, bool as_tail = false) -> bool {
             ckpt_why.clear();
@@ -7745,54 +7069,30 @@ int main(int argc, char **argv) try {
                 heat.assign(drive.d.usage.size(), 0.0);
         }
         Clock::time_point profile_saved_at = Clock::now();
-        dpct::queue_ptr adapt_stream = &dpct::get_in_order_queue();
-        /*
-        DPCT1025: The SYCL queue is created ignoring the flag and priority
-        options.
-        */
-        if (DPCT_CHECK_ERROR(
-                adapt_stream = dpct::get_current_device().create_queue(true)) !=
-            0) {
-            std::fprintf(stderr, "strata serve: cannot create the refill stream\n");
-            return 1;
-        }
+        strata::ze::Stream* adapt_stream = new strata::ze::Stream();
         // plan v0.3 P6: swaps in flight - (residency index, slot) admitted when adapt_ev has completed
         std::vector<std::pair<int32_t, int32_t>> pending;
         int pending_age = 0;   // the windows the pending swaps have waited (adapt_lag)
         std::vector<void*> pin_live;   // the swaps' locked arena pages (pin_blob), unlocked once they have landed
-        dpct::event_ptr adapt_ev = nullptr;
-        adapt_ev = new sycl::event();
+        strata::ze::Event* adapt_ev = new strata::ze::Event();
         // a layer split's later stages keep a copy of the residency table on their devices, and swap on their own
         auto res_upload = [&]() {
-            try {
-        if (d_res != nullptr)
+            if (d_res != nullptr)
                 res_put(d_res);
             for (auto& st : stages) {
                 const strata::core::OnDevice on(st->dev);
                 res_put(st->d_res);
             }
-        }
-        catch (sycl::exception const &exc) {
-          std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-                    << ", line:" << __LINE__ << std::endl;
-          std::exit(1);
-        }
         };
         auto apply_pending = [&](bool wait) {
-            try {
-        if (peer.valid()) peer.apply_pending(wait);
+            if (peer.valid()) peer.apply_pending(wait);
             if (pending.empty()) return;
-            if (wait) adapt_ev->wait_and_throw();
-            else if (adapt_ev->get_info<
-                         sycl::info::event::command_execution_status>() !=
-                     sycl::info::event_command_status::complete) return;
+            if (wait) adapt_ev->sync();
+            else if (!adapt_ev->query()) return;
             for (auto& st : stages)
                 if (st->adapt_live) {
-                    if (wait) st->adapt_ev->wait_and_throw();
-                    else if ((st->adapt_ev)
-                                 ->get_info<sycl::info::event::
-                                                command_execution_status>() !=
-                             sycl::info::event_command_status::complete) return;
+                    if (wait) st->adapt_ev->sync();
+                    else if (!st->adapt_ev->query()) return;
                 }
             for (auto& st : stages) st->adapt_live = false;
             unpin_blobs(pin_live);
@@ -7804,12 +7104,6 @@ int main(int argc, char **argv) try {
             pending.clear();
             pending_age = 0;
             res_upload();
-        }
-        catch (sycl::exception const &exc) {
-          std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-                    << ", line:" << __LINE__ << std::endl;
-          std::exit(1);
-        }
         };
         // --pipeline-windows: set while the tier adapts beside windows in flight (see its use in adapt)
         std::function<void()> adapt_fence;
@@ -7906,22 +7200,9 @@ int main(int argc, char **argv) try {
                                    gs ? gs->adapt_stream : adapt_stream) != 0) {
                     std::fprintf(stderr,
                                  "strata serve: adaptive swap copy failed "
-                                 "(layer %d, slot %d, pinned %d): %s\n",
-                                 /*
-                                 DPCT1009: SYCL reports errors using
-                                 exceptions and does not use error codes. Please
-                                 replace the "get_error_string_dummy(...)" with
-                                 a real error-handling function.
-                                 */
-                                 /*
-                                 DPCT1010: SYCL uses exceptions to report
-                                 errors and does not use the error codes. The
-                                 cudaGetLastError function call was replaced
-                                 with 0. You need to rewrite this code.
-                                 */
+                                 "(layer %d, slot %d, pinned %d)\n",
                                  (int)s.layer, (int)slot,
-                                 pin_live.empty() ? 0 : 1,
-                                 dpct::get_error_string_dummy(0));
+                                 pin_live.empty() ? 0 : 1);
                     return false;
                 }
                 if (gs) gs->adapt_live = true;
@@ -7934,29 +7215,15 @@ int main(int argc, char **argv) try {
                 strata::core::copy_blobs(cp_dst.data(), cp_src.data(),
                                          cp_bytes.data(), cp_dst.size(),
                                          adapt_stream, dma_mode) != 0) {
-                std::fprintf(
-                    stderr,
-                    "strata serve: adaptive swap copy failed (batched): %s\n",
-                    /*
-                    DPCT1009: SYCL reports errors using exceptions and does
-                    not use error codes. Please replace the
-                    "get_error_string_dummy(...)" with a real error-handling
-                    function.
-                    */
-                    /*
-                    DPCT1010: SYCL uses exceptions to report errors and
-                    does not use the error codes. The cudaGetLastError function
-                    call was replaced with 0. You need to rewrite this code.
-                    */
-                    dpct::get_error_string_dummy(0));
+                std::fprintf(stderr, "strata serve: adaptive swap copy failed (batched)\n");
                 return false;
             }
-            if (!swaps.empty()) dpct::sync_barrier(adapt_ev, adapt_stream);
+            if (!swaps.empty()) (adapt_stream)->record(*(adapt_ev));
             (void) main_live;
             for (auto& st : stages)
                 if (st->adapt_live) {
                     const strata::core::OnDevice on(st->dev);
-                    dpct::sync_barrier(st->adapt_ev, st->adapt_stream);
+                    (st->adapt_stream)->record(*(st->adapt_ev));
                 }
             // #477: the routing counted since the start (each count adds up to 1 / (1 - --adapt-decay) over its
             // decays: the sum is proportional to the routing itself) - only with --expert-profile-save, else `heat`
@@ -7995,8 +7262,8 @@ int main(int argc, char **argv) try {
         // copy lands.  `j`: the swap's exchange buffer (its copy back) and bounce buffer (a_cap + j).
         struct ASwap { int32_t layer, in, out, slot; int home; int64_t j; bool exchange; };
         struct AHome {
-            strata::core::ExpertCache *cache; dpct::queue_ptr stream;
-            dpct::event_ptr ev;
+            strata::core::ExpertCache *cache; strata::ze::Stream* stream;
+            strata::ze::Event* ev;
             int dev;
             bool used;
         };
@@ -8020,31 +7287,15 @@ int main(int argc, char **argv) try {
                                  "a round every %d windows\n", (long long) a_cap, o.adapt_every);
         }
         auto a_flush = [&]() { // the job's copies: an event after them on every
-                               // stream used, submitted now (WDDM)
-            try {
-        for (AHome &h : ahomes)
+                               // stream used, submitted now
+            for (AHome &h : ahomes)
                 if (h.used) {
                     const strata::core::OnDevice on(h.dev);
-                    /*
-                    DPCT1024: The original code returned the error code
-                    that was further consumed by the program logic. This
-                    original code was replaced with 0. You may need to rewrite
-                    the program logic consuming the error code.
-                    */
-                    if (DPCT_CHECK_ERROR(dpct::sync_barrier(h.ev, h.stream)) !=
-                        0) a_err = true;
-                    (void)DPCT_CHECK_ERROR(((h.stream)->ext_oneapi_empty()));
+                    h.stream->record(*h.ev);
                 }
-        }
-        catch (sycl::exception const &exc) {
-          std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-                    << ", line:" << __LINE__ << std::endl;
-          std::exit(1);
-        }
         };
         auto a_choose = [&]() { // step 1, on the job thread
-            try {
-        struct C { float gain; int32_t layer, in, out; };
+            struct C { float gain; int32_t layer, in, out; };
             std::vector<C> all;
             std::vector<std::pair<float, int32_t>> cand, vict;
             for (int64_t l = 0; l < g.n_layers; ++l) {
@@ -8082,51 +7333,14 @@ int main(int argc, char **argv) try {
                 if (!w.exchange) continue;
                 AHome& h = ahomes[(size_t) w.home];
                 const strata::core::OnDevice on(h.dev);
-                /*
-                DPCT1000: Error handling if-stmt was detected but could not
-                be rewritten.
-                */
-                /*
-                DPCT1124: cudaMemcpyAsync is migrated to asynchronous
-                memcpy API. While the origin API might be synchronous, it
-                depends on the type of operand memory, so you may need to call
-                wait() on event return by memcpy API to ensure synchronization
-                behavior.
-                */
-                if (const dpct::err0 e = DPCT_CHECK_ERROR(h.stream->memcpy(
-                        src.exchange_buffer(w.j), h.cache->device_slot(w.slot),
-                        (size_t)strata::kernels::cpu::expert_layout()
-                            .blob_bytes(w.layer)));
-                    e != 0) {
-                    std::fprintf(stderr,
-                                 "strata serve: adaptive tier: copy back of "
-                                 "layer %d slot %d (CUDA%d) failed: %s\n",
-                                 /*
-                                 DPCT1009: SYCL reports errors using
-                                 exceptions and does not use error codes. Please
-                                 replace the "get_error_string_dummy(...)" with
-                                 a real error-handling function.
-                                 */
-                                 (int)w.layer, (int)w.slot, h.dev,
-                                 dpct::get_error_string_dummy(e));
-                    /*
-                    DPCT1001: The statement could not be removed.
-                    */
-                    a_err = true;
-                }
+                h.stream->memcpy(src.exchange_buffer(w.j), h.cache->device_slot(w.slot),
+                                 (size_t) strata::kernels::cpu::expert_layout().blob_bytes(w.layer));
                 h.used = true;
             }
             a_flush();
-        }
-        catch (sycl::exception const &exc) {
-          std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-                    << ", line:" << __LINE__ << std::endl;
-          std::exit(1);
-        }
         };
         auto a_copy_in = [&]() { // step 2, on the job thread
-            try {
-        for (AHome &h : ahomes) h.used = false;
+            for (AHome &h : ahomes) h.used = false;
             for (const ASwap& w : aswaps) {
                 AHome& h = ahomes[(size_t) w.home];
                 const size_t nb = (size_t) strata::kernels::cpu::expert_layout().blob_bytes(w.layer);
@@ -8142,76 +7356,22 @@ int main(int argc, char **argv) try {
                     b = bb;
                 }
                 const strata::core::OnDevice on(h.dev);
-                /*
-                DPCT1000: Error handling if-stmt was detected but could not
-                be rewritten.
-                */
-                /*
-                DPCT1124: cudaMemcpyAsync is migrated to asynchronous
-                memcpy API. While the origin API might be synchronous, it
-                depends on the type of operand memory, so you may need to call
-                wait() on event return by memcpy API to ensure synchronization
-                behavior.
-                */
-                if (const dpct::err0 e = DPCT_CHECK_ERROR(
-                        h.stream->memcpy(h.cache->device_slot(w.slot), b, nb));
-                    e != 0) {
-                    std::fprintf(stderr,
-                                 "strata serve: adaptive tier: copy of layer "
-                                 "%d into slot %d (CUDA%d) failed: %s\n",
-                                 /*
-                                 DPCT1009: SYCL reports errors using
-                                 exceptions and does not use error codes. Please
-                                 replace the "get_error_string_dummy(...)" with
-                                 a real error-handling function.
-                                 */
-                                 (int)w.layer, (int)w.slot, h.dev,
-                                 dpct::get_error_string_dummy(e));
-                    /*
-                    DPCT1001: The statement could not be removed.
-                    */
-                    a_err = true;
-                }
+                h.stream->memcpy(h.cache->device_slot(w.slot), b, nb);
                 h.used = true;
             }
             a_flush();
-        }
-        catch (sycl::exception const &exc) {
-          std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-                    << ", line:" << __LINE__ << std::endl;
-          std::exit(1);
-        }
         };
         auto a_ready =
             [&](bool wait) -> bool { // the job and its copies are done
-            try {
-        if (wait) ajob->wait();
+            if (wait) ajob->wait();
             else if (!ajob->idle()) return false;
             for (AHome& h : ahomes)
                 if (h.used) {
                     const strata::core::OnDevice on(h.dev);
-                    if (wait) {
-                        if (DPCT_CHECK_ERROR(h.ev->wait_and_throw()) != 0)
-                            a_err = true;
-                    } else if (const dpct::err0 q =
-                                   dpct::sycl_event_query(h.ev);
-                               q == 1) return false;
-                    /*
-                    DPCT1001: The statement could not be removed.
-                    */
-                    /*
-                    DPCT1000: Error handling if-stmt was detected but could
-                    not be rewritten.
-                    */
-                    else if (q != 0) a_err = true;
+                    if (wait) h.ev->sync();
+                    else if (!h.ev->query()) return false;
                 }
             return true;
-        }
-        catch (sycl::exception const &exc) {
-          std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-                    << ", line:" << __LINE__ << std::endl;
-          std::exit(1);
-        }
         };
         // between windows: `drain` finishes the round in flight and starts none.  False when a copy failed.
         auto adapt_tick = [&](bool drain) -> bool {
@@ -8367,12 +7527,7 @@ int main(int argc, char **argv) try {
             // what is left once everything is allocated: under WDDM a GPU filled to the brim does not fail, it pages -
             // and a page-in while the verify graph spins on a host flag stalls the request for good
             size_t free_b = 0, total_b = 0;
-            /*
-            DPCT1106: 'cudaMemGetInfo' was migrated with the Intel
-            extensions for device information which may not be supported by all
-            compilers or runtimes. You may need to adjust the code.
-            */
-            dpct::get_current_device().get_memory_info(free_b, total_b);
+            strata::ze::mem_get_info(strata::ze::current_device(), &free_b, &total_b);
             // below ~256 MiB a later allocation (a first-used window's buffers, the desktop, another program) can make
             // the driver page GPU memory, and a verify graph spinning on a host flag then never finishes
             const int64_t free_mib = (int64_t) (free_b >> 20);
@@ -8394,12 +7549,7 @@ int main(int argc, char **argv) try {
         // what the server's Monitor tab shows (servers before 0.1.8 skip unknown lines until READY)
         {
             size_t free_b = 0, total_b = 0;
-            /*
-            DPCT1106: 'cudaMemGetInfo' was migrated with the Intel
-            extensions for device information which may not be supported by all
-            compilers or runtimes. You may need to adjust the code.
-            */
-            dpct::get_current_device().get_memory_info(free_b, total_b);
+            strata::ze::mem_get_info(strata::ze::current_device(), &free_b, &total_b);
             // "Experts in VRAM" is every tier, not one card's.  This used to report `xcache` alone, so a layer split
             // showed CUDA0's cache as if it were the whole GPU's: a 4-GPU 256K run read 3327 experts when the four
             // cards held 13320, and the Monitor tab was wrong by 4x for every multi-GPU config.  The tiers are
@@ -8511,8 +7661,7 @@ int main(int argc, char **argv) try {
         auto vram_command = [&](const std::string &cmd,
                                 std::string &e) -> bool {
             // `VRAM` alone: the reserve the engine started with (--vram-reserve-mib)
-            try {
-        char *end = nullptr;
+            char *end = nullptr;
             const bool bare = cmd.find_first_not_of(' ', 4) == std::string::npos;
             const long long reserve = bare ? (long long) o.vram_reserve_mib : std::strtoll(cmd.c_str() + 4, &end, 10);
             if (!bare && (end == cmd.c_str() + 4 || reserve < 0)) { e = "expected: VRAM [reserve_mib]"; return false; }
@@ -8529,30 +7678,10 @@ int main(int argc, char **argv) try {
                 if (!p.lent.empty()) { e = "VRAM: a prompt's loan is still out"; return false; }
             if (!ver.wait_commit(e)) return false;
             apply_pending(true);                     // the adaptive tier's swaps in flight land first
-            if (DPCT_CHECK_ERROR(
-                    dpct::get_current_device().queues_wait_and_throw()) != 0) {
-                /*
-                DPCT1009: SYCL reports errors using exceptions and does not
-                use error codes. Please replace the
-                "get_error_string_dummy(...)" with a real error-handling
-                function.
-                */
-                /*
-                DPCT1010: SYCL uses exceptions to report errors and does
-                not use the error codes. The cudaGetLastError function call was
-                replaced with 0. You need to rewrite this code.
-                */
-                e = std::string("VRAM: ") + dpct::get_error_string_dummy(0);
-                return false;
-            }
+            strata::ze::device_sync();
             const auto t0 = Clock::now();
             size_t free_b = 0, total_b = 0;
-            /*
-            DPCT1106: 'cudaMemGetInfo' was migrated with the Intel
-            extensions for device information which may not be supported by all
-            compilers or runtimes. You may need to adjust the code.
-            */
-            dpct::get_current_device().get_memory_info(free_b, total_b);
+            strata::ze::mem_get_info(strata::ze::current_device(), &free_b, &total_b);
             const int64_t want_free = (int64_t) reserve << 20, mapped = xcache.mapped_bytes();
             const int64_t before = xcache.slots();
             // what stays at least: the prompt path's smallest loan (256 tokens) and the 128 slots it must leave
@@ -8608,12 +7737,7 @@ int main(int argc, char **argv) try {
                 res_upload();
             }
             relend();
-            /*
-            DPCT1106: 'cudaMemGetInfo' was migrated with the Intel
-            extensions for device information which may not be supported by all
-            compilers or runtimes. You may need to adjust the code.
-            */
-            dpct::get_current_device().get_memory_info(free_b, total_b);
+            strata::ze::mem_get_info(strata::ze::current_device(), &free_b, &total_b);
             std::fprintf(stderr, "strata serve: VRAM %lld MiB kept free: the expert cache %lld -> %lld of %lld slots "
                                  "(%.2f of %.2f GiB), %lld MiB free now, prompt chunk %lld, in %.0f ms%s\n",
                          reserve, (long long) before, (long long) xcache.slots(), (long long) xcache.full_slots(),
@@ -8626,12 +7750,6 @@ int main(int argc, char **argv) try {
                         (long long) (xcache.mapped_bytes() >> 20), (long long) (xcache.full_bytes() >> 20),
                         (long long) (free_b >> 20), (long long) o.prefill_chunk);
             return true;
-        }
-        catch (sycl::exception const &exc) {
-          std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-                    << ", line:" << __LINE__ << std::endl;
-          std::exit(1);
-        }
         };
         // ---- --batch: the slots of the batch windows
         struct BSlot {
@@ -8677,17 +7795,12 @@ int main(int argc, char **argv) try {
         // the session a request just left behind (its prompt) -> slot b's sessions, on every stage
         auto copy_to_slot = [&](int b, const std::vector<int32_t> &ids,
                                 std::string &e) -> bool {
-            try {
-        const int64_t upto = (int64_t)ids.size();
+            const int64_t upto = (int64_t)ids.size();
             for (size_t k = 0; k < bslot_ss.size(); ++k) {
                 strata::core::SessionState& from = k == 0 ? ss : stages[k - 1]->ss;
                 strata::core::SessionState& to = *bslot_ss[k][(size_t) b];
                 const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
-                if (DPCT_CHECK_ERROR(
-                        dpct::get_current_device().queues_wait_and_throw()) !=
-                    0) {
-                    e = "batch admission: device sync failed"; return false;
-                }
+                strata::ze::device_sync();
                 strata::core::ConversationCheckpoint ck;
                 ck.ids = ids;
                 if (!strata::core::conversation_checkpoint_save(ck, from, g, e) ||
@@ -8697,18 +7810,11 @@ int main(int argc, char **argv) try {
                     strata::core::ConversationKv img;
                     if (!strata::core::conversation_kv_save(img, from.qsa_states[from.qsa_ord0 + j], g, upto, true, e))
                         return false;
-                    if (DPCT_CHECK_ERROR(dpct::get_current_device()
-                                             .queues_wait_and_throw()) != 0) {
-                        e = "batch admission: device sync failed"; return false;
-                    }
+                    strata::ze::device_sync();
                     if (!strata::core::conversation_kv_restore(img, to.qsa_states[to.qsa_ord0 + j], g, upto, true, e))
                         return false;
                 }
-                if (DPCT_CHECK_ERROR(
-                        dpct::get_current_device().queues_wait_and_throw()) !=
-                    0) {
-                    e = "batch admission: device sync failed"; return false;
-                }
+                strata::ze::device_sync();
             }
             if (batch_mtp) {
                 // Admission first builds the solo draft KV; copy it into the slot before drafting.
@@ -8719,39 +7825,26 @@ int main(int argc, char **argv) try {
                                                         false, e) ||
                     !strata::core::conversation_kv_restore(
                         image, slot_mtp[(size_t)b]->kv_state(), draft_geometry,
-                        upto, false, e) ||
-                    DPCT_CHECK_ERROR(
-                        dpct::get_current_device().queues_wait_and_throw()) !=
-                        0)
+                        upto, false, e))
                     return false;
+                strata::ze::device_sync();
                 slot_mtp[(size_t) b]->set_prompt_len(upto);
             }
             return true;
-        }
-        catch (sycl::exception const &exc) {
-          std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-                    << ", line:" << __LINE__ << std::endl;
-          std::exit(1);
-        }
         };
         // slot b's sessions -> the main ones (the reverse of copy_to_slot): a request that continues the
         // conversation an idle slot holds reads on from there.  Every stage, the same calls.
         // `at`: one of the slot's checkpoints - only the K/V up to it is copied and its state restored instead
         auto copy_from_slot = [&](int b, const ConvCheckpoint *at,
                                   std::string &e) -> bool {
-            try {
-        const int64_t upto = at != nullptr ? (int64_t)at->ids.size()
+            const int64_t upto = at != nullptr ? (int64_t)at->ids.size()
                                            : (int64_t)bs[(size_t)b].ids.size();
             if (at != nullptr && at->stage_parts.size() != stages.size()) { e = "a checkpoint without its stage parts"; return false; }
             for (size_t k = 0; k < bslot_ss.size(); ++k) {
                 strata::core::SessionState& from = *bslot_ss[k][(size_t) b];
                 strata::core::SessionState& to = k == 0 ? ss : stages[k - 1]->ss;
                 const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
-                if (DPCT_CHECK_ERROR(
-                        dpct::get_current_device().queues_wait_and_throw()) !=
-                    0) {
-                    e = "batch slot restore: device sync failed"; return false;
-                }
+                strata::ze::device_sync();
                 if (at != nullptr) {
                     if (!strata::core::conversation_checkpoint_restore(k == 0 ? *at : at->stage_parts[k - 1], to, g, e))
                         return false;
@@ -8766,19 +7859,11 @@ int main(int argc, char **argv) try {
                     strata::core::ConversationKv img;
                     if (!strata::core::conversation_kv_save(img, from.qsa_states[from.qsa_ord0 + j], g, upto, true, e))
                         return false;
-                    if (DPCT_CHECK_ERROR(dpct::get_current_device()
-                                             .queues_wait_and_throw()) != 0) {
-                        e = "batch slot restore: device sync failed";
-                        return false;
-                    }
+                    strata::ze::device_sync();
                     if (!strata::core::conversation_kv_restore(img, to.qsa_states[to.qsa_ord0 + j], g, upto, true, e))
                         return false;
                 }
-                if (DPCT_CHECK_ERROR(
-                        dpct::get_current_device().queues_wait_and_throw()) !=
-                    0) {
-                    e = "batch slot restore: device sync failed"; return false;
-                }
+                strata::ze::device_sync();
             }
             if (batch_mtp) {
                 // A returning solo request resumes from its slot's draft KV.
@@ -8789,20 +7874,12 @@ int main(int argc, char **argv) try {
                         upto, false, e) ||
                     !strata::core::conversation_kv_restore(
                         image, mtp.kv_state(), draft_geometry, upto, false,
-                        e) ||
-                    DPCT_CHECK_ERROR(
-                        dpct::get_current_device().queues_wait_and_throw()) !=
-                        0)
+                        e))
                     return false;
+                strata::ze::device_sync();
                 mtp.set_prompt_len(upto);
             }
             return true;
-        }
-        catch (sycl::exception const &exc) {
-          std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-                    << ", line:" << __LINE__ << std::endl;
-          std::exit(1);
-        }
         };
         // one batch window over the active slots only (row t is the t-th active slot): an idle slot is not touched,
         // so it keeps the conversation it holds
@@ -8897,11 +7974,11 @@ int main(int argc, char **argv) try {
                 }
                 if (batch_mtp && sl.active) {
                     const size_t stride = (size_t) g.hc * (size_t) g.n_embd;
-                    if (DPCT_CHECK_ERROR(dpct::get_in_order_queue().memcpy(
-                            slot_mtp_rows[(size_t)b].get(),
-                            ver.final_R_all() + (size_t)first[t] * stride,
-                            2 * stride * sizeof(float)).wait()) != 0 ||
-                        !slot_mtp[(size_t)b]->draft(2, outb + first[t],
+                    strata::ze::default_stream().memcpy(slot_mtp_rows[(size_t) b].get(),
+                                                        ver.final_R_all() + (size_t) first[t] * stride,
+                                                        2 * stride * sizeof(float));
+                    strata::ze::default_stream().sync();
+                    if (!slot_mtp[(size_t)b]->draft(2, outb + first[t],
                                                     pos[first[t]], keep[b] - 1,
                                                     sl.draft.data(), err)) {
                         std::printf("ERR batch MTP slot %d: %s\n", b, err.c_str());
@@ -9298,11 +8375,7 @@ int main(int argc, char **argv) try {
                         continue;
                     }
                     // the elastic K/V (--kv-grow) maps only the cells it has grown to: make room for the file's cells
-                    if (!kvg_ensure((int64_t) image.live.ids.size() + 256, [&] {
-                                                                                 dpct::get_current_device()
-                                                                                     .queues_wait_and_throw();
-                                                                                     apply_pending(
-                                                                                         true); })) {
+                    if (!kvg_ensure((int64_t) image.live.ids.size() + 256, [&] { strata::ze::device_sync(); apply_pending(true); })) {
                         refuse("the K/V cannot grow to the saved conversation: no VRAM is left", strata::core::SessionError::memory);
                         continue;
                     }
@@ -9470,35 +8543,19 @@ int main(int argc, char **argv) try {
                     for (int64_t c = n; ve.empty() && c < cells; ++c) put(c, p + (c - n), p + (c - n), p + (c - n));
                 }
                 tr("positions built", (long long) img_rows.size());
-                dpct::get_current_device().queues_wait_and_throw();
+                strata::ze::device_sync();
                 tr("device idle");
                 // CUDA0's table and, with a layer split, every later stage's (each device reads its own)
                 auto upload_mrope = [&]() -> bool {
-                    try {
-                bool ok = DPCT_CHECK_ERROR(
-                              dpct::get_in_order_queue()
-                                  .memcpy(d_mrope, mrope_host.data(),
-                                          mrope_host.size() * sizeof(int32_t))
-                                  .wait()) == 0;
+                    strata::ze::default_stream().memcpy(d_mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t));
+                    strata::ze::default_stream().sync();
                     for (auto& st : stages) {
                         const strata::core::OnDevice on(st->dev);
-                        dpct::get_current_device().queues_wait_and_throw();
-                        ok =
-                            ok &&
-                            DPCT_CHECK_ERROR(
-                                dpct::get_in_order_queue()
-                                    .memcpy(st->mrope, mrope_host.data(),
-                                            mrope_host.size() * sizeof(int32_t))
-                                    .wait()) == 0;
+                        strata::ze::device_sync();
+                        strata::ze::default_stream().memcpy(st->mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t));
+                        strata::ze::default_stream().sync();
                     }
-                    return ok;
-                }
-                catch (sycl::exception const &exc) {
-                  std::cerr << exc.what()
-                            << "Exception caught at file:" << __FILE__
-                            << ", line:" << __LINE__ << std::endl;
-                  std::exit(1);
-                }
+                    return true;
                 };
                 if (ve.empty() && !upload_mrope()) ve = "the image position upload failed";
                 if (!ve.empty()) {
@@ -9555,15 +8612,7 @@ int main(int argc, char **argv) try {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
-            auto kv_quiesce = [&] {
-                                    try {
-            dpct::get_current_device().queues_wait_and_throw(); apply_pending(true); }
-            catch (sycl::exception const &exc) {
-              std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-                        << ", line:" << __LINE__ << std::endl;
-              std::exit(1);
-            }
-            };
+            auto kv_quiesce = [&] { strata::ze::device_sync(); apply_pending(true); };
             if (kvg.on) {   // the elastic K/V: this prompt's cells (it gives back what it does not need below)
                 // a failed growth may leave the tier half-changed: the engine stops (as for any CUDA failure)
                 if (!kvg_ensure(n + 256, kv_quiesce)) {
@@ -9698,10 +8747,7 @@ int main(int argc, char **argv) try {
                                     err.c_str());
                         return 1;
                     }
-                    if (DPCT_CHECK_ERROR(dpct::get_current_device()
-                                             .queues_wait_and_throw()) != 0) {
-                        std::printf("ERR stage sync\n"); return 1;
-                    }
+                    strata::ze::device_sync();
                 }
                 if (use_mtp && std::getenv("STRATA_SNAPSHOT_VERIFY") != nullptr) {
                     uint64_t draft_hash = 0;
@@ -9766,11 +8812,11 @@ int main(int argc, char **argv) try {
             int64_t reread_to = -1;   // STRATA_CKPT_REREAD only: read [0, reread_to) again instead of restoring
             if (resume == 0) {
                 strata::core::session_zero(ss, g, nullptr, main_cs);
-                main_stream->wait();
+                main_stream->sync();
                 for (auto& st : stages) {
                     const strata::core::OnDevice on(st->dev);
                     strata::core::session_zero(st->ss, g, nullptr, (void*) st->stream);
-                    st->stream->wait();
+                    st->stream->sync();
                 }
                 checks.clear();
             } else if (!from_live) {
@@ -9785,11 +8831,11 @@ int main(int argc, char **argv) try {
                     // (--adapt-swaps 0) the answer must match the restored one token for token; anything the
                     // checkpoint missed shows up as a difference.
                     strata::core::session_zero(ss, g, nullptr, main_cs);
-                    main_stream->wait();
+                    main_stream->sync();
                     for (auto& st : stages) {
                         const strata::core::OnDevice on(st->dev);
                         strata::core::session_zero(st->ss, g, nullptr, (void*) st->stream);
-                        st->stream->wait();
+                        st->stream->sync();
                     }
                     reread_to = resume;
                     std::fprintf(stderr, "strata serve: STRATA_CKPT_REREAD: reading %lld tokens again instead of "
@@ -9925,8 +8971,7 @@ int main(int argc, char **argv) try {
                         if (pl_mtp_live[l1 & 1]) {   // the drafter has read this parity's previous rows first
                             const strata::core::OnDevice on(mtp.device());
                             (v.stream())
-                                ->ext_oneapi_submit_barrier(
-                                    {*pl_mtp_ev[l1 & 1]});
+                                ->wait(*pl_mtp_ev[l1 & 1]);
                         }
                         if (!v.pl_launch(w.T, w1.data(), w.q, e) || !v.pl_commit_async(w.T, e)) return fail(e);
                         ++l1;
@@ -9941,8 +8986,7 @@ int main(int argc, char **argv) try {
                             if (!mtp.prefill(v.final_R(0), nx.data(), w.T, w.q, e, false)) return fail(e);
                             {
                                 const strata::core::OnDevice on(mtp.device());
-                                dpct::sync_barrier(pl_mtp_ev[f1 & 1],
-                                                   mtp.stream());
+                                (mtp.stream())->record(*(pl_mtp_ev[f1 & 1]));
                             }
                             pl_mtp_live[f1 & 1] = true;
                             pp_reached = w.q + w.T;   // #471
@@ -10323,12 +9367,6 @@ int main(int argc, char **argv) try {
                         std::printf("ERR %s\n", err.c_str());
                         // #224: a CUDA fault (an illegal address) poisons the context for the whole process, and
                         // unwinding the destructors on it could hang until the 60 s watchdog: leave at once
-                        /*
-                        DPCT1010: SYCL uses exceptions to report errors and
-                        does not use the error codes. The cudaPeekAtLastError
-                        function call was replaced with 0. You need to rewrite
-                        this code.
-                        */
                         if (0 != 0) {
                             std::fflush(stdout);
                             std::fflush(stderr);
@@ -10456,54 +9494,17 @@ int main(int argc, char **argv) try {
                 const int force_miss = pl_force_miss;
                 static const bool pl_log = pipe_dbg_env("STRATA_PIPELINE_LOG") != nullptr;
                 const int dev0 = PV[0][0]->device();
-                dpct::queue_ptr s0 = PV[0][0]->stream();
+                strata::ze::Stream* s0 = PV[0][0]->stream();
                 // the snapshot of the GDN state window `seq` reads (overlapped: before its launch, on the side stream)
                 auto snap_take = [&](int seq) -> bool {
-                    try {
-                if (!pl_snap_overlap) return true;
+                    if (!pl_snap_overlap) return true;
                     const strata::core::OnDevice on(dev0);
                     const int q = seq & 1;
-                    /*
-                    DPCT1024: The original code returned the error code
-                    that was further consumed by the program logic. This
-                    original code was replaced with 0. You may need to rewrite
-                    the program logic consuming the error code.
-                    */
-                    return DPCT_CHECK_ERROR(
-                               dpct::sync_barrier(pl_snap_pre[q], s0)) == 0 &&
-                           DPCT_CHECK_ERROR(
-                               pl_snap_stream->ext_oneapi_submit_barrier(
-                                   {*pl_snap_pre[q]})) == 0 &&
-                           /*
-                           DPCT1124: cudaMemcpyAsync is migrated to
-                           asynchronous memcpy API. While the origin API might
-                           be synchronous, it depends on the type of operand
-                           memory, so you may need to call wait() on event
-                           return by memcpy API to ensure synchronization
-                           behavior.
-                           */
-                           DPCT_CHECK_ERROR(pl_snap_stream->memcpy(
-                               pl_snap2[q], ss.gdn_state, pl_snap_bytes)) ==
-                               0 &&
-                           /*
-                           DPCT1024: The original code returned the error
-                           code that was further consumed by the program logic.
-                           This original code was replaced with 0. You may need
-                           to rewrite the program logic consuming the error
-                           code.
-                           */
-                           DPCT_CHECK_ERROR(dpct::sync_barrier(
-                               pl_snap_ev[q], pl_snap_stream)) == 0 &&
-                           (DPCT_CHECK_ERROR(
-                                (pl_snap_stream->ext_oneapi_empty())),
-                            true);
-                }
-                catch (sycl::exception const &exc) {
-                  std::cerr << exc.what()
-                            << "Exception caught at file:" << __FILE__
-                            << ", line:" << __LINE__ << std::endl;
-                  std::exit(1);
-                }
+                    s0->record(*pl_snap_pre[q]);
+                    pl_snap_stream->wait(*pl_snap_pre[q]);
+                    pl_snap_stream->memcpy(pl_snap2[q], ss.gdn_state, pl_snap_bytes);
+                    pl_snap_stream->record(*pl_snap_ev[q]);
+                    return true;
                 };
                 PW A, B, D;              // A: the oldest window not verified; B: the next; D: a wrong speculative window
                 bool doomed = false;     // D still runs: when it finishes, stage 0 goes back to undo_w's real commit
@@ -10594,48 +9595,27 @@ int main(int argc, char **argv) try {
                     B.made = true;
                 };
                 // events after all the work both stages' streams hold now, and whether they have passed
-                dpct::event_ptr fence_ev[2] = {nullptr, nullptr},
-                                exch_ev[2] = {nullptr, nullptr};
+                strata::ze::Event* fence_ev[2] = {nullptr, nullptr}, *exch_ev[2] = {nullptr, nullptr};
                 {
                     const strata::core::OnDevice on0(dev0);
-                    fence_ev[0] = new sycl::event();
-                    exch_ev[0] = new sycl::event();
+                    fence_ev[0] = new strata::ze::Event();
+                    exch_ev[0] = new strata::ze::Event();
                 }
                 {
                     const strata::core::OnDevice on1(stages[0]->dev);
-                    fence_ev[1] = new sycl::event();
-                    exch_ev[1] = new sycl::event();
+                    fence_ev[1] = new strata::ze::Event();
+                    exch_ev[1] = new strata::ze::Event();
                 }
-                auto stage_record = [&](dpct::event_ptr *ev) {
-                    try {
-                {
+                auto stage_record = [&](strata::ze::Event** ev) {
+                    {
                         const strata::core::OnDevice on(dev0);
-                        dpct::sync_barrier(ev[0], s0);
-                        (void)DPCT_CHECK_ERROR((s0->ext_oneapi_empty()));
+                        s0->record(*ev[0]);
                     }
                     const strata::core::OnDevice on(stages[0]->dev);
-                    dpct::sync_barrier(ev[1], PV[1][0]->stream());
-                    (void)DPCT_CHECK_ERROR(
-                        ((PV[1][0]->stream())->ext_oneapi_empty()));
-                }
-                catch (sycl::exception const &exc) {
-                  std::cerr << exc.what()
-                            << "Exception caught at file:" << __FILE__
-                            << ", line:" << __LINE__ << std::endl;
-                  std::exit(1);
-                }
+                    PV[1][0]->stream()->record(*ev[1]);
                 };
-                auto stage_passed = [&](dpct::event_ptr *ev) {
-                    try {
-                return dpct::sycl_event_query(ev[0]) != 1 &&
-                       dpct::sycl_event_query(ev[1]) != 1;
-                }
-                catch (sycl::exception const &exc) {
-                  std::cerr << exc.what()
-                            << "Exception caught at file:" << __FILE__
-                            << ", line:" << __LINE__ << std::endl;
-                  std::exit(1);
-                }
+                auto stage_passed = [&](strata::ze::Event** ev) {
+                    return ev[0]->query() && ev[1]->query();
                 };
                 // adapt()'s fence, on the tier's thread: it waits on the HOST.  A device-side wait (the refill streams
                 // waiting for the stages' events) would queue copies behind windows that need this loop, beside it.
@@ -10658,23 +9638,13 @@ int main(int argc, char **argv) try {
                     exch_wait = false;
                 };
                 auto pl_apply = [&]() {
-                    try {
-                if (exch_wait) {
+                    if (exch_wait) {
                         if (stage_passed(exch_ev)) pl_release();
                         return;
                     }
-                    if (pending.empty() ||
-                        adapt_ev->get_info<
-                            sycl::info::event::command_execution_status>() !=
-                            sycl::info::event_command_status::complete) return;
+                    if (pending.empty() || !adapt_ev->query()) return;
                     for (auto& st : stages)
-                        if (st->adapt_live &&
-                            (st->adapt_ev)
-                                    ->get_info<
-                                        sycl::info::event::
-                                            command_execution_status>() !=
-                                sycl::info::event_command_status::
-                                    complete) return;
+                        if (st->adapt_live && !st->adapt_ev->query()) return;
                     for (auto& st : stages) st->adapt_live = false;
                     for (const auto& [i, slot] : pending) {
                         host_res[(size_t) i] = slot;
@@ -10685,13 +9655,6 @@ int main(int argc, char **argv) try {
                     res_upload();
                     stage_record(exch_ev);
                     exch_wait = true;
-                }
-                catch (sycl::exception const &exc) {
-                  std::cerr << exc.what()
-                            << "Exception caught at file:" << __FILE__
-                            << ", line:" << __LINE__ << std::endl;
-                  std::exit(1);
-                }
                 };
                 auto pl_adapt = [&]() -> bool {
                     if (pl_adapt_thr.joinable() && pl_adapt_done.load()) {
@@ -10795,19 +9758,11 @@ int main(int argc, char **argv) try {
                     if (doomed && D.finished) {
                         {
                             const strata::core::OnDevice on(dev0);
-                            /*
-                            DPCT1124: cudaMemcpyAsync is migrated to
-                            asynchronous memcpy API. While the origin API might
-                            be synchronous, it depends on the type of operand
-                            memory, so you may need to call wait() on event
-                            return by memcpy API to ensure synchronization
-                            behavior.
-                            */
-                            if (DPCT_CHECK_ERROR(s0->memcpy(
+                            if (((void) (s0->memcpy(
                                     ss.gdn_state,
                                     pl_snap2[pl_snap_overlap ? (undo_w.seq & 1)
                                                              : 0],
-                                    pl_snap_bytes)) != 0)
+                                    pl_snap_bytes)), 0) != 0)
                                 return die("restoring the GDN snapshot failed");
                         }
                         ss.ple_prev[0] = undo_ple[0];
@@ -10915,22 +9870,11 @@ int main(int argc, char **argv) try {
                             {
                                 const strata::core::OnDevice on(dev0);
                                 if (pl_snap_overlap
-                                        ? DPCT_CHECK_ERROR(
-                                              s0->ext_oneapi_submit_barrier(
-                                                  {*pl_snap_ev[A.seq & 1]})) !=
+                                        ? ((void) (s0->wait(*pl_snap_ev[A.seq & 1])), 0) !=
                                               0
-                                        /*
-                                        DPCT1124: cudaMemcpyAsync is
-                                        migrated to asynchronous memcpy API.
-                                        While the origin API might be
-                                        synchronous, it depends on the type of
-                                        operand memory, so you may need to call
-                                        wait() on event return by memcpy API to
-                                        ensure synchronization behavior.
-                                        */
-                                        : DPCT_CHECK_ERROR(s0->memcpy(
+                                        : ((void) (s0->memcpy(
                                               pl_snap2[0], ss.gdn_state,
-                                              pl_snap_bytes)) != 0)
+                                              pl_snap_bytes)), 0) != 0)
                                     return die("the GDN snapshot failed");
                             }
                             undo_ple[0] = ss.ple_prev[0];
@@ -11057,10 +10001,10 @@ int main(int argc, char **argv) try {
                 if (pl_adapt_thr.joinable()) pl_adapt_thr.join();   // its copies waited only for finished work
                 adapt_fence = nullptr;
                 if (exch_wait) pl_release();   // every window has completed (drained)
-                for (dpct::event_ptr ev : fence_ev) if (ev)
-                    dpct::destroy_event(ev);
-                for (dpct::event_ptr ev : exch_ev) if (ev)
-                    dpct::destroy_event(ev);
+                for (strata::ze::Event* ev : fence_ev) if (ev)
+                    delete (ev);
+                for (strata::ze::Event* ev : exch_ev) if (ev)
+                    delete (ev);
                 if (pl_trace_path != nullptr && !pl_trace.empty()) {
                     if (std::FILE* f = std::fopen(pl_trace_path, "a")) {
                         std::fprintf(f, "# request p0=%lld\n", (long long) (n - 1));
@@ -11162,17 +10106,14 @@ int main(int argc, char **argv) try {
                     strata::kernels::penalty_rows(consumed.data(), (int64_t) consumed.size(), window.data(), T,
                                                   hist_n, hist_stage.data());
                     const strata::core::OnDevice on_h(hist_dev);
-                    dpct::get_in_order_queue()
+                    strata::ze::default_stream()
                         .memcpy(d_hist, hist_stage.data(),
                                 (size_t)T * (size_t)hist_n * sizeof(int32_t))
                         .wait();
                 }
                 // the elastic K/V: the window's cells and the drafter's beyond them
                 if (kvg.on && p + T + 64 > kvg.cells &&
-                    !kvg_ensure(p + T + 64, [&] {
-                                                  dpct::get_current_device()
-                                                      .queues_wait_and_throw();
-                                                      apply_pending(true); })) {
+                    !kvg_ensure(p + T + 64, [&] { strata::ze::device_sync(); apply_pending(true); })) {
                     std::printf("ERR the K/V cannot grow: no VRAM is left\n");
                     return 1;
                 }
@@ -11310,12 +10251,7 @@ int main(int argc, char **argv) try {
             if (state_hash && !cancelled && o.prompt_cache > 0) {   // every finished request, ckpt=0 too (parity gates)
                 // DEBUG: a fingerprint of every part of the session over the positions it holds ([0, L)), and
                 // separately of what lies past them in the last KV page (stale cells, fine unless something reads them)
-                if (DPCT_CHECK_ERROR(
-                        dpct::get_current_device().queues_wait_and_throw()) !=
-                    0) {
-                    std::printf("ERR synchronizing state fingerprint\n");
-                    return 1;
-                }
+                strata::ze::device_sync();
                 const int64_t L = (int64_t) live.size();
                 const strata::kernels::QsaShapes qs = [&] {
                     strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
@@ -11325,17 +10261,15 @@ int main(int argc, char **argv) try {
                 bool hash_ok = true;
                 std::array<uint8_t, 65536> hash_buffer;
                 auto hash_dev = [&](const void *p, size_t bytes, uint64_t h) {
-                    try {
-                for (size_t offset = 0; hash_ok && offset < bytes;) {
+                    for (size_t offset = 0; hash_ok && offset < bytes;) {
                         const size_t n = std::min(hash_buffer.size(), bytes - offset);
                         // VRAM or a streamed host copy, with fixed diagnostic workspace.
-                        if (DPCT_CHECK_ERROR(
-                                dpct::get_in_order_queue()
+                        if (((void) (strata::ze::default_stream()
                                     .memcpy(hash_buffer.data(),
                                             static_cast<const uint8_t *>(p) +
                                                 offset,
                                             n)
-                                    .wait()) != 0) {
+                                    .wait()), 0) != 0) {
                             hash_ok = false;
                             break;
                         }
@@ -11343,13 +10277,6 @@ int main(int argc, char **argv) try {
                         offset += n;
                     }
                     return h;
-                }
-                catch (sycl::exception const &exc) {
-                  std::cerr << exc.what()
-                            << "Exception caught at file:" << __FILE__
-                            << ", line:" << __LINE__ << std::endl;
-                  std::exit(1);
-                }
                 };
                 // the cells [c0, c1) of one int8 K or V pool ([page][kv_head][page_size][head_dim]), bytes per value `w`
                 auto hash_cells = [&](const void* pool, int64_t per_cell, int64_t c0, int64_t c1, uint64_t h) {
@@ -11604,7 +10531,7 @@ int main(int argc, char **argv) try {
         // SYCL port: the requests are done and their output written; leave without unwinding the GPU objects (the OS
         // reclaims them). Their destructors ran against a runtime already shutting down and aborted (exit 139).
         try {
-            dpct::get_current_device().queues_wait_and_throw();
+            strata::ze::device_sync();
             // Release the direct-access USM host mirror before process teardown.
             gguf_src.close();
         } catch (const std::exception& e) {
@@ -11654,7 +10581,7 @@ int main(int argc, char **argv) try {
                 kvg_started = true;
                 kvg_start(first);
                 if (!kvg_ensure(n_prompt + o.max_new + 64, [] {
-                                                                dpct::get_current_device().queues_wait_and_throw(); })) return 1;
+                                                                strata::ze::device_sync(); })) return 1;
                 for (size_t i = 0; i < host_res.size(); ++i)
                     if (host_res[i] >= first) {
                         lent.emplace_back((int32_t) i, host_res[i]);
@@ -11693,7 +10620,7 @@ int main(int argc, char **argv) try {
             kvg_started = true;
             kvg_start(xcache.slots());
             if (!kvg_ensure(n_prompt + o.max_new + 64, [] {
-                                                            dpct::get_current_device().queues_wait_and_throw(); })) return 1;
+                                                            strata::ze::device_sync(); })) return 1;
         }
         const Clock::time_point tp0 = Clock::now();
         if (!prefill.run(o.tokens.data(), n_batched, 0, err)) {
@@ -11752,7 +10679,7 @@ int main(int argc, char **argv) try {
         kvg_started = true;
         kvg_start(xcache.slots());
         if (!kvg_ensure(n_prompt + o.max_new + 64, [] {
-                                                        dpct::get_current_device().queues_wait_and_throw(); })) return 1;
+                                                        strata::ze::device_sync(); })) return 1;
     }
     for (int64_t pos = pos_start;; ++pos) {
         // plan v0.3 P6: a native pack's last prompt token is the first verify window (T = 1)
@@ -11834,7 +10761,7 @@ int main(int argc, char **argv) try {
             }
         }
         if (final_r != nullptr) {
-            dpct::get_in_order_queue()
+            strata::ze::default_stream()
                 .memcpy(final_r_host.data(), ss.R,
                         final_r_host.size() * sizeof(float))
                 .wait();
@@ -11869,24 +10796,12 @@ int main(int argc, char **argv) try {
         // faulted had completed its own error checks successfully - because its kernels had not run yet.  A
         // sticky error surfaces at the next SYNCHRONISING call, which is whatever happens to come next.
         if (!o.stream_token &&
-            DPCT_CHECK_ERROR(
-                dpct::get_current_device().queues_wait_and_throw()) != 0) {
+            ((void) (strata::ze::device_sync()), 0) != 0) {
             std::fprintf(
                 stderr,
                 "strata generate: the device faulted in lm_head at position "
                 "%lld: %s\n",
-                /*
-                DPCT1009: SYCL reports errors using exceptions and does not
-                use error codes. Please replace the
-                "get_error_string_dummy(...)" with a real error-handling
-                function.
-                */
-                /*
-                DPCT1010: SYCL uses exceptions to report errors and does
-                not use the error codes. The cudaGetLastError function call was
-                replaced with 0. You need to rewrite this code.
-                */
-                (long long)pos, dpct::get_error_string_dummy(0));
+                (long long)pos, "error");
             return 1;
         }
         {
@@ -11897,16 +10812,10 @@ int main(int argc, char **argv) try {
         const bool emit_logits = dump != nullptr &&
             strata::program::logits_selection::selected(pos, dump_positions, o.logits_stride);
         const bool read_logits = !o.stream_token || o.check_logits || emit_logits;
-        /*
-        DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy API.
-        While the origin API might be synchronous, it depends on the type of
-        operand memory, so you may need to call wait() on event return by memcpy
-        API to ensure synchronization behavior.
-        */
         if (read_logits &&
-            (DPCT_CHECK_ERROR(strata::q_of(token_stream)->memcpy(
-                 logits.data(), d_logits, (size_t)n_vocab * 4)) != 0 ||
-             DPCT_CHECK_ERROR(strata::q_of(token_stream)->wait()) != 0)) {
+            (((void) (strata::ze::stream_of(token_stream)->memcpy(
+                 logits.data(), d_logits, (size_t)n_vocab * 4)), 0) != 0 ||
+             ((void) (strata::ze::stream_of(token_stream)->sync()), 0) != 0)) {
             std::fprintf(stderr, "strata generate: reading the logits back failed\n");
             return 1;
         }
@@ -11946,30 +10855,13 @@ int main(int argc, char **argv) try {
         // the same text whether a token comes from this path or from the speculative loop below.
         sp.counter = (uint64_t) pos;
         strata::kernels::sample_tokens(d_logits, 1, (int) n_vocab, nullptr, 0, sp, d_next, token_stream);
-        /*
-        DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy API.
-        While the origin API might be synchronous, it depends on the type of
-        operand memory, so you may need to call wait() on event return by memcpy
-        API to ensure synchronization behavior.
-        */
-        if (DPCT_CHECK_ERROR(strata::q_of(token_stream)->memcpy(
-                &next, d_next, sizeof(int))) != 0 ||
-            DPCT_CHECK_ERROR(strata::q_of(token_stream)->wait()) != 0) {
+        if (((void) (strata::ze::stream_of(token_stream)->memcpy(
+                &next, d_next, sizeof(int))), 0) != 0 ||
+            ((void) (strata::ze::stream_of(token_stream)->sync()), 0) != 0) {
             std::fprintf(
                 stderr,
                 "strata generate: reading the sampled token back failed: %s\n",
-                /*
-                DPCT1009: SYCL reports errors using exceptions and does not
-                use error codes. Please replace the
-                "get_error_string_dummy(...)" with a real error-handling
-                function.
-                */
-                /*
-                DPCT1010: SYCL uses exceptions to report errors and does
-                not use the error codes. The cudaGetLastError function call was
-                replaced with 0. You need to rewrite this code.
-                */
-                dpct::get_error_string_dummy(0));
+                "error");
             return 1;
         }
         // The sampled-token synchronization also completes every captured QSA
@@ -12071,8 +10963,9 @@ int main(int argc, char **argv) try {
         int32_t* usage_dev = nullptr;   // STRATA_USAGE_DUMP=PATH: the device plan counts every routed expert (measurement)
         const char* usage_dump = std::getenv("STRATA_USAGE_DUMP");
         if (mirror_table_d && usage_dump && *usage_dump) {
-            usage_dev = sycl::malloc_device<int32_t>((size_t) (g.n_layers * g.n_expert), dpct::get_in_order_queue());
-            dpct::get_in_order_queue().memset(usage_dev, 0, (size_t) (g.n_layers * g.n_expert) * 4).wait();
+            usage_dev = (int32_t*) strata::ze::malloc_device(((size_t) (g.n_layers * g.n_expert)) * sizeof(int32_t));
+            strata::ze::default_stream().memset(usage_dev, 0, (size_t) (g.n_layers * g.n_expert) * 4);
+            strata::ze::default_stream().sync();
         }
         if (mirror_table_d) strata::kernels::resident_plan_set_mirror(thits.d_res, mirror_table_d, usage_dev);
         vh.h_res = host_res.empty() ? nullptr : host_res.data();
@@ -12110,14 +11003,9 @@ int main(int argc, char **argv) try {
         if (o.adapt_every > 0 && o.adapt_swaps > 0) drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
         int64_t swaps_total = 0;
         double ms_adapt = 0;
-        dpct::queue_ptr adapt_stream = &dpct::get_in_order_queue();
-        /*
-        DPCT1025: The SYCL queue is created ignoring the flag and priority
-        options.
-        */
+        strata::ze::Stream* adapt_stream = &strata::ze::default_stream();
         if (!drive.d.usage.empty() &&
-            DPCT_CHECK_ERROR(
-                adapt_stream = dpct::get_current_device().create_queue(true)) !=
+            ((void) (adapt_stream = new strata::ze::Stream()), 0) !=
                 0) {
             std::fprintf(stderr, "strata generate: cannot create the refill stream\n");
             return 1;
@@ -12126,15 +11014,13 @@ int main(int argc, char **argv) try {
         std::vector<std::pair<int32_t, int32_t>> pending;
         int pending_age = 0;   // the windows the pending swaps have waited (adapt_lag)
         std::vector<void*> pin_live;   // the swaps' locked arena pages (pin_blob), unlocked once they have landed
-        dpct::event_ptr adapt_ev = nullptr;
-        adapt_ev = new sycl::event();
+        strata::ze::Event* adapt_ev = new strata::ze::Event();
         int64_t adapt_rounds = 0;   // counted here: `rounds` is declared below the adapt lambda
         auto apply_pending = [&](bool wait) {
-            try {
-        if (pending.empty()) return;
+            if (pending.empty()) return;
             // STRATA_TRACE_ADAPT=1: whether a round's copies had landed when the next window read the table
             static const bool trace_pending = std::getenv("STRATA_TRACE_ADAPT") != nullptr;
-            if (wait) adapt_ev->wait_and_throw();
+            if (wait) adapt_ev->sync();
             else if (adapt_ev->get_info<
                          sycl::info::event::command_execution_status>() !=
                      sycl::info::event_command_status::complete) {
@@ -12155,12 +11041,6 @@ int main(int argc, char **argv) try {
             pending_age = 0;
             if (d_res != nullptr)
                 res_put(d_res);
-        }
-        catch (sycl::exception const &exc) {
-          std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-                    << ", line:" << __LINE__ << std::endl;
-          std::exit(1);
-        }
         };
         // Plan v0.3 P6: the VRAM tier follows the conversation.  Candidates are missing experts routed at least
         // twice (decayed); each is paired with its layer's least-routed resident expert and swapped when it was
@@ -12252,7 +11132,7 @@ int main(int argc, char **argv) try {
                 std::fprintf(stderr, "strata generate: an adaptive refill failed\n");
                 return false;
             }
-            if (!swaps.empty()) dpct::sync_barrier(adapt_ev, adapt_stream);
+            if (!swaps.empty()) (adapt_stream)->record(*(adapt_ev));
             if (trace_adapt)
                 std::fprintf(stderr, "strata: ADAPT round=%lld swapped %zu of %d slots, usage decayed\n",
                              (long long) adapt_rounds, swaps.size(), o.adapt_swaps);
@@ -12389,7 +11269,7 @@ int main(int argc, char **argv) try {
             if (hashes != nullptr) {   // FNV-1a over the window's final residual rows (a test path: a plain copy)
                 const size_t n_floats = (size_t) T * (size_t) (g.hc * g.n_embd);
                 hash_rows.resize(n_floats);
-                dpct::get_in_order_queue()
+                strata::ze::default_stream()
                     .memcpy(hash_rows.data(), ver.final_R_all(),
                             n_floats * sizeof(float))
                     .wait();
@@ -12597,7 +11477,8 @@ int main(int argc, char **argv) try {
                         drive.d.ms_run / rounds);
         if (usage_dev != nullptr) {   // STRATA_USAGE_DUMP: the window's routing as make_profile.py reads it (layer, k=1, id, weight)
             std::vector<int32_t> uh((size_t) (g.n_layers * g.n_expert));
-            dpct::get_in_order_queue().memcpy(uh.data(), usage_dev, uh.size() * 4).wait();
+            strata::ze::default_stream().memcpy(uh.data(), usage_dev, uh.size() * 4);
+            strata::ze::default_stream().sync();
             if (FILE* uf = std::fopen(usage_dump, "wb")) {
                 int64_t total = 0;
                 for (int64_t l = 0; l < g.n_layers; ++l)
@@ -12653,13 +11534,13 @@ int main(int argc, char **argv) try {
     }
     if (layer_dump != nullptr) {
         std::fclose(layer_dump);
-        sycl::free(layer_stage, dpct::get_in_order_queue());
+        strata::ze::free(layer_stage);
         std::printf("%-24s %s (%lld layers + the input x %d streams x %lld per position)\n", "layers dumped",
                     o.dump_layers.c_str(), (long long) g.n_layers, (int) g.hc, (long long) g.n_embd);
     }
     if (half_dump != nullptr) {
         std::fclose(half_dump);
-        sycl::free(half_stage, dpct::get_in_order_queue());
+        strata::ze::free(half_stage);
         std::printf("%-24s %s (%lld layers x %llu per position)\n", "halves dumped", o.dump_halves.c_str(),
                     (long long) g.n_layers, (unsigned long long) half_stride);
     }
@@ -12686,10 +11567,10 @@ int main(int argc, char **argv) try {
                     prefill_ms > 0 ? 1000.0 * (double) (n_prompt - 1) / prefill_ms : 0.0, ttft_ms);
     if (!o.dump_mixed.empty()) {
         std::vector<float> mx((size_t) g.n_embd);
-        if (DPCT_CHECK_ERROR(dpct::get_in_order_queue()
+        if (((void) (strata::ze::default_stream()
                                  .memcpy(mx.data(), ss.block.mixed,
                                          mx.size() * sizeof(float))
-                                 .wait()) != 0) {
+                                 .wait()), 0) != 0) {
             std::fprintf(stderr, "strata generate: reading mixed back failed\n");
             return 1;
         }
@@ -12709,10 +11590,9 @@ int main(int argc, char **argv) try {
     // ---- the residual, for bisecting the head against the layers (see `dump_residual`'s note)
     if (!o.dump_residual.empty()) {
         std::vector<float> R((size_t) g.hc * g.n_embd);
-        if (DPCT_CHECK_ERROR(
-                dpct::get_in_order_queue()
+        if (((void) (strata::ze::default_stream()
                     .memcpy(R.data(), ss.R, R.size() * sizeof(float))
-                    .wait()) != 0) {
+                    .wait()), 0) != 0) {
             std::fprintf(stderr, "strata generate: reading R back failed\n");
             return 1;
         }
@@ -12830,16 +11710,11 @@ int main(int argc, char **argv) try {
 
     strata::core::session_graphs_free(gr);
     strata::core::doorbell_free(db);
-    sycl::free(d_next, dpct::get_in_order_queue());
-    sycl::free(d_logits, dpct::get_in_order_queue());
-    sycl::free(d_emb, dpct::get_in_order_queue());
-    sycl::free(d_parts, dpct::get_in_order_queue());
-    sycl::free(sbuf, dpct::get_in_order_queue());
-    sycl::free(arena, dpct::get_in_order_queue());
+    strata::ze::free(d_next);
+    strata::ze::free(d_logits);
+    strata::ze::free(d_emb);
+    strata::ze::free(d_parts);
+    strata::ze::free(sbuf);
+    strata::ze::free(arena);
     return 0;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
 }

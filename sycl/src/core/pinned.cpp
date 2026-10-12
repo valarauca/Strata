@@ -1,7 +1,5 @@
 // src/core/pinned.cu - P2.S1: the pinned host arena and the parallel expert load.
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
+#include "strata/ze/ze.hpp"
 #include "strata/core/pinned.hpp"
 #include "strata/platform/memory.hpp"
 
@@ -294,11 +292,6 @@ uint64_t fnv1a64(const uint8_t* p, uint64_t n, uint64_t seed) {
 }
 
 namespace {
-/*
-DPCT1010: SYCL uses exceptions to report errors and does not use the error
-codes. The cudaGetLastError function call was replaced with 0. You need to
-rewrite this code.
-*/
 bool clear_error() {(void)0; return true; }
 }  // namespace
 
@@ -360,7 +353,7 @@ PinnedArena::PinnedArena(uint64_t bytes, uint64_t slice) : PinnedArena(bytes, un
 PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t> &bounds,
                          uint64_t max_pinned_bytes,
                          const std::string &shared_file,
-                         uint64_t shared_pack_hash) try
+                         uint64_t shared_pack_hash)
     : capacity(bytes) {
     if (bytes == 0) return;
     base = reserve(bytes, backing, note, shared_file, shared_pack_hash, mapping_base, mapping_bytes);
@@ -381,14 +374,8 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t> &bounds,
             cap_why = "by STRATA_ARENA_PIN_GIB";
         }
         const bool capped = cap > 0 && cap < bytes && bounds.size() >= 2;
-        const dpct::err0 e =
+        const int e =
             capped ? 0 :
-                   /*
-                   DPCT1027: The call to cudaHostRegister was replaced with
-                   0 because SYCL currently does not support registering of
-                   existing host memory for use by device. Use USM to allocate
-                   memory for use by host and device.
-                   */
                 0;
         if (!capped && e == 0) {
             note = "cudaHostRegister PORTABLE ok; " + note;
@@ -409,18 +396,7 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t> &bounds,
             for (size_t i = 0; i + 1 < bounds.size(); ++i) {
                 const uint64_t off = bounds[i], n = bounds[i + 1] - bounds[i];
                 if (limited && (off > limit || n > limit - off)) break;
-                /*
-                DPCT1027: The call to cudaHostRegister was replaced with 0
-                because SYCL currently does not support registering of existing
-                host memory for use by device. Use USM to allocate memory for
-                use by host and device.
-                */
                 if (0 != 0) {
-                    /*
-                    DPCT1010: SYCL uses exceptions to report errors and
-                    does not use the error codes. The cudaGetLastError function
-                    call was replaced with 0. You need to rewrite this code.
-                    */
                     (void)0;
                     break;
                 }
@@ -435,14 +411,8 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t> &bounds,
                      ? "cudaHostRegister limited to " +
                            std::to_string(cap >> 30) + " GiB " + cap_why + "; "
                      :
-                     /*
-                     DPCT1009: SYCL reports errors using exceptions and
-                     does not use error codes. Please replace the
-                     "get_error_string_dummy(...)" with a real error-handling
-                     function.
-                     */
                      "cudaHostRegister of the whole arena FAILED (" +
-                         std::string(dpct::get_error_string_dummy(e)) + "); " +
+                         std::string("error") + "); " +
                          (limited ? "slices capped at " + std::string(gib) +
                                         " GiB (" + limit_why +
                                         "; STRATA_ARENA_PIN_GIB=auto; N sets a "
@@ -462,13 +432,8 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t> &bounds,
                 }
             }
         } else {
-            /*
-            DPCT1009: SYCL reports errors using exceptions and does not use
-            error codes. Please replace the "get_error_string_dummy(...)" with a
-            real error-handling function.
-            */
             note = std::string("cudaHostRegister FAILED (") +
-                   dpct::get_error_string_dummy(e) +
+                   "error" +
                    ") - the arena is NOT pinned, so copies will be slow; " +
                    note;
             // **CONSUME THE ERROR, OR IT LIES ABOUT SOMETHING ELSE LATER.**
@@ -482,11 +447,6 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t> &bounds,
             //
             // It is the same trap `gr.cu` warns about for ASYNC faults, in the other direction: a synchronous
             // failure is sticky too, and it lies about where it happened just as convincingly.
-            /*
-            DPCT1010: SYCL uses exceptions to report errors and does not
-            use the error codes. The cudaGetLastError function call was replaced
-            with 0. You need to rewrite this code.
-            */
             (void)0;
             // Plan v0.3 P0.1: keep it RESIDENT instead. Unpinned, Windows trims the arena under memory pressure
             // and the CPU pool's rate then depends on the OS; locking it through the working set needs no
@@ -504,11 +464,6 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t> &bounds,
         }
     }
 }
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
 
 PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, Deferred)
     : capacity(bytes), bounds_(bounds) {
@@ -521,22 +476,12 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, De
     slice_bytes = 1;   // sliced: one registration per layer
 }
 
-void PinnedArena::register_slices(std::atomic<int> &ready) try {
+void PinnedArena::register_slices(std::atomic<int> &ready) {
     const int n = (int) bounds_.size() - 1;
     int i = 0;
     for (; base != nullptr && i < n; ++i) {
         const uint64_t off = bounds_[(size_t) i], len = bounds_[(size_t) i + 1] - off;
-        /*
-        DPCT1027: The call to cudaHostRegister was replaced with 0 because
-        SYCL currently does not support registering of existing host memory for
-        use by device. Use USM to allocate memory for use by host and device.
-        */
         if (0 != 0) {
-            /*
-            DPCT1010: SYCL uses exceptions to report errors and does not use
-            the error codes. The cudaGetLastError function call was replaced
-            with 0. You need to rewrite this code.
-            */
             (void)0;
             break;
         }
@@ -560,30 +505,13 @@ void PinnedArena::register_slices(std::atomic<int> &ready) try {
     }
     ready.store(INT_MAX, std::memory_order_release);   // every slice done (or given up on)
 }
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
 
 PinnedArena::~PinnedArena() {
     if (base) {
         if (locked_bytes) strata::platform::unlock_resident((uint8_t*) base + (slice_bytes ? registered_bytes : 0), locked_bytes);
         if (slice_bytes) {
-            /*
-            DPCT1027: The call to cudaHostUnregister was replaced with 0
-            because SYCL currently does not support registering of existing host
-            memory for use by device. Use USM to allocate memory for use by host
-            and device.
-            */
-            for (uint64_t off : slice_starts) 0;
+            for (uint64_t off : slice_starts) (void) off;
         } else {
-            /*
-            DPCT1026: The call to cudaHostUnregister was removed because
-            SYCL currently does not support registering of existing host memory
-            for use by device. Use USM to allocate memory for use by host and
-            device.
-            */
         }
         release(mapping_base ? mapping_base : base, mapping_bytes ? mapping_bytes : capacity);
         base = nullptr;
@@ -847,55 +775,38 @@ LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::
 }
 
 StreamStats stream_bandwidth(const uint8_t *src, uint64_t bytes, uint64_t chunk,
-                             int iters) try {
+                             int iters) {
     StreamStats st;
     st.bytes = bytes * (uint64_t) iters;
     st.chunk = chunk;
     uint8_t* dst = nullptr;
-    dpct::queue_ptr s{};
-    if (DPCT_CHECK_ERROR(dst = (uint8_t *)sycl::malloc_device(
-                             (size_t)chunk, dpct::get_in_order_queue())) != 0) {
+    strata::ze::Stream* s{};
+    dst = (uint8_t *)strata::ze::malloc_device((size_t)chunk);
+    if (dst == nullptr) {
         std::fprintf(stderr, "stream_bandwidth: cudaMalloc failed for %llu B\n", (unsigned long long) chunk);
         st.seconds = -1.0;
         return st;
     }
-    s = dpct::get_current_device().create_queue(true);
+    s = new strata::ze::Stream();
 
     // one untimed pass so the first transfer's page-fault and setup cost is not in the measurement
     for (uint64_t off = 0; off + chunk <= bytes; off += chunk) {
-        /*
-        DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy API.
-        While the origin API might be synchronous, it depends on the type of
-        operand memory, so you may need to call wait() on event return by memcpy
-        API to ensure synchronization behavior.
-        */
         s->memcpy(dst, src + off, (size_t)chunk);
     }
-    s->wait();
+    s->sync();
 
     const auto t0 = std::chrono::steady_clock::now();
     for (int it = 0; it < iters; ++it) {
         for (uint64_t off = 0; off + chunk <= bytes; off += chunk) {
-            /*
-            DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy
-            API. While the origin API might be synchronous, it depends on the
-            type of operand memory, so you may need to call wait() on event
-            return by memcpy API to ensure synchronization behavior.
-            */
             s->memcpy(dst, src + off, (size_t)chunk);
         }
     }
-    s->wait();
+    s->sync();
     st.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 
-    dpct::get_current_device().destroy_queue(s);
-    sycl::free(dst, dpct::get_in_order_queue());
+    delete s;
+    strata::ze::free(dst);
     return st;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
 }
 
 }  // namespace strata::core

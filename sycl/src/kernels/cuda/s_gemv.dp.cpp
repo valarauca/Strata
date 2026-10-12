@@ -4,14 +4,8 @@
 // vector loads.  The kernel is templated on the code WIDTH (a compile-time property of the unpacking loop) and
 // takes the rest of the per-type attributes as run-time arguments, because the manifest supplies them per
 // tensor and a 13-way switch inside the inner loop would be the naive-but-wrong kind of naive.
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
-#include "strata/sycl_queue.hpp"
+#include "strata/port.hpp"
 #include "strata/kernels/s_gemv.hpp"
-
-#include <cstdio>
-#include <cstdlib>
 
 namespace strata::kernels {
 namespace {
@@ -61,11 +55,6 @@ constexpr int Q8K_BLOCK_ELEMS = 256;
 
 __dpct_inline__ float q8k_at(const uint8_t *__restrict__ x, long long i) {
     const uint8_t* blk = x + (i / Q8K_BLOCK_ELEMS) * Q8K_BLOCK_BYTES;
-    /*
-    DPCT1098: The '*' expression is used instead of the __ldg call. These
-    two expressions do not provide the exact same functionality. Check the
-    generated code for potential precision and/or performance issues.
-    */
     const float d = *(const float*) blk;
     const int8_t q = ((const int8_t*) (blk + 4))[i % Q8K_BLOCK_ELEMS];
     return d * (float) q;
@@ -159,12 +148,6 @@ auto &s_iq4nl =
 /// different loader would be a second thing to get wrong, and the only difference IS the loader - the weight
 /// decode, the quad loop, the shared codebook and the reduction are identical.
 template <int CODE_BITS, bool Q8K>
-/*
-DPCT1110: The total declared local variable size in device function
-s_gemv_q8_split_kernel exceeds 128 bytes and may cause high register pressure.
-Consult with your hardware vendor to find the total register size available and
-adjust the code, or use smaller sub-group size to avoid high register pressure.
-*/
 __dpct_inline__ void s_gemv_q8_split_kernel(
     const uint8_t *__restrict__ x, const uint8_t *__restrict__ codes,
     const float *__restrict__ scales, const float *__restrict__ offset,
@@ -277,11 +260,6 @@ __dpct_inline__ void s_gemv_q8_split_kernel(
         const int blk_elems = Q8K ? Q8K_BLOCK_ELEMS : Q8_0_BLOCK_ELEMS;
         const uint8_t* xb = x + (i / blk_elems) * (Q8K ? Q8K_BLOCK_BYTES : Q8_0_BLOCK_BYTES);
         const int xi = (int) (i % blk_elems);
-        /*
-        DPCT1098: The '*' expression is used instead of the __ldg call.
-        These two expressions do not provide the exact same functionality. Check
-        the generated code for potential precision and/or performance issues.
-        */
         const float xd =
             Q8K ? *(const float*) xb
                 : sycl::vec<sycl::half, 1>(
@@ -334,11 +312,6 @@ __dpct_inline__ void s_gemv_q8_split_kernel(
     }
     float acc = (((acc0 + acc1) + (acc2 + acc3)) + ((acc4 + acc5) + (acc6 + acc7))) +
                 (((acc8 + acc9) + (acc10 + acc11)) + ((acc12 + acc13) + (acc14 + acc15)));
-    /*
-DPCT1108: '__shfl_down_sync' was migrated with the experimental feature
-masked sub_group function which may not be supported by all compilers or
-runtimes. You may need to adjust the code.
-*/
 #pragma unroll
     for (int step = 16; step > 0; step >>= 1) acc +=
         dpct::experimental::shift_sub_group_left(
@@ -400,84 +373,6 @@ auto &s_iq4nl =
 
 }  // namespace
 
-void s_gemv(const uint16_t *x, const uint8_t *codes, const float *scales,
-            const float *offset, float *y, int64_t n_in, int64_t n_out,
-            const SForm &form) try {
-    if (n_in <= 0 || n_out <= 0) return;
-    if (form.group_elems <= 0 || n_in % form.group_elems != 0) {
-        std::fprintf(stderr, "s_gemv: n_in %lld is not a multiple of group_elems %d\n", (long long) n_in,
-                     form.group_elems);
-        std::exit(1);
-    }
-    if (form.has_offset && offset == nullptr) {
-        std::fprintf(stderr, "s_gemv: form says has_offset but offset is null\n");
-        std::exit(1);
-    }
-    const int threads = 128;
-    const long long blocks = (n_out + threads - 1) / threads;
-    const int cb = (int) form.codebook;
-    switch (form.code_bits) {
-    case 2: {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        dpct::get_in_order_queue()
-            .parallel_for<dpct_kernel_name<class s_gemv_kernel_4f63f9,
-                                           dpct_kernel_scalar<2>>>(
-                sycl::nd_range<3>(sycl::range(1, 1, (unsigned)blocks) *
-                                      sycl::range(1, 1, threads),
-                                  sycl::range(1, 1, threads)),
-                exp_props, [=](sycl::nd_item<3> item_ct1) {
-                    s_gemv_kernel<2>(x, codes, scales, offset, y, n_in, n_out,
-                                     form.code_bias, cb, form.group_elems,
-                                     form.has_offset ? 1 : 0);
-                });
-    } break;
-    case 4: {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        dpct::get_in_order_queue()
-            .parallel_for<dpct_kernel_name<class s_gemv_kernel_9c529a,
-                                           dpct_kernel_scalar<4>>>(
-                sycl::nd_range<3>(sycl::range(1, 1, (unsigned)blocks) *
-                                      sycl::range(1, 1, threads),
-                                  sycl::range(1, 1, threads)),
-                exp_props, [=](sycl::nd_item<3> item_ct1) {
-                    s_gemv_kernel<4>(x, codes, scales, offset, y, n_in, n_out,
-                                     form.code_bias, cb, form.group_elems,
-                                     form.has_offset ? 1 : 0);
-                });
-    } break;
-    case 8: {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        dpct::get_in_order_queue()
-            .parallel_for<dpct_kernel_name<class s_gemv_kernel_e40e1f,
-                                           dpct_kernel_scalar<8>>>(
-                sycl::nd_range<3>(sycl::range(1, 1, (unsigned)blocks) *
-                                      sycl::range(1, 1, threads),
-                                  sycl::range(1, 1, threads)),
-                exp_props, [=](sycl::nd_item<3> item_ct1) {
-                    s_gemv_kernel<8>(x, codes, scales, offset, y, n_in, n_out,
-                                     form.code_bias, cb, form.group_elems,
-                                     form.has_offset ? 1 : 0);
-                });
-    } break;
-        default:
-            std::fprintf(stderr, "s_gemv: unsupported code_bits %d\n", form.code_bits);
-            std::exit(1);
-    }
-    const dpct::err0 e =
-        DPCT_CHECK_ERROR(dpct::get_current_device().queues_wait_and_throw());
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
-
 namespace {
 
 // One BLOCK per output row, `threads_per_row` threads splitting it.  Parallelism becomes
@@ -493,12 +388,6 @@ namespace {
 // divisor is passed as its logarithm and the division becomes a shift.  The host wrapper refuses a
 // non-power-of-two group rather than silently computing a wrong index.
 template <int CODE_BITS>
-/*
-DPCT1110: The total declared local variable size in device function
-s_gemv_split_kernel exceeds 128 bytes and may cause high register pressure.
-Consult with your hardware vendor to find the total register size available and
-adjust the code, or use smaller sub-group size to avoid high register pressure.
-*/
 __dpct_inline__ void s_gemv_split_kernel(
     const uint16_t *__restrict__ x, const uint8_t *__restrict__ codes,
     const float *__restrict__ scales, const float *__restrict__ offset,
@@ -599,10 +488,6 @@ __dpct_inline__ void s_gemv_split_kernel(
 #pragma unroll
     for (int step = threads_per_row / 2; step > 0; step >>= 1) {
         if (tid < step) partial[tid] += partial[tid + step];
-        /*
-        DPCT1118: SYCL group functions and algorithms must be encountered in
-        converged control flow. You may need to adjust the code.
-        */
         item_ct1.barrier(sycl::access::fence_space::local_space);
     }
     if (tid == 0) y[o] = partial[0];
@@ -610,406 +495,6 @@ __dpct_inline__ void s_gemv_split_kernel(
 
 }  // namespace
 
-static void s_gemv_split_impl(const uint16_t *x, const uint8_t *codes,
-                              const float *scales, const float *offset,
-                              float *y, int64_t n_in, int64_t n_out,
-                              const SForm &form, int threads_per_row,
-                              dpct::queue_ptr stream, bool sync) try {
-    if (n_in <= 0 || n_out <= 0) return;
-    if (threads_per_row < 1 || (threads_per_row & (threads_per_row - 1)) != 0 || threads_per_row > 1024) {
-        std::fprintf(stderr, "s_gemv_split: threads_per_row must be a power of two in 1..1024, got %d\n",
-                     threads_per_row);
-        std::exit(1);
-    }
-    const int cb = (int) form.codebook;
-    // Every group size this format defines is a power of two, which is what lets the per-element group index
-    // be a shift.  Refuse anything else rather than compute a wrong index quietly.
-    if (form.group_elems <= 0 || (form.group_elems & (form.group_elems - 1)) != 0) {
-        std::fprintf(stderr, "s_gemv_split: group_elems must be a power of two, got %d\n", form.group_elems);
-        std::exit(1);
-    }
-    // AND THE QUAD MUST FIT INSIDE ONE GROUP: four consecutive elements share a scale and the kernel reads
-    // exactly one.  Every group size this format defines is 16, 32 or 64, so this cannot fire on a real pack.
-    if (form.group_elems % 4 != 0) {
-        std::fprintf(stderr, "s_gemv_split: group_elems %d is not a multiple of 4\n", form.group_elems);
-        std::exit(1);
-    }
-    int group_shift = 0;
-    while ((1 << group_shift) < form.group_elems) ++group_shift;
-    /*
-    DPCT1083: The size of local memory in the migrated code may be different
-    from the original code. Check that the allocated memory size in the migrated
-    code is correct.
-    */
-    const size_t smem = (size_t)threads_per_row * sizeof(float);
-    const unsigned grid = (unsigned) n_out;
-    switch (form.code_bits) {
-        case 2:
-            /*
-            DPCT1049: The work-group size passed to the SYCL kernel may
-            exceed the limit. To get the device limit, query
-            info::device::max_work_group_size. Adjust the work-group size if
-            needed.
-            */
-        {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
-            dpct::has_capability_or_fail(stream->get_device(),
-                                         {sycl::aspect::fp16});
-
-            stream->submit([&](sycl::handler &cgh) {
-                sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
-                    sycl::range(smem), cgh);
-
-                cgh.parallel_for<dpct_kernel_name<
-                    class s_gemv_split_kernel_8538ef, dpct_kernel_scalar<2>>>(
-                    sycl::nd_range<3>(sycl::range(1, 1, grid) *
-                                          sycl::range(1, 1, threads_per_row),
-                                      sycl::range(1, 1, threads_per_row)),
-                    exp_props, [=](sycl::nd_item<3> item_ct1) {
-                        s_gemv_split_kernel<2>(
-                            x, codes, scales, offset, y, n_in, n_out,
-                            form.code_bias, cb, form.group_elems, group_shift,
-                            form.has_offset ? 1 : 0, threads_per_row,
-                            dpct_local_acc_ct1
-                                .get_multi_ptr<sycl::access::decorated::no>()
-                                .get());
-                    });
-            });
-        }
-            break;
-        case 4:
-            /*
-            DPCT1049: The work-group size passed to the SYCL kernel may
-            exceed the limit. To get the device limit, query
-            info::device::max_work_group_size. Adjust the work-group size if
-            needed.
-            */
-        {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
-            dpct::has_capability_or_fail(stream->get_device(),
-                                         {sycl::aspect::fp16});
-
-            stream->submit([&](sycl::handler &cgh) {
-                sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
-                    sycl::range(smem), cgh);
-
-                cgh.parallel_for<dpct_kernel_name<
-                    class s_gemv_split_kernel_6cb7af, dpct_kernel_scalar<4>>>(
-                    sycl::nd_range<3>(sycl::range(1, 1, grid) *
-                                          sycl::range(1, 1, threads_per_row),
-                                      sycl::range(1, 1, threads_per_row)),
-                    exp_props, [=](sycl::nd_item<3> item_ct1) {
-                        s_gemv_split_kernel<4>(
-                            x, codes, scales, offset, y, n_in, n_out,
-                            form.code_bias, cb, form.group_elems, group_shift,
-                            form.has_offset ? 1 : 0, threads_per_row,
-                            dpct_local_acc_ct1
-                                .get_multi_ptr<sycl::access::decorated::no>()
-                                .get());
-                    });
-            });
-        }
-            break;
-        case 8:
-            /*
-            DPCT1049: The work-group size passed to the SYCL kernel may
-            exceed the limit. To get the device limit, query
-            info::device::max_work_group_size. Adjust the work-group size if
-            needed.
-            */
-        {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
-            dpct::has_capability_or_fail(stream->get_device(),
-                                         {sycl::aspect::fp16});
-
-            stream->submit([&](sycl::handler &cgh) {
-                sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
-                    sycl::range(smem), cgh);
-
-                cgh.parallel_for<dpct_kernel_name<
-                    class s_gemv_split_kernel_63886c, dpct_kernel_scalar<8>>>(
-                    sycl::nd_range<3>(sycl::range(1, 1, grid) *
-                                          sycl::range(1, 1, threads_per_row),
-                                      sycl::range(1, 1, threads_per_row)),
-                    exp_props, [=](sycl::nd_item<3> item_ct1) {
-                        s_gemv_split_kernel<8>(
-                            x, codes, scales, offset, y, n_in, n_out,
-                            form.code_bias, cb, form.group_elems, group_shift,
-                            form.has_offset ? 1 : 0, threads_per_row,
-                            dpct_local_acc_ct1
-                                .get_multi_ptr<sycl::access::decorated::no>()
-                                .get());
-                    });
-            });
-        }
-            break;
-        default:
-            std::fprintf(stderr, "s_gemv_split: unsupported code_bits %d\n", form.code_bits);
-            std::exit(1);
-    }
-    if (sync) {
-        const dpct::err0 e = DPCT_CHECK_ERROR(
-            dpct::get_current_device().queues_wait_and_throw());
-    }
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
-
-void s_gemv_split(const uint16_t* x, const uint8_t* codes, const float* scales, const float* offset,
-                  float* y, int64_t n_in, int64_t n_out, const SForm& form, int threads_per_row) {
-    s_gemv_split_impl(x, codes, scales, offset, y, n_in, n_out, form,
-                      threads_per_row,
-                      (dpct::queue_ptr)&dpct::get_in_order_queue(), true);
-}
-
-void s_gemv_split_async(const uint16_t* x, const uint8_t* codes, const float* scales, const float* offset,
-                        float* y, int64_t n_in, int64_t n_out, const SForm& form, int threads_per_row,
-                        void* stream) {
-    s_gemv_split_impl(x, codes, scales, offset, y, n_in, n_out, form,
-                      threads_per_row, strata::q_of(stream), false);
-}
-
-// ---- the Q8_K entry points -----------------------------------------------------------------------------
-
-namespace {
-
-bool q8k_form_ok(const SForm& form, int64_t n_in, const char* who) {
-    if (form.group_elems <= 0 || n_in % form.group_elems != 0) {
-        std::fprintf(stderr, "%s: n_in %lld is not a multiple of group_elems %d\n", who, (long long) n_in,
-                     form.group_elems);
-        return false;
-    }
-    if (n_in % Q8K_BLOCK_ELEMS != 0) {
-        // `quantize_q8_K` requires this too, and a partial block would read past the end of the activation.
-        std::fprintf(stderr, "%s: n_in %lld is not a multiple of the Q8_K block %d\n", who, (long long) n_in,
-                     Q8K_BLOCK_ELEMS);
-        return false;
-    }
-    return true;
-}
-
-void finish(const char *who, void *stream) try {
-    /*
-    DPCT1010: SYCL uses exceptions to report errors and does not use the
-    error codes. The cudaGetLastError function call was replaced with 0. You
-    need to rewrite this code.
-    */
-    const dpct::err0 e = 0;
-
-    if (stream != nullptr) return;
-    const dpct::err0 s =
-        DPCT_CHECK_ERROR(dpct::get_current_device().queues_wait_and_throw());
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
-
-}  // namespace
-
-void s_gemv_q8k(const uint8_t* x_q8k, const uint8_t* codes, const float* scales, const float* offset, float* y,
-                int64_t n_in, int64_t n_out, const SForm& form, void* stream) {
-    if (n_in <= 0 || n_out <= 0) return;
-    if (!q8k_form_ok(form, n_in, "s_gemv_q8k")) std::exit(1);
-    const int threads = 128;
-    const unsigned blocks = (unsigned) ((n_out + threads - 1) / threads);
-    const int cb = (int) form.codebook;
-    const int ho = form.has_offset ? 1 : 0;
-    switch (form.code_bits) {
-    case 4: {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class s_gemv_q8k_kernel_9b1637,
-                                            dpct_kernel_scalar<4>>>(
-                sycl::nd_range<3>(sycl::range(1, 1, blocks) *
-                                      sycl::range(1, 1, threads),
-                                  sycl::range(1, 1, threads)),
-                exp_props, [=](sycl::nd_item<3> item_ct1) {
-                    s_gemv_q8k_kernel<4>(x_q8k, codes, scales, offset, y, n_in,
-                                         n_out, form.code_bias, cb,
-                                         form.group_elems, ho);
-                });
-    } break;
-    case 8: {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class s_gemv_q8k_kernel_adeed5,
-                                            dpct_kernel_scalar<8>>>(
-                sycl::nd_range<3>(sycl::range(1, 1, blocks) *
-                                      sycl::range(1, 1, threads),
-                                  sycl::range(1, 1, threads)),
-                exp_props, [=](sycl::nd_item<3> item_ct1) {
-                    s_gemv_q8k_kernel<8>(x_q8k, codes, scales, offset, y, n_in,
-                                         n_out, form.code_bias, cb,
-                                         form.group_elems, ho);
-                });
-    } break;
-        default:
-            // 2-bit S2 never has a Q8_K activation: its `vec_dot_type` is Q8_0.  Refusing is better than
-            // running a kernel that would be numerically wrong in a way the caller cannot see.
-            std::fprintf(stderr, "s_gemv_q8k: code_bits %d has no Q8_K contract "
-                                 "(S2 uses Q8_0; see docs/activation-contract.md)\n", form.code_bits);
-            std::exit(1);
-    }
-    finish("s_gemv_q8k", stream);
-}
-
-void s_gemv_q8k_split(const uint8_t* x_q8k, const uint8_t* codes, const float* scales, const float* offset,
-                      float* y, int64_t n_in, int64_t n_out, const SForm& form, void* stream) {
-    if (n_in <= 0 || n_out <= 0) return;
-    if (!q8k_form_ok(form, n_in, "s_gemv_q8k_split")) std::exit(1);
-    // THE GROUP SIZE IS PASSED AS ITS LOGARITHM: see the note on the kernel.  A non-power-of-two group would
-    // make the shift a WRONG INDEX rather than a slow one, so it is refused here.
-    int group_shift = 0;
-    while ((1 << group_shift) < form.group_elems) ++group_shift;
-    if ((1 << group_shift) != form.group_elems) {
-        std::fprintf(stderr, "s_gemv_q8k_split: group_elems %d is not a power of two\n", form.group_elems);
-        std::exit(1);
-    }
-    // AND THE QUAD MUST FIT INSIDE ONE GROUP.  Four consecutive elements share a scale, so a group smaller
-    // than four would need two of them and the kernel reads exactly one.  Every group size this format
-    // defines is 16, 32 or 64, so this cannot fire on a real pack - it is here because a future one could.
-    if (form.group_elems % 16 != 0) {
-        std::fprintf(stderr, "s_gemv_q8k_split: group_elems %d is not a multiple of 16\n", form.group_elems);
-        std::exit(1);
-    }
-    const int threads = 256;
-    const int warps = threads / 32;
-    const unsigned blocks = (unsigned) ((n_out + warps - 1) / warps);
-    const int cb = (int) form.codebook;
-    const int ho = form.has_offset ? 1 : 0;
-    switch (form.code_bits) {
-    case 4: {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class s_gemv_q8_split_kernel_19ad26,
-                                            dpct_kernel_scalar<4>,
-                                            dpct_kernel_scalar<true>>>(
-                sycl::nd_range<3>(sycl::range(1, 1, blocks) *
-                                      sycl::range(1, 1, threads),
-                                  sycl::range(1, 1, threads)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        s_gemv_q8_split_kernel<4, true>(
-                            x_q8k, codes, scales, offset, y, n_in, n_out,
-                            form.code_bias, cb, group_shift, ho);
-                    });
-    } break;
-    case 8: {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class s_gemv_q8_split_kernel_4da4f5,
-                                            dpct_kernel_scalar<8>,
-                                            dpct_kernel_scalar<true>>>(
-                sycl::nd_range<3>(sycl::range(1, 1, blocks) *
-                                      sycl::range(1, 1, threads),
-                                  sycl::range(1, 1, threads)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        s_gemv_q8_split_kernel<8, true>(
-                            x_q8k, codes, scales, offset, y, n_in, n_out,
-                            form.code_bias, cb, group_shift, ho);
-                    });
-    } break;
-        default:
-            std::fprintf(stderr, "s_gemv_q8k_split: code_bits %d has no Q8_K contract\n", form.code_bits);
-            std::exit(1);
-    }
-    finish("s_gemv_q8k_split", stream);
-}
-
-void s_gemv_q8_0_split(const uint8_t* x_q8_0, const uint8_t* codes, const float* scales, const float* offset,
-                       float* y, int64_t n_in, int64_t n_out, const SForm& form, void* stream) {
-    if (n_in <= 0 || n_out <= 0) return;
-    // THE ACTIVATION IS `block_q8_0`, 32 elements per block, so `n_in` must be a multiple of 32 - which is a
-    // WEAKER requirement than Q8_K's 256 and is exactly why this kernel has to exist: `ffn_down_shexp` has
-    // n_in = 640, a multiple of 32 that is NOT a multiple of 256.
-    if (n_in % Q8_0_BLOCK_ELEMS != 0) {
-        std::fprintf(stderr, "s_gemv_q8_0_split: n_in %lld is not a multiple of %d\n", (long long) n_in,
-                     Q8_0_BLOCK_ELEMS);
-        std::exit(1);
-    }
-    // the same two checks `s_gemv_q8k_split` makes, for the same reasons - see the notes there
-    if (form.group_elems <= 0 || (form.group_elems & (form.group_elems - 1)) != 0) {
-        std::fprintf(stderr, "s_gemv_q8_0_split: group_elems must be a power of two, got %d\n",
-                     form.group_elems);
-        std::exit(1);
-    }
-    // SIXTEEN, NOT FOUR: a lane-iteration takes QE = 16 consecutive elements under ONE scale (see the kernel),
-    // so a group of 4 or 8 would read the wrong scale for most of them.  The Q8_K launcher already said 16.
-    if (form.group_elems % 16 != 0) {
-        std::fprintf(stderr, "s_gemv_q8_0_split: group_elems %d is not a multiple of 16\n", form.group_elems);
-        std::exit(1);
-    }
-    int group_shift = 0;
-    while ((1 << group_shift) < form.group_elems) ++group_shift;
-
-    const int threads = 256;
-    const int warps = threads / 32;
-    const unsigned blocks = (unsigned) ((n_out + warps - 1) / warps);
-    const int cb = (int) form.codebook;
-    const int ho = form.has_offset ? 1 : 0;
-    switch (form.code_bits) {
-    case 4: {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class s_gemv_q8_split_kernel_147ee4,
-                                            dpct_kernel_scalar<4>,
-                                            dpct_kernel_scalar<false>>>(
-                sycl::nd_range<3>(sycl::range(1, 1, blocks) *
-                                      sycl::range(1, 1, threads),
-                                  sycl::range(1, 1, threads)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        s_gemv_q8_split_kernel<4, false>(
-                            x_q8_0, codes, scales, offset, y, n_in, n_out,
-                            form.code_bias, cb, group_shift, ho);
-                    });
-    } break;
-    case 8: {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class s_gemv_q8_split_kernel_bac5c0,
-                                            dpct_kernel_scalar<8>,
-                                            dpct_kernel_scalar<false>>>(
-                sycl::nd_range<3>(sycl::range(1, 1, blocks) *
-                                      sycl::range(1, 1, threads),
-                                  sycl::range(1, 1, threads)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        s_gemv_q8_split_kernel<8, false>(
-                            x_q8_0, codes, scales, offset, y, n_in, n_out,
-                            form.code_bias, cb, group_shift, ho);
-                    });
-    } break;
-        default:
-            std::fprintf(stderr, "s_gemv_q8_0_split: code_bits %d has no Q8_0 contract\n", form.code_bits);
-            std::exit(1);
-    }
-    finish("s_gemv_q8_0_split", stream);
-}
+#include "s_gemv.kern.inc"
 
 }  // namespace strata::kernels

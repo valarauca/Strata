@@ -27,7 +27,7 @@ bool env_on(const char* name, bool def) {
 
 struct Counters {
     std::atomic<uint64_t> launches{0}, copies{0}, graph_launches{0}, host_waits{0}, events{0}, captures{0};
-    std::atomic<uint64_t> dropped_waits{0}, frees{0};
+    std::atomic<uint64_t> dropped_waits{0}, frees{0}, pageable{0};
 };
 Counters g_count;
 
@@ -631,6 +631,11 @@ Stream::Stream(int ordinal, Engine engine, bool high_priority) : dev_(ordinal < 
 }
 
 Stream::~Stream() {
+    if (runtime_owned_) {
+        std::fprintf(stderr, "strata ze: a runtime-owned stream (default or copy stream of GPU %d) was deleted\n", dev_);
+        std::fflush(stderr);
+        std::abort();
+    }
     {
         DeviceState& st = dev_state(dev_);
         std::lock_guard<std::mutex> lk(st.streams_mu);
@@ -640,6 +645,7 @@ Stream::~Stream() {
         zeCommandListHostSynchronize(imm_, UINT64_MAX);
         zeCommandListDestroy(imm_);
     }
+    if (bounce_) free(bounce_);
 }
 
 void Stream::after_append() {
@@ -675,9 +681,38 @@ void Stream::launch(const KernelBase& k, Dim3 grid, Dim3 block, void** args) {
 void Stream::memcpy(void* dst, const void* src, size_t bytes) {
     if (bytes == 0) return;
     std::lock_guard<std::recursive_mutex> lk(mu_);
-    STRATA_ZE_CHECK(zeCommandListAppendMemoryCopy(target(), dst, src, bytes, nullptr, 0, nullptr));
-    g_count.copies.fetch_add(1, std::memory_order_relaxed);
-    after_append();
+    const bool src_ok = kind_of(src) != MemKind::Unknown, dst_ok = kind_of(dst) != MemKind::Unknown;
+    if (src_ok && dst_ok) {
+        STRATA_ZE_CHECK(zeCommandListAppendMemoryCopy(target(), dst, src, bytes, nullptr, 0, nullptr));
+        g_count.copies.fetch_add(1, std::memory_order_relaxed);
+        after_append();
+        return;
+    }
+    if (cap_) {
+        std::fprintf(stderr, "strata ze: a copy from or to pageable host memory inside a capture (%p -> %p)\n", src, dst);
+        std::exit(1);
+    }
+    g_count.pageable.fetch_add(1, std::memory_order_relaxed);
+    sync();
+    if (!src_ok && !dst_ok) {
+        std::memcpy(dst, src, bytes);
+        return;
+    }
+    constexpr size_t kChunk = (size_t) 8 << 20;
+    if (bounce_ == nullptr) bounce_ = malloc_host(kChunk);
+    for (size_t off = 0; off < bytes; off += kChunk) {
+        const size_t n = bytes - off < kChunk ? bytes - off : kChunk;
+        if (!src_ok) {
+            std::memcpy(bounce_, (const uint8_t*) src + off, n);
+            STRATA_ZE_CHECK(zeCommandListAppendMemoryCopy(imm_, (uint8_t*) dst + off, bounce_, n, nullptr, 0, nullptr));
+            sync();
+        } else {
+            STRATA_ZE_CHECK(zeCommandListAppendMemoryCopy(imm_, bounce_, (const uint8_t*) src + off, n, nullptr, 0, nullptr));
+            sync();
+            std::memcpy((uint8_t*) dst + off, bounce_, n);
+        }
+        g_count.copies.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 void Stream::memcpy_2d(void* dst, size_t dpitch, const void* src, size_t spitch, size_t width, size_t height) {
@@ -687,6 +722,10 @@ void Stream::memcpy_2d(void* dst, size_t dpitch, const void* src, size_t spitch,
         return;
     }
     std::lock_guard<std::recursive_mutex> lk(mu_);
+    if (kind_of(dst) == MemKind::Unknown || kind_of(src) == MemKind::Unknown) {
+        for (size_t r = 0; r < height; ++r) memcpy((uint8_t*) dst + r * dpitch, (const uint8_t*) src + r * spitch, width);
+        return;
+    }
     const ze_copy_region_t dr{0, 0, 0, (uint32_t) width, (uint32_t) height, 1};
     const ze_copy_region_t sr{0, 0, 0, (uint32_t) width, (uint32_t) height, 1};
     STRATA_ZE_CHECK(zeCommandListAppendMemoryCopyRegion(target(), dst, &dr, (uint32_t) dpitch, 0, src, &sr, (uint32_t) spitch, 0,
@@ -704,6 +743,16 @@ void Stream::memset(void* dst, int value, size_t bytes) {
 void Stream::fill(void* dst, const void* pattern, size_t pattern_bytes, size_t bytes) {
     if (bytes == 0) return;
     std::lock_guard<std::recursive_mutex> lk(mu_);
+    if (kind_of(dst) == MemKind::Unknown) {
+        if (cap_) {
+            std::fprintf(stderr, "strata ze: a fill of pageable host memory inside a capture (%p)\n", dst);
+            std::exit(1);
+        }
+        sync();
+        for (size_t off = 0; off < bytes; off += pattern_bytes)
+            std::memcpy((uint8_t*) dst + off, pattern, bytes - off < pattern_bytes ? bytes - off : pattern_bytes);
+        return;
+    }
     STRATA_ZE_CHECK(zeCommandListAppendMemoryFill(target(), dst, pattern, pattern_bytes, bytes, nullptr, 0, nullptr));
     g_count.copies.fetch_add(1, std::memory_order_relaxed);
     after_append();
@@ -844,7 +893,10 @@ Graph::~Graph() {
 Stream& default_stream(int ordinal) {
     if (ordinal < 0) ordinal = t_dev;
     DeviceState& st = dev_state(ordinal);
-    std::call_once(st.def_once, [&] { st.def = std::make_unique<Stream>(ordinal, Stream::Engine::Compute); });
+    std::call_once(st.def_once, [&] {
+        st.def = std::make_unique<Stream>(ordinal, Stream::Engine::Compute);
+        st.def->runtime_owned_ = true;
+    });
     return *st.def;
 }
 
@@ -853,7 +905,10 @@ Stream& copy_stream(int ordinal) {
     DeviceState& st = dev_state(ordinal);
     static const bool off = !env_on("STRATA_COPY_ENGINE", true);
     if (off || st.info.copy_ordinal < 0) return default_stream(ordinal);
-    std::call_once(st.copy_once, [&] { st.copy = std::make_unique<Stream>(ordinal, Stream::Engine::Copy); });
+    std::call_once(st.copy_once, [&] {
+        st.copy = std::make_unique<Stream>(ordinal, Stream::Engine::Copy);
+        st.copy->runtime_owned_ = true;
+    });
     return *st.copy;
 }
 
@@ -919,12 +974,13 @@ void report(const char* when) {
     std::fprintf(stderr,
                  "strata ze report (%s): device allocations %zu (%.2f GiB), host allocations %zu (%.2f GiB), kernel launches "
                  "%llu, copies %llu, graph replays %llu, captures %llu, events %llu, host waits %llu, waits dropped in "
-                 "capture %llu, frees %llu\n",
+                 "capture %llu, frees %llu, pageable copies %llu\n",
                  when, t.device_n, (double) t.device_bytes / 1073741824.0, t.host_n, (double) t.host_bytes / 1073741824.0,
                  (unsigned long long) g_count.launches.load(), (unsigned long long) g_count.copies.load(),
                  (unsigned long long) g_count.graph_launches.load(), (unsigned long long) g_count.captures.load(),
                  (unsigned long long) g_count.events.load(), (unsigned long long) g_count.host_waits.load(),
-                 (unsigned long long) g_count.dropped_waits.load(), (unsigned long long) g_count.frees.load());
+                 (unsigned long long) g_count.dropped_waits.load(), (unsigned long long) g_count.frees.load(),
+                 (unsigned long long) g_count.pageable.load());
 }
 
 }  // namespace strata::ze

@@ -2,15 +2,8 @@
 //
 // Arithmetic transcribed from ggml/src/ggml-quants.c at the pinned llama.cpp (MIT License, Copyright (c) 2023-2026
 // The ggml authors): dequantize_row_q2_0/q4_0/q5_0/q8_0/q3_K/q4_K/q5_K/q6_K/iq4_nl/iq4_xs.
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
-#include "strata/sycl_queue.hpp"
+#include "strata/port.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
-#include "strata/kernels/iq_kernels.hpp"
-
-#include <cstdio>
-#include <cstdlib>
 
 namespace strata::kernels {
 namespace {
@@ -47,12 +40,6 @@ __dpct_inline__ void scale_min_k4(int j, const uint8_t *q, int &d, int &m) {
 
 // One 32-element group `g` (row-major over the whole slice); `out` points at that group's 32 outputs.
 template <int TYPE, typename T>
-/*
-DPCT1110: The total declared local variable size in device function group32
-exceeds 128 bytes and may cause high register pressure. Consult with your
-hardware vendor to find the total register size available and adjust the code,
-or use smaller sub-group size to avoid high register pressure.
-*/
 __dpct_inline__ void group32(const uint8_t *row_blocks, int gi_in_row, T *out) {
     if constexpr (TYPE == 42) {                                   // Q2_0: 64 per block of 18 B
         const uint8_t* b = row_blocks + (size_t) (gi_in_row / 2) * 18;
@@ -199,132 +186,8 @@ __dpct_inline__ void dequant_kernel(const uint8_t *__restrict__ blocks,
     group32<TYPE>(blocks + (row0 + r) * row_bytes, (int) gi, out + r * ld + gi * 32);
 }
 
-bool geometry(int type, int& block_elems, int& block_bytes) {
-    switch (type) {
-    case 2: block_elems = 32; block_bytes = 18; return true;
-    case 6: block_elems = 32; block_bytes = 22; return true;
-    case 7: block_elems = 32; block_bytes = 24; return true;
-    case 8: block_elems = 32; block_bytes = 34; return true;
-    case 20: block_elems = 32; block_bytes = 18; return true;
-    case 11: block_elems = 256; block_bytes = 110; return true;
-    case 12: block_elems = 256; block_bytes = 144; return true;
-    case 13: block_elems = 256; block_bytes = 176; return true;
-    case 14: block_elems = 256; block_bytes = 210; return true;
-    case 23: block_elems = 256; block_bytes = 136; return true;
-    case 42: block_elems = 64; block_bytes = 18; return true;
-    default: return false;
-    }
-}
-
-template <typename T>
-void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t cols, T* out, void* stream,
-            int64_t ld = 0) {
-    int be = 0, bb = 0;
-    if (!geometry(type, be, bb) || cols % be != 0 || rows <= 0) {
-        std::fprintf(stderr, "dequant: unsupported type %d or shape %lld x %lld\n", type, (long long) rows,
-                     (long long) cols);
-        std::exit(1);
-    }
-    const int64_t row_bytes = cols / be * bb, gpr = cols / 32, total = rows * gpr;
-    if (ld <= 0) ld = cols;
-    const unsigned grid = (unsigned) ((total + 255) / 256);
-    const uint8_t* p = (const uint8_t*) blocks;
-    dpct::queue_ptr st = strata::q_of(stream);
-#define STRATA_DQ(TY)                                                          \
-    {                                                                          \
-        auto exp_props = sycl::ext::oneapi::experimental::properties{          \
-            sycl::ext::oneapi::experimental::use_root_sync};                   \
-                                                                               \
-        st->submit([&](sycl::handler &cgh) {                                   \
-            auto p_ct0 = p;                                                    \
-            auto row_bytes_ct1 = row_bytes;                                    \
-            auto row0_ct2 = row0;                                              \
-            auto rows_ct3 = rows;                                              \
-            auto gpr_ct4 = gpr;                                                \
-            auto ld_ct5 = ld;                                                  \
-            auto out_ct6 = out;                                                \
-                                                                               \
-            cgh.parallel_for<dpct_kernel_name<class dequant_kernel_ec9311,     \
-                                              dpct_kernel_scalar<TY>, T>>(     \
-                sycl::nd_range<3>(sycl::range(1, 1, grid) *                    \
-                                      sycl::range(1, 1, 256),                  \
-                                  sycl::range(1, 1, 256)),                     \
-                exp_props, [=](sycl::nd_item<3> item_ct1) {                    \
-                    dequant_kernel<TY, T>(p_ct0, row_bytes_ct1, row0_ct2,      \
-                                          rows_ct3, gpr_ct4, ld_ct5, out_ct6); \
-                });                                                            \
-        });                                                                    \
-    } break
-    switch (type) {
-    case 2: STRATA_DQ(2);
-    case 6: STRATA_DQ(6);
-    case 7: STRATA_DQ(7);
-    case 8: STRATA_DQ(8);
-    case 11: STRATA_DQ(11);
-    case 12: STRATA_DQ(12);
-    case 13: STRATA_DQ(13);
-    case 14: STRATA_DQ(14);
-    case 20: STRATA_DQ(20);
-    case 23: STRATA_DQ(23);
-    case 42: STRATA_DQ(42);
-    }
-#undef STRATA_DQ
-    /*
-    DPCT1010: SYCL uses exceptions to report errors and does not use the
-    error codes. The cudaGetLastError function call was replaced with 0. You
-    need to rewrite this code.
-    */
-    const dpct::err0 e = 0;
-    /*
-    DPCT1009: SYCL reports errors using exceptions and does not use error
-    codes. Please replace the "get_error_string_dummy(...)" with a real
-    error-handling function.
-    */
-}
-
 }  // namespace
 
-bool dequant_bf16_supported(int ggml_type) noexcept {
-    int a, b;
-    return geometry(ggml_type, a, b);
-}
-
-namespace {
-// plan v0.3 P6: the i-quant formats (llama.cpp's dequantizers, iq_kernels.cu)
-bool iq_only(int t) { return t == 16 || t == 17 || t == 18 || t == 21 || t == 22 || t == 29; }
-}  // namespace
-
-void dequant_bf16(int ggml_type, const void* blocks, int64_t row0, int64_t rows, int64_t cols, uint16_t* out,
-                  void* stream) {
-    launch<uint16_t>(ggml_type, blocks, row0, rows, cols, out, stream);
-}
-
-void dequant_f16(int ggml_type, const void* blocks, int64_t row0, int64_t rows, int64_t cols, uint16_t* out,
-                 void* stream) {
-    if (iq_only(ggml_type)) {
-        iq_dequant_f16(ggml_type, (const uint8_t*) blocks + (size_t) row0 * iq_row_bytes(ggml_type, cols), rows * cols,
-                       out, stream);
-        return;
-    }
-    launch<H16>(ggml_type, blocks, row0, rows, cols, reinterpret_cast<H16*>(out), stream);
-}
-
-bool dequant_f16_ld(int ggml_type, const void* blocks, int64_t row0, int64_t rows, int64_t cols, int64_t ld,
-                    uint16_t* out, void* stream) {
-    int be = 0, bb = 0;
-    if (iq_only(ggml_type) || !geometry(ggml_type, be, bb) || cols % be != 0 || rows <= 0 || ld < cols || ld % 8 != 0)
-        return false;
-    launch<H16>(ggml_type, blocks, row0, rows, cols, reinterpret_cast<H16*>(out), stream, ld);
-    return true;
-}
-
-void dequant_f32(int ggml_type, const void* blocks, int64_t row0, int64_t rows, int64_t cols, float* out, void* stream) {
-    if (iq_only(ggml_type)) {
-        iq_dequant_f32(ggml_type, (const uint8_t*) blocks + (size_t) row0 * iq_row_bytes(ggml_type, cols), rows * cols,
-                       out, stream);
-        return;
-    }
-    launch<float>(ggml_type, blocks, row0, rows, cols, out, stream);
-}
+#include "dequant_bf16.kern.inc"
 
 }  // namespace strata::kernels

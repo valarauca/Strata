@@ -51,17 +51,8 @@
 //     produced - computed in ONE parallel pass over the experts instead of k serial ones.  It is O(n^2)
 //     comparisons and that is the right trade here: n = 512, every comparison is independent, and the old
 //     version was O(k*n) with a serial `exp` inside.
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
-#include "strata/sycl_queue.hpp"
-#include "strata/sycl_doorbell.hpp"
+#include "strata/port.hpp"
 #include "strata/kernels/router_top10.hpp"
-
-#include <cmath>
-#include <algorithm>
-#include <cstdio>
-#include <cstdlib>
 
 namespace strata::kernels {
 namespace {
@@ -72,120 +63,108 @@ constexpr int RT_MAX_THREADS = 512;
 // A tree sum brackets the serial reciprocal; ambiguous rounding falls back to
 // the original ascending sum. Selection and renormalisation stay in subgroup 0.
 template <bool FORCE_SERIAL>
-void launch_sycl_fast(sycl::queue& q, const float* logits, int n_tokens, int n_expert, int k,
-                      int* ids, float* weights) {
-    const int threads = (std::min(n_expert, RT_MAX_THREADS) + 31) & ~31;
-    q.submit([&](sycl::handler& h) {
-        sycl::local_accessor<double, 1> s_ex(sycl::range<1>(n_expert), h);
-        sycl::local_accessor<float, 1> s_red(sycl::range<1>(RT_MAX_THREADS / 32), h);
-        sycl::local_accessor<double, 1> s_dred(sycl::range<1>(RT_MAX_THREADS / 32), h);
-        sycl::local_accessor<float, 1> s_inv(sycl::range<1>(1), h);
-        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t)n_tokens * threads),
-                                        sycl::range<1>(threads)),
-            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
-                const auto sg = it.get_sub_group();
-                const int t = it.get_group(0), tid = it.get_local_id(0);
-                const int lane = tid & 31, warp = tid >> 5;
-                const int nt = it.get_local_range(0), nw = (nt + 31) >> 5;
-                const float* l = logits + (size_t)t * n_expert;
-                auto bar = [&] { sycl::group_barrier(it.get_group()); };
-                float mx = -INFINITY;
-                for (int e = tid; e < n_expert; e += nt) mx = sycl::fmax(mx, l[e]);
-                for (int off = 16; off > 0; off >>= 1)
-                    mx = sycl::fmax(mx, sycl::shift_group_left(sg, mx, off));
-                if (lane == 0) s_red[warp] = mx;
-                bar();
-                if (tid < 32) {
-                    float v = tid < nw ? s_red[tid] : -INFINITY;
-                    for (int off = 16; off > 0; off >>= 1)
-                        v = sycl::fmax(v, sycl::shift_group_left(sg, v, off));
-                    if (tid == 0) s_red[0] = v;
-                }
-                bar();
-                mx = s_red[0];
-                double part = 0.0;
-                for (int e = tid; e < n_expert; e += nt) {
-                    const double x = sycl::exp((double)l[e] - (double)mx);
-                    s_ex[e] = x;
-                    part += x;
-                }
-                for (int off = 16; off > 0; off >>= 1)
-                    part += sycl::permute_group_by_xor(sg, part, off);
-                if (lane == 0) s_dred[warp] = part;
-                bar();
-                double tot = 0.0;
-                for (int w = 0; w < nw; ++w) tot += s_dred[w];
-                const double lo = tot * (1.0 - 0x1p-40), hi = tot * (1.0 + 0x1p-40);
-                const float f_lo = (float)(1.0 / hi), f_hi = (float)(1.0 / lo);
-                float inv;
-                if (!FORCE_SERIAL && tot >= 1.0 && hi < 1e300 && f_lo == f_hi) {
-                    inv = f_lo;
-                } else {
-                    if (tid == 0) {
-                        double sum = 0.0;
-                        for (int e = 0; e < n_expert; ++e) sum += s_ex[e];
-                        s_inv[0] = (float)(1.0 / sum);
-                    }
-                    bar();
-                    inv = s_inv[0];
-                }
-                if (warp != 0) return;
-                constexpr int PER = 16;
-                float pv[PER];
-                unsigned live = 0;
-                for (int j = 0; j < PER; ++j) {
-                    const int e = lane + 32 * j;
-                    pv[j] = -INFINITY;
-                    if (e < n_expert) { pv[j] = (float)(s_ex[e] * inv); live |= 1u << j; }
-                }
-                float my_w = 0.0f;
-                int my_id = 0, nsel = 0;
-                for (int i = 0; i < k; ++i) {
-                    float bv = -INFINITY;
-                    int bi = n_expert;
-                    for (int j = 0; j < PER; ++j)
-                        if (((live >> j) & 1u) && pv[j] > bv) { bv = pv[j]; bi = lane + 32 * j; }
-                    for (int off = 16; off > 0; off >>= 1) {
-                        const float ov = sycl::permute_group_by_xor(sg, bv, off);
-                        const int oi = sycl::permute_group_by_xor(sg, bi, off);
-                        if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
-                    }
-                    if (bi >= n_expert) break;
-                    if ((bi & 31) == lane) live &= ~(1u << (bi >> 5));
-                    if (lane == i) { my_w = bv; my_id = bi; }
-                    nsel = i + 1;
-                }
-                if (nsel == k) {
-                    double s = 0.0;
-                    for (int i = 0; i < k; ++i) s += (double)sycl::select_from_group(sg, my_w, i);
-                    const double sc = sycl::fmax(s, 6.103515625e-05);
-                    if (lane < k) {
-                        ids[(size_t)t * k + lane] = my_id;
-                        weights[(size_t)t * k + lane] = (float)((double)my_w / sc);
-                    }
-                } else {
-                    if (lane < nsel) { ids[(size_t)t * k + lane] = my_id; weights[(size_t)t * k + lane] = my_w; }
-                    sycl::group_barrier(sg);
-                    if (lane == 0) {
-                        double s = 0.0;
-                        for (int i = 0; i < k; ++i) s += (double)weights[(size_t)t * k + i];
-                        const double sc = sycl::fmax(s, 6.103515625e-05);
-                        for (int i = 0; i < k; ++i)
-                            weights[(size_t)t * k + i] = (float)((double)weights[(size_t)t * k + i] / sc);
-                    }
-                }
-            });
-    });
+__dpct_inline__ void router_top10_sycl_fast_kernel(const float* logits, int n_expert, int k, int* ids, float* weights,
+                                                   unsigned char* slm) {
+    double* s_ex = (double*) slm;
+    double* s_dred = s_ex + n_expert;
+    float* s_red = (float*) (s_dred + RT_MAX_THREADS / 32);
+    float* s_inv = s_red + RT_MAX_THREADS / 32;
+    auto it = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const auto sg = it.get_sub_group();
+    const int t = it.get_group(2), tid = it.get_local_id(2);
+    const int lane = tid & 31, warp = tid >> 5;
+    const int nt = it.get_local_range(2), nw = (nt + 31) >> 5;
+    const float* l = logits + (size_t)t * n_expert;
+    auto bar = [&] { sycl::group_barrier(it.get_group()); };
+    float mx = -INFINITY;
+    for (int e = tid; e < n_expert; e += nt) mx = sycl::fmax(mx, l[e]);
+    for (int off = 16; off > 0; off >>= 1)
+        mx = sycl::fmax(mx, sycl::shift_group_left(sg, mx, off));
+    if (lane == 0) s_red[warp] = mx;
+    bar();
+    if (tid < 32) {
+        float v = tid < nw ? s_red[tid] : -INFINITY;
+        for (int off = 16; off > 0; off >>= 1)
+            v = sycl::fmax(v, sycl::shift_group_left(sg, v, off));
+        if (tid == 0) s_red[0] = v;
+    }
+    bar();
+    mx = s_red[0];
+    double part = 0.0;
+    for (int e = tid; e < n_expert; e += nt) {
+        const double x = sycl::exp((double)l[e] - (double)mx);
+        s_ex[e] = x;
+        part += x;
+    }
+    for (int off = 16; off > 0; off >>= 1)
+        part += sycl::permute_group_by_xor(sg, part, off);
+    if (lane == 0) s_dred[warp] = part;
+    bar();
+    double tot = 0.0;
+    for (int w = 0; w < nw; ++w) tot += s_dred[w];
+    const double lo = tot * (1.0 - 0x1p-40), hi = tot * (1.0 + 0x1p-40);
+    const float f_lo = (float)(1.0 / hi), f_hi = (float)(1.0 / lo);
+    float inv;
+    if (!FORCE_SERIAL && tot >= 1.0 && hi < 1e300 && f_lo == f_hi) {
+        inv = f_lo;
+    } else {
+        if (tid == 0) {
+            double sum = 0.0;
+            for (int e = 0; e < n_expert; ++e) sum += s_ex[e];
+            s_inv[0] = (float)(1.0 / sum);
+        }
+        bar();
+        inv = s_inv[0];
+    }
+    if (warp != 0) return;
+    constexpr int PER = 16;
+    float pv[PER];
+    unsigned live = 0;
+    for (int j = 0; j < PER; ++j) {
+        const int e = lane + 32 * j;
+        pv[j] = -INFINITY;
+        if (e < n_expert) { pv[j] = (float)(s_ex[e] * inv); live |= 1u << j; }
+    }
+    float my_w = 0.0f;
+    int my_id = 0, nsel = 0;
+    for (int i = 0; i < k; ++i) {
+        float bv = -INFINITY;
+        int bi = n_expert;
+        for (int j = 0; j < PER; ++j)
+            if (((live >> j) & 1u) && pv[j] > bv) { bv = pv[j]; bi = lane + 32 * j; }
+        for (int off = 16; off > 0; off >>= 1) {
+            const float ov = sycl::permute_group_by_xor(sg, bv, off);
+            const int oi = sycl::permute_group_by_xor(sg, bi, off);
+            if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+        }
+        if (bi >= n_expert) break;
+        if ((bi & 31) == lane) live &= ~(1u << (bi >> 5));
+        if (lane == i) { my_w = bv; my_id = bi; }
+        nsel = i + 1;
+    }
+    if (nsel == k) {
+        double s = 0.0;
+        for (int i = 0; i < k; ++i) s += (double)sycl::select_from_group(sg, my_w, i);
+        const double sc = sycl::fmax(s, 6.103515625e-05);
+        if (lane < k) {
+            ids[(size_t)t * k + lane] = my_id;
+            weights[(size_t)t * k + lane] = (float)((double)my_w / sc);
+        }
+    } else {
+        if (lane < nsel) { ids[(size_t)t * k + lane] = my_id; weights[(size_t)t * k + lane] = my_w; }
+        sycl::group_barrier(sg);
+        if (lane == 0) {
+            double s = 0.0;
+            for (int i = 0; i < k; ++i) s += (double)weights[(size_t)t * k + i];
+            const double sc = sycl::fmax(s, 6.103515625e-05);
+            for (int i = 0; i < k; ++i)
+                weights[(size_t)t * k + i] = (float)((double)weights[(size_t)t * k + i] / sc);
+        }
+    }
 }
 
 /// One BLOCK per token, so the reductions have somewhere to happen.  `n_tokens` is 1 in decode; the grid keeps
 /// the batch case working without a second code path.
-/*
-DPCT1110: The total declared local variable size in device function
-router_top10_kernel exceeds 128 bytes and may cause high register pressure.
-Consult with your hardware vendor to find the total register size available and
-adjust the code, or use smaller sub-group size to avoid high register pressure.
-*/
 __dpct_inline__ void router_top10_kernel(const float *__restrict__ logits,
                                          int n_tokens, int n_expert, int k,
                                          int *__restrict__ ids,
@@ -218,31 +197,16 @@ __dpct_inline__ void router_top10_kernel(const float *__restrict__ logits,
     float mx = -INFINITY;
 #pragma unroll
     for (int e = tid; e < n_expert; e += nt) mx = sycl::fmax(mx, l[e]);
-    /*
-DPCT1108: '__shfl_down_sync' was migrated with the experimental feature
-masked sub_group function which may not be supported by all compilers or
-runtimes. You may need to adjust the code.
-*/
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) mx = sycl::fmax(
         mx, dpct::experimental::shift_sub_group_left(
                 0xffffffffu, sycl::ext::oneapi::this_work_item::get_sub_group(),
                 mx, off));
     if ((tid & 31) == 0) s_red[tid >> 5] = mx;
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
     if (tid < 32) {
         const int nw = (nt + 31) >> 5;
         float v = (tid < nw) ? s_red[tid] : -INFINITY;
-        /*
-DPCT1108: '__shfl_down_sync' was migrated with the experimental feature
-masked sub_group function which may not be supported by all compilers or
-runtimes. You may need to adjust the code.
-*/
 #pragma unroll
         for (int off = 16; off > 0; off >>= 1) v = sycl::fmax(
             v, dpct::experimental::shift_sub_group_left(
@@ -250,11 +214,6 @@ runtimes. You may need to adjust the code.
                    sycl::ext::oneapi::this_work_item::get_sub_group(), v, off));
         if (tid == 0) s_red[0] = v;
     }
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
     mx = s_red[0];
 
@@ -263,11 +222,6 @@ runtimes. You may need to adjust the code.
 #pragma unroll
     for (int e = tid; e < n_expert; e += nt)
         s_ex[e] = sycl::exp((double)l[e] - (double)mx);
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
 
     // ---- the sum, ascending, on one thread: see the note above on why this is NOT parallelised.
@@ -277,11 +231,6 @@ runtimes. You may need to adjust the code.
         for (int e = 0; e < n_expert; ++e) sum += s_ex[e];
         s_sum = sum;
     }
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
     const float inv = (float) (1.0 / s_sum);
 
@@ -297,11 +246,6 @@ runtimes. You may need to adjust the code.
     float* s_p = (float*) (s_ex + n_expert);
 #pragma unroll
     for (int e = tid; e < n_expert; e += nt) s_p[e] = (float)(s_ex[e] * inv);
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
 
     // ================================ THE SELECTION, IN k PASSES ================================
@@ -318,11 +262,6 @@ runtimes. You may need to adjust the code.
     // `else if (f < e && pf == pe) ++rank`.  A stable descending top-k, ties by index.
 #pragma unroll
     for (int e = tid; e < n_expert; e += nt) s_taken[e] = 0;
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
 
     for (int i = 0; i < k; ++i) {
@@ -334,55 +273,24 @@ runtimes. You may need to adjust the code.
             if (pe > bv) { bv = pe; bi = e; }
         }
         for (int off = 16; off > 0; off >>= 1) {
-            /*
-            DPCT1108: '__shfl_down_sync' was migrated with the experimental
-            feature masked sub_group function which may not be supported by all
-            compilers or runtimes. You may need to adjust the code.
-            */
             const float ov = dpct::experimental::shift_sub_group_left(
                 0xffffffffu, sycl::ext::oneapi::this_work_item::get_sub_group(),
                 bv, off);
-            /*
-            DPCT1108: '__shfl_down_sync' was migrated with the experimental
-            feature masked sub_group function which may not be supported by all
-            compilers or runtimes. You may need to adjust the code.
-            */
             const int oi = dpct::experimental::shift_sub_group_left(
                 0xffffffffu, sycl::ext::oneapi::this_work_item::get_sub_group(),
                 bi, off);
             if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
         }
         if ((tid & 31) == 0) { s_red[tid >> 5] = bv; s_rid[tid >> 5] = bi; }
-        /*
-        DPCT1118: SYCL group functions and algorithms must be encountered in
-        converged control flow. You may need to adjust the code.
-        */
-        /*
-        DPCT1065: Consider replacing sycl::nd_item::barrier() with
-        sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
-        better performance if there is no access to global memory.
-        */
         item_ct1.barrier();
         if (tid < 32) {
             const int nw = (nt + 31) >> 5;
             float v = (tid < nw) ? s_red[tid] : -INFINITY;
             int ix = (tid < nw) ? s_rid[tid] : n_expert;
             for (int off = 16; off > 0; off >>= 1) {
-                /*
-                DPCT1108: '__shfl_down_sync' was migrated with the
-                experimental feature masked sub_group function which may not be
-                supported by all compilers or runtimes. You may need to adjust
-                the code.
-                */
                 const float ov = dpct::experimental::shift_sub_group_left(
                     0xffffffffu,
                     sycl::ext::oneapi::this_work_item::get_sub_group(), v, off);
-                /*
-                DPCT1108: '__shfl_down_sync' was migrated with the
-                experimental feature masked sub_group function which may not be
-                supported by all compilers or runtimes. You may need to adjust
-                the code.
-                */
                 const int oi = dpct::experimental::shift_sub_group_left(
                     0xffffffffu,
                     sycl::ext::oneapi::this_work_item::get_sub_group(), ix,
@@ -395,22 +303,8 @@ runtimes. You may need to adjust the code.
                 s_taken[ix] = 1;
             }
         }
-        /*
-        DPCT1118: SYCL group functions and algorithms must be encountered in
-        converged control flow. You may need to adjust the code.
-        */
-        /*
-        DPCT1065: Consider replacing sycl::nd_item::barrier() with
-        sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
-        better performance if there is no access to global memory.
-        */
         item_ct1.barrier();
     }
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
 
     // ---- renormalise, with ggml's lower clamp.  Order preserved.
@@ -620,182 +514,10 @@ __global__ void router_top10_fast_kernel(const float* __restrict__ logits, int n
         }
     }
 }
-
-void launch_generic(const float* logits, int n_tokens, int n_expert, int k, int* ids, float* weights, void* stream,
-                    int mode) {   // mode 0: router_top10_kernel, 1: the HIP fast kernel, 2: the fast kernel's serial path
-    int threads = n_expert < RT_MAX_THREADS ? n_expert : RT_MAX_THREADS;
-    threads = (threads + 31) & ~31;
-    const size_t taken_bytes = ((size_t) n_expert + 15u) & ~(size_t) 15u;
-    const size_t smem = taken_bytes + (size_t) n_expert * sizeof(double) + (size_t) n_expert * sizeof(float);
-    if (mode == 1) {
-        router_top10_fast_kernel<false><<<(unsigned) n_tokens, threads, smem, (cudaStream_t) stream>>>(
-            logits, n_tokens, n_expert, k, ids, weights);
-        return;
-    }
-    if (mode == 2) {
-        router_top10_fast_kernel<true><<<(unsigned) n_tokens, threads, smem, (cudaStream_t) stream>>>(
-            logits, n_tokens, n_expert, k, ids, weights);
-        return;
-    }
-    router_top10_kernel<<<(unsigned) n_tokens, threads, smem, (cudaStream_t) stream>>>(
-        logits, n_tokens, n_expert, k, ids, weights);
-}
 #endif
 
 }  // namespace
 
-bool router_top10_variant(const float* logits, int n_tokens, int n_expert, int k, int* ids, float* weights,
-                          void* stream, int variant) {
-#if defined(__HIPCC__)
-    if (n_tokens <= 0 || n_expert <= 64 || n_expert > 512 || k <= 0 || k > 32) return false;
-    if (variant < 0 || variant > 2) return false;
-    launch_generic(logits, n_tokens, n_expert, k, ids, weights, stream, variant);
-    return cudaGetLastError() == cudaSuccess;
-#else
-    if (n_tokens <= 0 || n_expert <= 64 || n_expert > 512 || k <= 0 || k > 32 || variant < 0 || variant > 2)
-        return false;
-    auto& q = *strata::q_of(stream);
-    if (variant == 1) launch_sycl_fast<false>(q, logits, n_tokens, n_expert, k, ids, weights);
-    else if (variant == 2) launch_sycl_fast<true>(q, logits, n_tokens, n_expert, k, ids, weights);
-    else {
-        const int threads = (std::min(n_expert, RT_MAX_THREADS) + 31) & ~31;
-        const size_t taken_bytes = ((size_t)n_expert + 15u) & ~size_t(15);
-        const size_t smem = taken_bytes + n_expert * (sizeof(double) + sizeof(float));
-        q.submit([&](sycl::handler& h) {
-            sycl::local_accessor<uint8_t, 1> local(sycl::range<1>(smem), h);
-            h.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, (size_t)n_tokens * threads),
-                                             sycl::range<3>(1, 1, threads)),
-                [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
-                    router_top10_kernel(logits, n_tokens, n_expert, k, ids, weights,
-                        local.get_multi_ptr<sycl::access::decorated::no>().get());
-                });
-        });
-    }
-    if (stream == nullptr) q.wait_and_throw();
-    return true;
-#endif
-}
-
-void router_top10(const float *logits, int n_tokens, int n_expert, int k,
-                  int *ids, float *weights, void *stream) try {
-    if (strata::a770_fast() && n_tokens > 0 && n_expert > 64 && n_expert <= 512 && k > 0 && k <= 32) {
-        auto& q = *strata::q_of(stream);
-        launch_sycl_fast<false>(q, logits, n_tokens, n_expert, k, ids, weights);
-        if (stream == nullptr) q.wait_and_throw();
-        return;
-    }
-#if defined(__HIPCC__)
-    {
-#if defined(STRATA_HIP_GFX906)
-        // gfx906 (wave64): the one-wavefront kernel below stays the default; the S6 kernel is wave32-shaped and only
-        // runs here on request (STRATA_HIP_ROUTER_FAST=1) until it is measured on this card
-        static const bool old = std::getenv("STRATA_HIP_ROUTER_FAST") == nullptr;
-#else
-        static const bool old = std::getenv("STRATA_HIP_ROUTER_OLD") != nullptr;
-#endif
-        if (!old && n_tokens > 0 && n_expert > 64 && n_expert <= 512 && k > 0 && k <= 32) {
-            launch_generic(logits, n_tokens, n_expert, k, ids, weights, stream, 1);
-            const cudaError_t e = cudaGetLastError();
-            if (e != cudaSuccess) {
-                std::fprintf(stderr, "router_top10 launch: %s\n", cudaGetErrorString(e));
-                std::exit(1);
-            }
-            if (stream == nullptr) {
-                const cudaError_t s = cudaDeviceSynchronize();
-                if (s != cudaSuccess) {
-                    std::fprintf(stderr, "router_top10: %s\n", cudaGetErrorString(s));
-                    std::exit(1);
-                }
-            }
-            return;
-        }
-    }
-#endif
-    if (n_tokens <= 0 || n_expert <= 0 || k <= 0) return;
-    if (k > 64) {
-        std::fprintf(stderr, "router_top10: k %d exceeds the kernel's 64\n", k);
-        std::exit(1);
-    }
-    if (n_expert > RT_MAX_THREADS * 64) {
-        std::fprintf(stderr, "router_top10: n_expert %d is past the kernel's %d\n", n_expert,
-                     RT_MAX_THREADS * 64);
-        std::exit(1);
-    }
-#if defined(STRATA_HIP_GFX906)
-    if (n_expert <= 64 * RW_PER && !std::getenv("STRATA_ROUTER_BLOCK")) {
-        router_top10_wave_kernel<<<(unsigned) n_tokens, 64, 0, (cudaStream_t) stream>>>(logits, n_tokens, n_expert, k,
-                                                                                       ids, weights);
-        const cudaError_t e = cudaGetLastError();
-        if (e != cudaSuccess) {
-            std::fprintf(stderr, "router_top10 launch: %s\n", cudaGetErrorString(e));
-            std::exit(1);
-        }
-        if (stream == nullptr && cudaDeviceSynchronize() != cudaSuccess) std::exit(1);
-        return;
-    }
-#endif
-    int threads = n_expert < RT_MAX_THREADS ? n_expert : RT_MAX_THREADS;
-    threads = (threads + 31) & ~31;                  // at least one full warp, for the reductions
-    // the selection's taken-mask, then n_expert doubles for the exponentials, then n_expert floats for the
-    // probabilities.  The mask is first so the two aligned arrays need no offset parameter.
-    const size_t taken_bytes = ((size_t) n_expert + 15u) & ~(size_t) 15u;
-    const size_t smem =
-        /*
-        DPCT1083: The size of local memory in the migrated code may be
-        different from the original code. Check that the allocated memory size
-        in the migrated code is correct.
-        */
-        taken_bytes + (size_t)n_expert * sizeof(double) +
-        (size_t)n_expert * sizeof(float);
-    /*
-    DPCT1049: The work-group size passed to the SYCL kernel may exceed the
-    limit. To get the device limit, query info::device::max_work_group_size.
-    Adjust the work-group size if needed.
-    */
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-        dpct::has_capability_or_fail(
-            strata::q_of(stream)->get_device(),
-            {sycl::aspect::fp64});
-
-        strata::q_of(stream)
-            ->submit([&](sycl::handler &cgh) {
-                sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
-                    sycl::range(smem), cgh);
-
-                cgh.parallel_for<
-                    dpct_kernel_name<class router_top10_kernel_3e0655>>(
-                    sycl::nd_range<3>(sycl::range(1, 1, (unsigned)n_tokens) *
-                                          sycl::range(1, 1, threads),
-                                      sycl::range(1, 1, threads)),
-                    exp_props,
-                    [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(
-                        32)]] {
-                        router_top10_kernel(
-                            logits, n_tokens, n_expert, k, ids, weights,
-                            dpct_local_acc_ct1
-                                .get_multi_ptr<sycl::access::decorated::no>()
-                                .get());
-                    });
-            });
-    }
-    /*
-    DPCT1010: SYCL uses exceptions to report errors and does not use the
-    error codes. The cudaGetLastError function call was replaced with 0. You
-    need to rewrite this code.
-    */
-    const dpct::err0 e = 0;
-
-    if (stream == nullptr) {
-        const dpct::err0 s = DPCT_CHECK_ERROR(
-            dpct::get_current_device().queues_wait_and_throw());
-    }
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
+#include "router_top10.kern.inc"
 
 }  // namespace strata::kernels

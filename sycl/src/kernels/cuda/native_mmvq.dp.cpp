@@ -23,29 +23,14 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
+#include "strata/port.hpp"
 #include "strata/sycl_math.hpp"
-#include "strata/sycl_queue.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/q8_1_finite.hpp"
-#include "strata/kernels/iq_kernels.hpp"
 #include "s26_tsum.dp.hpp"
 
-#include <algorithm>
 #include <cstdint>
-#include <cstdlib>
-#include <cstring>
-#include <limits>
-#include <stdexcept>
-#include <type_traits>
-#include <string>
-#include <unordered_map>
-#include <cstdio>
-#include <vector>
-#include <cmath>
 
 namespace strata::kernels {
 namespace {
@@ -139,11 +124,6 @@ static_assert(sizeof(IQ4NLBlock) == 18 && alignof(IQ4NLBlock) == 2 && offsetof(I
 __dpct_inline__ float warp_sum(float x) {
 #pragma unroll
     for (int offset = WARP / 2; offset > 0; offset >>= 1) {
-        /*
-        DPCT1108: '__shfl_xor_sync' was migrated with the experimental
-        feature masked sub_group function which may not be supported by all
-        compilers or runtimes. You may need to adjust the code.
-        */
         x += dpct::experimental::permute_sub_group_by_xor(
             0xffffffff, sycl::ext::oneapi::this_work_item::get_sub_group(), x,
             offset);
@@ -157,27 +137,10 @@ template <int SG> __dpct_inline__ float sg_sum(float x) {   // SYCL port: warp_s
         x += sycl::permute_group_by_xor(sycl::ext::oneapi::this_work_item::get_sub_group(), x, offset);
     return x;
 }
-// SYCL port: the decode mmvq kernels as Xe2-native SIMD16 sub-groups (twice the registers per lane, same 128
-// threads per group) or as the CUDA-shaped 32-lane warp (default). STRATA_MMVQ_SG: 16 = all SIMD16, 1 = IQ4_XS
-// only, 2 = short outputs (n_out <= 1024) only, 3 = both. mmvq_sg_bench alone: SIMD16 wins on IQ4_XS (up to
-// 1.45x) and short outputs (up to 1.3x), loses 10-25% on the large K-quant projections.
-inline int mmvq_sg() {
-    static const int v = std::getenv("STRATA_MMVQ_SG") ? std::atoi(std::getenv("STRATA_MMVQ_SG")) : 32;
-    return v;
-}
-inline bool mmvq_sg16(bool iq4xs, int n_out) {
-    const int v = mmvq_sg();
-    return v == 16 || ((v & 1) && v < 4 && iq4xs) || ((v & 2) && v < 4 && n_out <= 1024);
-}
 
 __dpct_inline__ float warp_max(float x) {
 #pragma unroll
     for (int offset = WARP / 2; offset > 0; offset >>= 1) {
-        /*
-        DPCT1108: '__shfl_xor_sync' was migrated with the experimental
-        feature masked sub_group function which may not be supported by all
-        compilers or runtimes. You may need to adjust the code.
-        */
         x = sycl::fmax(x,
                        dpct::experimental::permute_sub_group_by_xor(
                            0xffffffff,
@@ -212,12 +175,6 @@ native_swiglu_quantize_q8_1_kernel(const float *__restrict__ gate,
                   int(item_ct1.get_local_id(2));
     if (i >= n_in) return; // n_in is a multiple of 32: only whole warps return.
     const float gi = gate[i];
-    /*
-    DPCT1013: The rounding mode could not be specified and the generated
-    code may have different accuracy than the original code. Verify the
-    correctness. SYCL math built-in function rounding mode is aligned with
-    OpenCL C 1.2 standard.
-    */
     const float xi = gi / (1.0f + sycl::native::exp(-gi)) * up[i];
     const float amax = warp_max(sycl::fabs(xi));
     const float sum = warp_sum(xi);
@@ -253,12 +210,6 @@ q5_q8_dot_impl(const int *__restrict__ vl, const int *__restrict__ vh,
     return dm5f.x() * sumf_d - dm5f.y() * sumf_m;
 }
 
-/*
-DPCT1110: The total declared local variable size in device function
-q5_q8_dot exceeds 128 bytes and may cause high register pressure. Consult with
-your hardware vendor to find the total register size available and adjust the
-code, or use smaller sub-group size to avoid high register pressure.
-*/
 __dpct_inline__ float q5_q8_dot(const Q5KBlock *__restrict__ bq5,
                                 const Q81Block *__restrict__ bq8, int iqs) {
     int vl[2];
@@ -335,11 +286,6 @@ __dpct_inline__ void native_q5_k_mmvq_kernel(const Q5KBlock *__restrict__ w,
             partial[item_ct1.get_local_id(1) - 1][i][item_ct1.get_local_id(2)] =
                 tmp[i];
     }
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
     if (item_ct1.get_local_id(1) > 0) return;
 #pragma unroll
@@ -414,11 +360,6 @@ __dpct_inline__ void native_q2_0_mmvq_kernel(const Q20Block *__restrict__ w,
             partial[item_ct1.get_local_id(1) - 1][i][item_ct1.get_local_id(2)] =
                 tmp[i];
     }
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
     if (item_ct1.get_local_id(1) > 0) return;
 #pragma unroll
@@ -516,11 +457,6 @@ __dpct_inline__ void native_q3_k_mmvq_kernel(const Q3KBlock *__restrict__ w,
             partial[item_ct1.get_local_id(1) - 1][i][item_ct1.get_local_id(2)] =
                 tmp[i];
     }
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
     if (item_ct1.get_local_id(1) > 0) return;
 #pragma unroll
@@ -536,10 +472,7 @@ __dpct_inline__ void native_q3_k_mmvq_kernel(const Q3KBlock *__restrict__ w,
 
 // The pinned nonlinear IQ4 codebook and its CUDA two-stage byte lookup. The
 // explicit alignment satisfies the four 32-bit table loads; values are unchanged.
-inline dpct::global_memory<int8_t, 1>& iq4nl_values = *new dpct::global_memory<int8_t, 1>(sycl::range(16), {-127, -104, -83, -65, -49, -35, -22, -10, 1,
-                                   13, 25, 38, 53, 69, 89, 113});
-
-static constexpr int8_t kIq4nlTable[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+alignas(4) static constexpr int8_t kIq4nlTable[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
 __dpct_inline__ sycl::int2 iq4_table_lookup(int q4, int8_t *iq4nl_values) {
 #if defined(STRATA_HIP_GFX906)
     // AMD: llama.cpp's HIP lookup (see iq_kernels.cu get_int_from_table_16): 4 v_perm_b32 per 8 values
@@ -629,11 +562,6 @@ native_iq4_xs_mmvq_kernel(const IQ4XSBlock *__restrict__ w,
             partial[item_ct1.get_local_id(1) - 1][i][item_ct1.get_local_id(2)] =
                 tmp[i];
     }
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
     if (item_ct1.get_local_id(1) > 0) return;
 #pragma unroll
@@ -740,11 +668,6 @@ __dpct_inline__ void native_q4_k_mmvq_kernel(const Q4KBlock *__restrict__ w,
             partial[item_ct1.get_local_id(1) - 1][i][item_ct1.get_local_id(2)] =
                 tmp[i];
     }
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
     if (item_ct1.get_local_id(1) > 0) return;
 #pragma unroll
@@ -827,11 +750,6 @@ __dpct_inline__ void native_q6_k_mmvq_kernel(const Q6KBlock *__restrict__ w,
             partial[item_ct1.get_local_id(1) - 1][i][item_ct1.get_local_id(2)] =
                 tmp[i];
     }
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
     if (item_ct1.get_local_id(1) > 0) return;
 #pragma unroll
@@ -960,11 +878,6 @@ __dpct_inline__ void native_small_mmvq_kernel(const Weight *__restrict__ w,
             partial[item_ct1.get_local_id(1) - 1][i][item_ct1.get_local_id(2)] =
                 tmp[i];
     }
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
     if (item_ct1.get_local_id(1) > 0) return;
 #pragma unroll
@@ -1346,28 +1259,11 @@ struct SmallTraits<IQ4NLBlock, 4> {
     }
 };
 
-// NW warps per block and ROWS rows per block. The EXACT layout (NW = 4, ROWS = 1, or 4 for small K) is the
-// ncols = 1 layout and keeps every column bitwise equal to a single-column call. The UPSTREAM layout is
-// llama.cpp's generic multi-column table (ncols 2-4: 4 warps; 5-8: 2 warps; always 2 rows per block): faster,
-// equal to ncols = 1 only to float rounding (the cross-warp reduction groups partial sums differently).
-bool g_multi_exact = true;   // until the upstream layout is timed on an idle GPU (plan rule: default only what is measured)
-
-// S26 STRATA_TSUM=1 (TS): warp 0's NCOLS x ROWS sums as one transposed butterfly (s26_tsum.cuh), bitwise the same
-static bool s26_tsum_on() {
-    static const bool on = [] { const char* v = std::getenv("STRATA_TSUM"); return v && v[0] == '1'; }();
-    return on;
-}
 
 // S26 STRATA_LFUSE (PAIR): blocks n_out.. compute the same rows of w2 into y2 (two matrices of one shape on one
 // input in one launch; each output's code is the single matrix's)
 template <typename F, int NCOLS, int NW, int ROWS, bool TS = false,
           bool PAIR = false, int SG = WARP>
-/*
-DPCT1110: The total declared local variable size in device function
-native_mmvq_multi_kernel exceeds 128 bytes and may cause high register pressure.
-Consult with your hardware vendor to find the total register size available and
-adjust the code, or use smaller sub-group size to avoid high register pressure.
-*/
 __dpct_inline__ void
 native_mmvq_multi_kernel(const typename F::Block *__restrict__ w,
                          const Q81Block *__restrict__ x, float *__restrict__ y,
@@ -1395,11 +1291,6 @@ native_mmvq_multi_kernel(const typename F::Block *__restrict__ w,
         for (int i = 0; i < ROWS; ++i) {
             if (row0 + i < n_out) {
                 const std::size_t block = std::size_t(row0 + i) * blocks_per_row + kbx;
-                /*
-                DPCT1084: The function call "Q5KTraits::load" has multiple
-                migration results in different template instantiations that
-                could not be unified. You may need to adjust the code.
-                */
                 const typename F::W wv =
                     F::load(w + block, kqs); // once per (row, block)
 #pragma unroll
@@ -1419,11 +1310,6 @@ native_mmvq_multi_kernel(const typename F::Block *__restrict__ w,
                 partial[item_ct1.get_local_id(1) - 1][j][i]
                        [item_ct1.get_local_id(2)] = tmp[j][i];
     }
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
     if (item_ct1.get_local_id(1) > 0) return;
     if constexpr (TS) {
@@ -1530,10 +1416,6 @@ __dpct_inline__ sycl::int4 load16_a2(const void* p) {
 #pragma unroll
     for (int i = 0; i < 4; ++i) o[i] = half ? (w[i] >> 16) | (w[i + 1] << 16) : w[i];
     return sycl::int4((int) o[0], (int) o[1], (int) o[2], (int) o[3]);
-}
-inline bool q6k_a2() {   // STRATA_MMVQ_A2=0 turns the aligned-load path off
-    static const bool v = std::getenv("STRATA_MMVQ_A2") == nullptr || std::atoi(std::getenv("STRATA_MMVQ_A2")) != 0;
-    return v;
 }
 
 template <int NCOLS, int RPW, int SG = WARP, int BS = (int) sizeof(Q6KBlock), bool A2 = false>   // BS: block stride
@@ -1686,60 +1568,6 @@ void native_mmvq_q6k_pf_kernel(const Q6KBlock* __restrict__ w, const Q81Block* _
         if (lane == 0) y[std::size_t(j) * n_out + row] = v;
     }
 }
-inline int q6k_pf() {   // STRATA_MMVQ_PF: weight-load steps issued ahead in the wide Q6_K kernel (0 = off)
-    static const int v = std::getenv("STRATA_MMVQ_PF") ? std::atoi(std::getenv("STRATA_MMVQ_PF")) : 0;
-    return v;
-}
-inline int q6k_wide_rpw() {
-    static const int v = std::getenv("STRATA_MMVQ_WIDE_RPW") ? std::atoi(std::getenv("STRATA_MMVQ_WIDE_RPW")) : 1;
-    return v;
-}
-template <int NCOLS>
-void launch_q6k_wide(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, dpct::queue_ptr s) {
-    const auto* w = static_cast<const Q6KBlock*>(weights);
-    const auto* x = static_cast<const Q81Block*>(x_q8_1);
-    const int rpw = q6k_wide_rpw();
-    if (const int pf = q6k_pf(); pf > 0) {
-        const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
-        const sycl::range<3> t(1, WARPS, WARP);
-#define STRATA_Q6PF(UU) if (pf == UU) { \
-            s->parallel_for<dpct_kernel_name<class native_mmvq_q6k_pf, dpct_kernel_scalar<NCOLS>, dpct_kernel_scalar<UU>>>( \
-                sycl::nd_range<3>(sycl::range(1, 1, blocks) * t, t), \
-                [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] { native_mmvq_q6k_pf_kernel<NCOLS, UU>(w, x, y, n_in, n_out); }); \
-            return; }
-        STRATA_Q6PF(2) STRATA_Q6PF(3) STRATA_Q6PF(4) STRATA_Q6PF(6)
-#undef STRATA_Q6PF
-    }
-    if (rpw == 1 && q6k_a2()) {
-        const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
-        s->parallel_for<dpct_kernel_name<class native_mmvq_q6k_wide_a2, dpct_kernel_scalar<NCOLS>>>(
-            sycl::nd_range<3>(sycl::range(1, 1, blocks) * sycl::range(1, WARPS, WARP), sycl::range(1, WARPS, WARP)),
-            [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
-                native_mmvq_q6k_wide_kernel<NCOLS, 1, WARP, (int) sizeof(Q6KBlock), true>(w, x, y, n_in, n_out);
-            });
-        return;
-    }
-    if (rpw == 1 && mmvq_sg16(false, n_out)) {
-        constexpr int NWG = WARPS * WARP / 16;
-        const unsigned blocks = unsigned((std::size_t(n_out) + NWG - 1) / NWG);
-        s->parallel_for<dpct_kernel_name<class native_mmvq_q6k_wide16, dpct_kernel_scalar<NCOLS>>>(
-            sycl::nd_range<3>(sycl::range(1, 1, blocks) * sycl::range(1, NWG, 16), sycl::range(1, NWG, 16)),
-            [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(16)]] { native_mmvq_q6k_wide_kernel<NCOLS, 1, 16>(w, x, y, n_in, n_out); });
-        return;
-    }
-#define STRATA_Q6W(RP) if (rpw == RP) { \
-        const unsigned blocks = unsigned((std::size_t(n_out) + WARPS * RP - 1) / (WARPS * RP)); \
-        s->parallel_for<dpct_kernel_name<class native_mmvq_q6k_wide, dpct_kernel_scalar<NCOLS>, dpct_kernel_scalar<RP>>>( \
-            sycl::nd_range<3>(sycl::range(1, 1, blocks) * sycl::range(1, WARPS, WARP), sycl::range(1, WARPS, WARP)), \
-            [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] { native_mmvq_q6k_wide_kernel<NCOLS, RP>(w, x, y, n_in, n_out); }); \
-        return; }
-    STRATA_Q6W(1) STRATA_Q6W(2) STRATA_Q6W(4)
-#undef STRATA_Q6W
-    const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
-    s->parallel_for<dpct_kernel_name<class native_mmvq_q6k_wide1, dpct_kernel_scalar<NCOLS>>>(
-        sycl::nd_range<3>(sycl::range(1, 1, blocks) * sycl::range(1, WARPS, WARP), sycl::range(1, WARPS, WARP)),
-        [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] { native_mmvq_q6k_wide_kernel<NCOLS, 1>(w, x, y, n_in, n_out); });
-}
 // ---------------------------------------------------------------- SYCL port: wide kernels for Q4_K, Q5_K, IQ4_XS
 //
 // The Q6_K wide kernel's shape for the other 256-element formats: 8 lanes share a block, each lane's weights are one
@@ -1858,35 +1686,6 @@ void native_mmvq_wide_kernel(const typename F::Block* __restrict__ w, const Q81B
         if (lane == 0) y[std::size_t(j) * n_out + row] = v;
     }
 }
-template <typename F, int NCOLS>
-void launch_wide(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, dpct::queue_ptr s) {
-    const auto* w = static_cast<const typename F::Block*>(weights);
-    const auto* x = static_cast<const Q81Block*>(x_q8_1);
-    const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
-    s->parallel_for<dpct_kernel_name<class native_mmvq_wide, F, dpct_kernel_scalar<NCOLS>>>(
-        sycl::nd_range<3>(sycl::range(1, 1, blocks) * sycl::range(1, WARPS, WARP), sycl::range(1, WARPS, WARP)),
-        [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] { native_mmvq_wide_kernel<F, NCOLS>(w, x, y, n_in, n_out); });
-}
-inline bool wide_k() {   // STRATA_MMVQ_WIDE_K=0: Q4_K/Q5_K/IQ4_XS through the multi kernel (the old path)
-    static const bool v = std::getenv("STRATA_MMVQ_WIDE_K") == nullptr || std::atoi(std::getenv("STRATA_MMVQ_WIDE_K")) != 0;
-    return v;
-}
-template <typename F>
-bool try_wide(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream) {
-    if (!wide_k() || ncols < 1 || ncols > 8 || n_in % QK != 0) return false;
-    const auto s = strata::q_of(stream);
-    switch (ncols) {
-        case 1: launch_wide<F, 1>(weights, x_q8_1, y, n_in, n_out, s); return true;
-        case 2: launch_wide<F, 2>(weights, x_q8_1, y, n_in, n_out, s); return true;
-        case 3: launch_wide<F, 3>(weights, x_q8_1, y, n_in, n_out, s); return true;
-        case 4: launch_wide<F, 4>(weights, x_q8_1, y, n_in, n_out, s); return true;
-        case 5: launch_wide<F, 5>(weights, x_q8_1, y, n_in, n_out, s); return true;
-        case 6: launch_wide<F, 6>(weights, x_q8_1, y, n_in, n_out, s); return true;
-        case 7: launch_wide<F, 7>(weights, x_q8_1, y, n_in, n_out, s); return true;
-        default: launch_wide<F, 8>(weights, x_q8_1, y, n_in, n_out, s); return true;
-    }
-}
-
 // SYCL port: wide kernels for the 32-element formats Q8_0 (34-byte blocks) and IQ4_NL (18). Both are only 2-byte
 // aligned, so the weights come through load16_a2 (page-safe). Q8_0: 2 lanes per block (16 quants each), 16 blocks
 // per sub-group step; IQ4_NL: 1 lane per block (its 16 bytes = 32 nibbles), 32 blocks per step. One row per
@@ -1947,223 +1746,12 @@ void native_mmvq_wide32_kernel(const typename F::Block* __restrict__ w, const Q8
         if (lane == 0) y[std::size_t(j) * n_out + row] = v;
     }
 }
-template <typename F, int NCOLS>
-void launch_wide32(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, dpct::queue_ptr s) {
-    const auto* w = static_cast<const typename F::Block*>(weights);
-    const auto* x = static_cast<const Q81Block*>(x_q8_1);
-    const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
-    s->parallel_for<dpct_kernel_name<class native_mmvq_wide32, F, dpct_kernel_scalar<NCOLS>>>(
-        sycl::nd_range<3>(sycl::range(1, 1, blocks) * sycl::range(1, WARPS, WARP), sycl::range(1, WARPS, WARP)),
-        [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] { native_mmvq_wide32_kernel<F, NCOLS>(w, x, y, n_in, n_out); });
-}
-inline bool wide_32() {   // STRATA_MMVQ_WIDE_32=0: Q8_0/IQ4_NL through the small/multi kernels (the old path)
-    static const bool v = std::getenv("STRATA_MMVQ_WIDE_32") == nullptr || std::atoi(std::getenv("STRATA_MMVQ_WIDE_32")) != 0;
-    return v;
-}
-template <typename F>
-bool try_wide32(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream) {
-    if (!wide_32() || ncols < 1 || ncols > 8 || n_in % 32 != 0) return false;
-    const auto s = strata::q_of(stream);
-    switch (ncols) {
-        case 1: launch_wide32<F, 1>(weights, x_q8_1, y, n_in, n_out, s); return true;
-        case 2: launch_wide32<F, 2>(weights, x_q8_1, y, n_in, n_out, s); return true;
-        case 3: launch_wide32<F, 3>(weights, x_q8_1, y, n_in, n_out, s); return true;
-        case 4: launch_wide32<F, 4>(weights, x_q8_1, y, n_in, n_out, s); return true;
-        case 5: launch_wide32<F, 5>(weights, x_q8_1, y, n_in, n_out, s); return true;
-        case 6: launch_wide32<F, 6>(weights, x_q8_1, y, n_in, n_out, s); return true;
-        case 7: launch_wide32<F, 7>(weights, x_q8_1, y, n_in, n_out, s); return true;
-        default: launch_wide32<F, 8>(weights, x_q8_1, y, n_in, n_out, s); return true;
-    }
-}
-
-// SYCL port: alignment experiment - Q6_K blocks repacked at a 224-byte stride (every block 16-byte aligned).
-template <int NCOLS>
-void launch_q6k_wide224(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, dpct::queue_ptr s) {
-    const auto* w = static_cast<const Q6KBlock*>(weights);
-    const auto* x = static_cast<const Q81Block*>(x_q8_1);
-    const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
-    s->parallel_for<dpct_kernel_name<class native_mmvq_q6k_wide224, dpct_kernel_scalar<NCOLS>>>(
-        sycl::nd_range<3>(sycl::range(1, 1, blocks) * sycl::range(1, WARPS, WARP), sycl::range(1, WARPS, WARP)),
-        [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] { native_mmvq_q6k_wide_kernel<NCOLS, 1, WARP, 224>(w, x, y, n_in, n_out); });
-}
-bool g_q6k_wide = std::getenv("STRATA_MMVQ_WIDE") == nullptr || std::atoi(std::getenv("STRATA_MMVQ_WIDE")) != 0;
-
-template <typename F, int NCOLS, int RPW>
-void launch_rowwarp(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, dpct::queue_ptr s) {
-    const auto* w = static_cast<const typename F::Block*>(weights);
-    const auto* x = static_cast<const Q81Block*>(x_q8_1);
-    const unsigned blocks = unsigned((std::size_t(n_out) + WARPS * RPW - 1) / (WARPS * RPW));
-    s->parallel_for<dpct_kernel_name<class native_mmvq_rowwarp, F, dpct_kernel_scalar<NCOLS>, dpct_kernel_scalar<RPW>>>(
-        sycl::nd_range<3>(sycl::range(1, 1, blocks) * sycl::range(1, WARPS, WARP), sycl::range(1, WARPS, WARP)),
-        [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] { native_mmvq_rowwarp_kernel<F, NCOLS, RPW>(w, x, y, n_in, n_out); });
-}
-inline int rowwarp_rpw() {   // STRATA_MMVQ_RPW: 0 = the shared kernel, 1/2/4 = rows per warp (bench knob)
-    static const int v = std::getenv("STRATA_MMVQ_RPW") ? std::atoi(std::getenv("STRATA_MMVQ_RPW")) : 0;   // default: the shared kernel (measured equal at warm clocks)
-    return v;
-}
-
-template <typename F, int NCOLS>
-void launch_multi_n(const void *weights, const void *x_q8_1, float *y, int n_in,
-                    int n_out, dpct::queue_ptr s) {
-    const auto* w = static_cast<const typename F::Block*>(weights);
-    const auto* x = static_cast<const Q81Block*>(x_q8_1);
-    auto exp_props = sycl::ext::oneapi::experimental::properties{
-        sycl::ext::oneapi::experimental::use_root_sync};
-    dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
-    if (!g_multi_exact) {
-        constexpr int NW = NCOLS <= 4 ? 4 : 2;
-        constexpr int ROWS = 1;   // SYCL port: one row per work-group (more groups: the kernel is latency-bound here)
-        const unsigned blocks = unsigned((std::size_t(n_out) + ROWS - 1) / ROWS);
-        s->parallel_for<dpct_kernel_name<
-            class native_mmvq_multi_kernel_646c3d, F,
-            dpct_kernel_scalar<NCOLS>, dpct_kernel_scalar<NW>,
-            dpct_kernel_scalar<2>>>(
-            sycl::nd_range<3>(sycl::range(1, 1, blocks) * sycl::range(1, NW, WARP),
-                              sycl::range(1, NW, WARP)),
-            exp_props,
-            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
-                native_mmvq_multi_kernel<F, NCOLS, NW, ROWS>(w, x, y, n_in, n_out);
-            });
-        return;
-    }
-    if (mmvq_sg16(std::is_same_v<F, IQ4XSTraits>, n_out)) {   // same 128 threads as 8 SIMD16 sub-groups
-        constexpr int NW16 = WARPS * WARP / 16;
-        const sycl::range<3> t16(1, NW16, 16);
-        if (n_in / F::DIV < F::BPI) {
-            const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
-            s->parallel_for<dpct_kernel_name<class native_mmvq_multi16_small, F, dpct_kernel_scalar<NCOLS>>>(
-                sycl::nd_range<3>(sycl::range(1, 1, blocks) * t16, t16),
-                [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(16)]] {
-                    native_mmvq_multi_kernel<F, NCOLS, NW16, WARPS, false, false, 16>(w, x, y, n_in, n_out);
-                });
-        } else {
-            s->parallel_for<dpct_kernel_name<class native_mmvq_multi16, F, dpct_kernel_scalar<NCOLS>>>(
-                sycl::nd_range<3>(sycl::range(1, 1, unsigned(n_out)) * t16, t16),
-                [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(16)]] {
-                    native_mmvq_multi_kernel<F, NCOLS, NW16, 1, false, false, 16>(w, x, y, n_in, n_out);
-                });
-        }
-        return;
-    }
-    const dpct::dim3 threads(WARP, WARPS);
-    // #783 PR-h (stuchapin909): two rows per block for every K, not only small K - each row keeps its own partial sums and
-    // reduction, so a row's result does not depend on its neighbour; STRATA_NO_MMVQ_ROWS2=1 keeps one row for large K
-    static const bool rows1 = [] {
-        const char* v = std::getenv("STRATA_NO_MMVQ_ROWS2");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
-    if (rows1 && n_in / F::DIV >= F::BPI) {
-        if (s26_tsum_on()) {
-            s->parallel_for<dpct_kernel_name<
-                class native_mmvq_multi_kernel_2a7dda, F,
-                dpct_kernel_scalar<NCOLS>, dpct_kernel_scalar<WARPS>,
-                dpct_kernel_scalar<1>, dpct_kernel_scalar<true>>>(
-                sycl::nd_range<3>(sycl::range(1, 1, unsigned(n_out)) * threads, threads),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
-                    native_mmvq_multi_kernel<F, NCOLS, WARPS, 1, true>(w, x, y, n_in, n_out);
-                });
-        } else {
-            s->parallel_for<dpct_kernel_name<
-                class native_mmvq_multi_kernel_23124e, F,
-                dpct_kernel_scalar<NCOLS>, dpct_kernel_scalar<WARPS>,
-                dpct_kernel_scalar<1>, dpct_kernel_scalar<false>>>(
-                sycl::nd_range<3>(sycl::range(1, 1, unsigned(n_out)) * threads, threads),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
-                    native_mmvq_multi_kernel<F, NCOLS, WARPS, 1>(w, x, y, n_in, n_out);
-                });
-        }
-        return;
-    }
-    constexpr int ROWS = 2;
-    const unsigned blocks = unsigned((std::size_t(n_out) + ROWS - 1) / ROWS);
-    if (s26_tsum_on()) {
-        s->parallel_for<dpct_kernel_name<
-            class native_mmvq_multi_kernel_279861, F,
-            dpct_kernel_scalar<NCOLS>, dpct_kernel_scalar<WARPS>,
-            dpct_kernel_scalar<ROWS>, dpct_kernel_scalar<true>>>(
-            sycl::nd_range<3>(sycl::range(1, 1, blocks) * threads, threads),
-            exp_props,
-            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
-                native_mmvq_multi_kernel<F, NCOLS, WARPS, ROWS, true>(w, x, y, n_in, n_out);
-            });
-    } else {
-        s->parallel_for<dpct_kernel_name<
-            class native_mmvq_multi_kernel_75e8ad, F, dpct_kernel_scalar<NCOLS>,
-            dpct_kernel_scalar<WARPS>, dpct_kernel_scalar<ROWS>,
-            dpct_kernel_scalar<false>>>(
-            sycl::nd_range<3>(sycl::range(1, 1, blocks) * threads, threads),
-            exp_props,
-            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
-                native_mmvq_multi_kernel<F, NCOLS, WARPS, ROWS>(w, x, y, n_in, n_out);
-            });
-    }
-}
-
-template<typename F>
-void launch_multi(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
-                  void* stream) {
-    const auto s = strata::q_of(stream);
-    switch (ncols) {
-        case 2: launch_multi_n<F, 2>(weights, x_q8_1, y, n_in, n_out, s); break;
-        case 3: launch_multi_n<F, 3>(weights, x_q8_1, y, n_in, n_out, s); break;
-        case 4: launch_multi_n<F, 4>(weights, x_q8_1, y, n_in, n_out, s); break;
-        case 5: launch_multi_n<F, 5>(weights, x_q8_1, y, n_in, n_out, s); break;
-        case 6: launch_multi_n<F, 6>(weights, x_q8_1, y, n_in, n_out, s); break;
-        case 7: launch_multi_n<F, 7>(weights, x_q8_1, y, n_in, n_out, s); break;
-        case 8: launch_multi_n<F, 8>(weights, x_q8_1, y, n_in, n_out, s); break;
-        default: throw std::invalid_argument("native MMVQ multi-column launch requires 2 <= ncols <= 8");
-    }
-}
-
-void validate_shape(int n_in, int ncols, int block_elems = Q8K) {
-    if (n_in <= 0 || n_in % block_elems != 0) {
-        throw std::invalid_argument("native MMVQ requires n_in > 0 and divisible by its block element count");
-    }
-    if (ncols < 1 || ncols > MAX_NCOLS) throw std::invalid_argument("native MMVQ requires 1 <= ncols <= 8");
-}
-void validate_pointer(const void* p) {
-    if (!p || reinterpret_cast<std::uintptr_t>(p) % 4 != 0) {
-        throw std::invalid_argument("native MMVQ requires non-null 4-byte aligned device pointers");
-    }
-}
-void validate_stream(void* stream) {
-    if (!stream) throw std::invalid_argument("native MMVQ requires an explicit non-null CUDA stream");
-}
-void launch_check() {
-    /*
-    DPCT1010: SYCL uses exceptions to report errors and does not use the
-    error codes. The cudaGetLastError function call was replaced with 0. You
-    need to rewrite this code.
-    */
-    const auto error = 0;
-    /*
-    DPCT1000: Error handling if-stmt was detected but could not be
-    rewritten.
-    */
-    if (error != 0) {
-        /*
-        DPCT1009: SYCL reports errors using exceptions and does not use
-        error codes. Please replace the "get_error_string_dummy(...)" with a
-        real error-handling function.
-        */
-        /*
-        DPCT1001: The statement could not be removed.
-        */
-        throw std::runtime_error(std::string("native MMVQ launch: ") +
-                                 dpct::get_error_string_dummy(error));
-    }
-}
-
-
 #if defined(STRATA_HIP_GFX906)
 // ---- AMD (wave64) layout: one wavefront per R rows, four wavefronts per block, the row's blocks strided over the
 // 64 lanes exactly as the CUDA kernels stride them over a block (kbx = lane / T, stride 64 / T), and a 64-lane
 // butterfly instead of the LDS partials and __syncthreads of the one-block-per-row layout: on gfx906 a block per
 // 2 KB row spent most of its time being launched and joined.  The SAME kernel serves every column count 1..8, so a
 // column's sums do not depend on how many columns (verify tokens) ride along.  STRATA_MMVQ_WAVE=0: the CUDA layout.
-bool g_wave_off = std::getenv("STRATA_MMVQ_WAVE") && std::string(std::getenv("STRATA_MMVQ_WAVE")) == "0";
 template<typename F, int NCOLS, int R>
 __launch_bounds__(256)
 __global__ void native_mmvq_wave_kernel(const typename F::Block* __restrict__ w, const Q81Block* __restrict__ x,
@@ -2198,126 +1786,7 @@ __global__ void native_mmvq_wave_kernel(const typename F::Block* __restrict__ w,
             if (lane == 0 && row0 + i < n_out) y[std::size_t(j) * n_out + row0 + i] = v;
         }
 }
-template<typename F, int NCOLS>
-void wave_launch_n(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, cudaStream_t s) {
-    const auto* w = static_cast<const typename F::Block*>(weights);
-    const auto* x = static_cast<const Q81Block*>(x_q8_1);
-    constexpr int R = 1;
-    const unsigned blocks = unsigned((std::size_t(n_out) + 4 * R - 1) / (4 * R));
-    native_mmvq_wave_kernel<F, NCOLS, R><<<blocks, 256, 0, s>>>(w, x, y, n_in, n_out);
-}
-template<typename F>
-void wave_launch(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream) {
-    const auto s = static_cast<cudaStream_t>(stream);
-    switch (ncols) {
-        case 1: wave_launch_n<F, 1>(weights, x_q8_1, y, n_in, n_out, s); break;
-        case 2: wave_launch_n<F, 2>(weights, x_q8_1, y, n_in, n_out, s); break;
-        case 3: wave_launch_n<F, 3>(weights, x_q8_1, y, n_in, n_out, s); break;
-        case 4: wave_launch_n<F, 4>(weights, x_q8_1, y, n_in, n_out, s); break;
-        case 5: wave_launch_n<F, 5>(weights, x_q8_1, y, n_in, n_out, s); break;
-        case 6: wave_launch_n<F, 6>(weights, x_q8_1, y, n_in, n_out, s); break;
-        case 7: wave_launch_n<F, 7>(weights, x_q8_1, y, n_in, n_out, s); break;
-        case 8: wave_launch_n<F, 8>(weights, x_q8_1, y, n_in, n_out, s); break;
-        default: throw std::invalid_argument("native MMVQ (wave) requires 1 <= ncols <= 8");
-    }
-}
-#define STRATA_WAVE_MMVQ(...) \
-    if (!g_wave_off) { wave_launch<__VA_ARGS__>(weights, x_q8_1, y, n_in, n_out, ncols, stream); launch_check(); return; }
-#else
-#define STRATA_WAVE_MMVQ(...)
 #endif
-
-template<typename Weight, int Qi>
-void small_mmvq(const void* weights, const void* x_q8_1, float* y,
-                int n_in, int n_out, int ncols, void* stream) {
-    validate_shape(n_in, ncols, 32);
-    if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
-    validate_pointer(weights);
-    validate_pointer(x_q8_1);
-    validate_pointer(y);
-    validate_stream(stream);
-    STRATA_WAVE_MMVQ(SmallTraits<Weight, Qi>)
-    if (ncols > 1) {
-        launch_multi<SmallTraits<Weight, Qi>>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
-        launch_check();
-        return;
-    }
-    const auto* w = static_cast<const Weight*>(weights);
-    const auto* x = static_cast<const Q81Block*>(x_q8_1);
-    const auto s = strata::q_of(stream);
-    const dpct::dim3 threads(WARP, WARPS);
-    if (n_in / 32 < 2 * WARPS * WARP / Qi) {
-        const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
-        /*
-        DPCT1049: The work-group size passed to the SYCL kernel may exceed
-        the limit. To get the device limit, query
-        info::device::max_work_group_size. Adjust the work-group size if needed.
-        */
-        {
-            iq4nl_values.init(*s);
-
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
-
-            s->submit([&](sycl::handler &cgh) {
-                auto iq4nl_values_ptr_ct1 = iq4nl_values.get_ptr();
-
-                cgh.parallel_for<dpct_kernel_name<
-                    class native_small_mmvq_kernel_95f41f, Weight,
-                    dpct_kernel_scalar<Qi>, dpct_kernel_scalar<true>>>(
-                    sycl::nd_range<3>(sycl::range(1, 1, blocks) * threads,
-                                      threads),
-                    exp_props,
-                    [=](sycl::nd_item<3> item_ct1)
-                        [[sycl::reqd_sub_group_size(32)]] {
-                            native_small_mmvq_kernel<Weight, Qi, true>(
-                                w, x, y, n_in, n_out, iq4nl_values_ptr_ct1);
-                        });
-            });
-        }
-    } else {
-        /*
-        DPCT1049: The work-group size passed to the SYCL kernel may exceed
-        the limit. To get the device limit, query
-        info::device::max_work_group_size. Adjust the work-group size if needed.
-        */
-        iq4nl_values.init(*s);
-
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        s->submit([&](sycl::handler &cgh) {
-            auto iq4nl_values_ptr_ct1 = iq4nl_values.get_ptr();
-
-            cgh.parallel_for<dpct_kernel_name<
-                class native_small_mmvq_kernel_d00fb9, Weight,
-                dpct_kernel_scalar<Qi>, dpct_kernel_scalar<false>>>(
-                sycl::nd_range<3>(sycl::range(1, 1, unsigned(n_out)) * threads,
-                                  threads),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        native_small_mmvq_kernel<Weight, Qi, false>(
-                            w, x, y, n_in, n_out, iq4nl_values_ptr_ct1);
-                    });
-        });
-    }
-    launch_check();
-}
-
-template<typename Weight, int Qi>
-void small_f32(const void* weights, const float* x, void* scratch_q8_1,
-               float* y, int n_in, int n_out, int ncols, void* stream) {
-    validate_shape(n_in, ncols, 32);
-    if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
-    validate_pointer(weights);
-    validate_pointer(x);
-    validate_pointer(scratch_q8_1);
-    validate_pointer(y);
-    validate_stream(stream);
-    native_quantize_q8_1(x, scratch_q8_1, n_in, ncols, stream);
-    small_mmvq<Weight, Qi>(weights, scratch_q8_1, y, n_in, n_out, ncols, stream);
-}
 
 // ============================ STRATA_Q8_PACKED=1: the packed Q8_0 decode layout (opt-in) ============================
 //
@@ -2335,28 +1804,10 @@ void small_f32(const void* weights, const float* x, void* scratch_q8_1,
 #if defined(__HIPCC__)
 #define STRATA_Q8P_LOAD(p) __builtin_nontemporal_load(p)
 #else
-/*
-DPCT1098: The '*' expression is used instead of the __ldcs call. These two
-expressions do not provide the exact same functionality. Check the generated
-code for potential precision and/or performance issues.
-*/
-/*
-DPCT1064: Migrated __ldcs call is used in a macro/template definition and
-may not be valid for all macro/template uses. Adjust the code.
-*/
 #define STRATA_Q8P_LOAD(p) (*(p))
 #endif
-constexpr int Q8P_PERSIST_GRID = 640;
-constexpr int Q8P_PERSIST_MAX_IN = 4096;
 
 template <int NCOLS, bool TS = false>
-/*
-DPCT1110: The total declared local variable size in device function
-native_q8_0_packed_kernel exceeds 128 bytes and may cause high register
-pressure. Consult with your hardware vendor to find the total register size
-available and adjust the code, or use smaller sub-group size to avoid high
-register pressure.
-*/
 __dpct_inline__ void
 native_q8_0_packed_kernel(const int8_t *__restrict__ qs,
                           const sycl::half *__restrict__ dpl,
@@ -2397,15 +1848,6 @@ native_q8_0_packed_kernel(const int8_t *__restrict__ qs,
                 partial[buf][item_ct1.get_local_id(1) - 1][j]
                        [item_ct1.get_local_id(2)] = tmp[j];
         }
-        /*
-        DPCT1118: SYCL group functions and algorithms must be encountered in
-        converged control flow. You may need to adjust the code.
-        */
-        /*
-        DPCT1065: Consider replacing sycl::nd_item::barrier() with
-        sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
-        better performance if there is no access to global memory.
-        */
         item_ct1.barrier();
         if (TS && item_ct1.get_local_id(1) ==
                       0) { // S26 STRATA_TSUM=1: one transposed butterfly,
@@ -2439,87 +1881,6 @@ native_q8_0_packed_kernel(const int8_t *__restrict__ qs,
     }
 }
 
-struct Q8Packed { const int8_t *qs; const sycl::half * d; int n_in, n_out; };
-std::unordered_map<const void*, Q8Packed>& q8_packed_registry() {
-    static std::unordered_map<const void*, Q8Packed> registry;
-    return registry;
-}
-
-template <int NCOLS>
-void q8_packed_launch(const Q8Packed &w, const Q81Block *x, float *y,
-                      dpct::queue_ptr s) {
-    const bool persist = w.n_in <= Q8P_PERSIST_MAX_IN;
-    const int grid = persist ? (std::min)(w.n_out, Q8P_PERSIST_GRID) : w.n_out;
-    if (s26_tsum_on())
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-        dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
-
-        s->parallel_for<dpct_kernel_name<class native_q8_0_packed_kernel_851f07,
-                                         dpct_kernel_scalar<NCOLS>,
-                                         dpct_kernel_scalar<true>>>(
-            sycl::nd_range<3>(sycl::range(1, 1, unsigned(grid)) *
-                                  sycl::range(1, WARPS, WARP),
-                              sycl::range(1, WARPS, WARP)),
-            exp_props,
-            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
-                native_q8_0_packed_kernel<NCOLS, true>(
-                    w.qs, w.d, x, y, w.n_in, w.n_out, persist ? grid : w.n_out);
-            });
-    } else {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-        dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
-
-        s->/*
-DPCT1050: The template argument of the dpct_kernel_name could not be
-deduced. You need to update this code.
-*/
-            parallel_for<
-                dpct_kernel_name<class native_q8_0_packed_kernel_56c826,
-                                 dpct_kernel_scalar<NCOLS>,
-                                 dpct_kernel_scalar<false>>>(
-                sycl::nd_range<3>(sycl::range(1, 1, unsigned(grid)) *
-                                      sycl::range(1, WARPS, WARP),
-                                  sycl::range(1, WARPS, WARP)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        native_q8_0_packed_kernel<NCOLS>(
-                            w.qs, w.d, x, y, w.n_in, w.n_out,
-                            persist ? grid : w.n_out);
-                    });
-    }
-}
-
-bool q8_packed_mmvq(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream) {
-    auto& registry = q8_packed_registry();
-    if (registry.empty() || (ncols > 1 && !g_multi_exact)) return false;   // packed = the EXACT layout only
-    const auto found = registry.find(weights);
-    if (found == registry.end() || found->second.n_in != n_in || found->second.n_out != n_out) return false;
-    validate_shape(n_in, ncols, 32);
-    validate_pointer(x_q8_1);
-    validate_pointer(y);
-    validate_stream(stream);
-    const auto* x = static_cast<const Q81Block*>(x_q8_1);
-    const auto s = strata::q_of(stream);
-    switch (ncols) {
-        case 1: q8_packed_launch<1>(found->second, x, y, s); break;
-        case 2: q8_packed_launch<2>(found->second, x, y, s); break;
-        case 3: q8_packed_launch<3>(found->second, x, y, s); break;
-        case 4: q8_packed_launch<4>(found->second, x, y, s); break;
-        case 5: q8_packed_launch<5>(found->second, x, y, s); break;
-        case 6: q8_packed_launch<6>(found->second, x, y, s); break;
-        case 7: q8_packed_launch<7>(found->second, x, y, s); break;
-        case 8: q8_packed_launch<8>(found->second, x, y, s); break;
-        default: throw std::invalid_argument("native MMVQ requires 1 <= ncols <= 8");
-    }
-    launch_check();
-    return true;
-}
-
-
 // ============================ STRATA_Q6_PACKED=1: the packed Q6_K head layout (opt-in) ============================
 //
 // The output heads (the main head, 248320 rows, and the MTP draft head's row subset) are Q6_K matrices of 2560-wide
@@ -2528,25 +1889,7 @@ bool q8_packed_mmvq(const void* weights, const void* x_q8_1, float* y, int n_in,
 // two words are aligned dword loads (non-temporal). Thread ownership (block tid / 32 + 4 i, word tid % 32), the
 // q6_q8_dot_impl expression, the per-thread order and the reduction are those of native_q6_k_mmvq_kernel<false> /
 // native_mmvq_multi_kernel<Q6KTraits, NC, 4, 1>: every output is bitwise equal. Persistent workgroups.
-int g_q6p_grid_override = 0;   // the self-test's grid sweep (STRATA_Q6P_SELFTEST=2)
-int q6p_grid() {
-    if (g_q6p_grid_override > 0) return g_q6p_grid_override;
-    static const int grid = [] {
-        const char* v = std::getenv("STRATA_Q6P_GRID");
-        const int g = v ? std::atoi(v) : 0;
-        return g > 0 ? g : 640;
-    }();
-    return grid;
-}
-
 template <int NCOLS, bool TS = false>
-/*
-DPCT1110: The total declared local variable size in device function
-native_q6_k_packed_kernel exceeds 128 bytes and may cause high register
-pressure. Consult with your hardware vendor to find the total register size
-available and adjust the code, or use smaller sub-group size to avoid high
-register pressure.
-*/
 __dpct_inline__ void native_q6_k_packed_kernel(
     const int *__restrict__ ql, const int *__restrict__ qh,
     const int8_t *__restrict__ sc, const sycl::half *__restrict__ dpl,
@@ -2595,15 +1938,6 @@ __dpct_inline__ void native_q6_k_packed_kernel(
                 partial[buf][item_ct1.get_local_id(1) - 1][j]
                        [item_ct1.get_local_id(2)] = tmp[j];
         }
-        /*
-        DPCT1118: SYCL group functions and algorithms must be encountered in
-        converged control flow. You may need to adjust the code.
-        */
-        /*
-        DPCT1065: Consider replacing sycl::nd_item::barrier() with
-        sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
-        better performance if there is no access to global memory.
-        */
         item_ct1.barrier();
         if (TS && item_ct1.get_local_id(1) ==
                       0) { // S26 STRATA_TSUM=1: one transposed butterfly,
@@ -2637,1069 +1971,8 @@ __dpct_inline__ void native_q6_k_packed_kernel(
     }
 }
 
-bool g_q6_bypass = false;   // the load-time self-test times the GGUF-layout kernels with the copy registered
-
-// the packed planes of one Q6_K matrix (owned: allocated by native_q6_k_pack, freed by native_q6_k_unpack)
-struct Q6Packed {
-    void *base; const int * ql; const int * qh; const int8_t * sc;
-    const sycl::half * d;
-    int n_in, n_out;
-};
-std::unordered_map<const void*, Q6Packed>& q6_packed_registry() {
-    static std::unordered_map<const void*, Q6Packed> registry;
-    return registry;
-}
-
-template <int NCOLS>
-void q6_packed_launch(const Q6Packed &w, const Q81Block *x, float *y,
-                      dpct::queue_ptr s) {
-    const int grid = (std::min)(w.n_out, q6p_grid());
-    if (s26_tsum_on())
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-        dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
-
-        s->parallel_for<dpct_kernel_name<class native_q6_k_packed_kernel_ee650b,
-                                         dpct_kernel_scalar<NCOLS>,
-                                         dpct_kernel_scalar<true>>>(
-            sycl::nd_range<3>(sycl::range(1, 1, unsigned(grid)) *
-                                  sycl::range(1, WARPS, WARP),
-                              sycl::range(1, WARPS, WARP)),
-            exp_props,
-            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
-                native_q6_k_packed_kernel<NCOLS, true>(
-                    w.ql, w.qh, w.sc, w.d, x, y, w.n_in, w.n_out, grid);
-            });
-    } else {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-        dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
-
-        s->/*
-DPCT1050: The template argument of the dpct_kernel_name could not be
-deduced. You need to update this code.
-*/
-            parallel_for<
-                dpct_kernel_name<class native_q6_k_packed_kernel_ca2554,
-                                 dpct_kernel_scalar<NCOLS>,
-                                 dpct_kernel_scalar<false>>>(
-                sycl::nd_range<3>(sycl::range(1, 1, unsigned(grid)) *
-                                      sycl::range(1, WARPS, WARP),
-                                  sycl::range(1, WARPS, WARP)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        native_q6_k_packed_kernel<NCOLS>(
-                            w.ql, w.qh, w.sc, w.d, x, y, w.n_in, w.n_out, grid);
-                    });
-    }
-}
-
-bool q6_packed_mmvq(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream) {
-    auto& registry = q6_packed_registry();
-    if (registry.empty() || g_q6_bypass || (ncols > 1 && !g_multi_exact)) return false;
-    const auto found = registry.find(weights);
-    if (found == registry.end() || found->second.n_in != n_in || found->second.n_out != n_out) return false;
-    validate_shape(n_in, ncols, 256);
-    validate_pointer(x_q8_1);
-    validate_pointer(y);
-    validate_stream(stream);
-    const auto* x = static_cast<const Q81Block*>(x_q8_1);
-    const auto s = strata::q_of(stream);
-    switch (ncols) {
-        case 1: q6_packed_launch<1>(found->second, x, y, s); break;
-        case 2: q6_packed_launch<2>(found->second, x, y, s); break;
-        case 3: q6_packed_launch<3>(found->second, x, y, s); break;
-        case 4: q6_packed_launch<4>(found->second, x, y, s); break;
-        case 5: q6_packed_launch<5>(found->second, x, y, s); break;
-        case 6: q6_packed_launch<6>(found->second, x, y, s); break;
-        case 7: q6_packed_launch<7>(found->second, x, y, s); break;
-        case 8: q6_packed_launch<8>(found->second, x, y, s); break;
-        default: throw std::invalid_argument("native MMVQ requires 1 <= ncols <= 8");
-    }
-    launch_check();
-    return true;
-}
 } // namespace
 
-bool native_q8_0_packed_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("STRATA_Q8_PACKED");
-        return v && v[0] == '1' && v[1] == '\0';
-    }();
-    return enabled;
-}
-
-bool native_q8_0_packed_eligible(int n_in, int n_out) {
-    return n_in > 0 && n_in % 32 == 0 && n_in / 32 >= 2 * WARPS * WARP / 8 && n_in <= Q8P_PERSIST_MAX_IN &&
-           n_out >= 2048;
-}
-
-void native_q8_0_pack_host(const void* gguf_blocks, void* out, int n_in, int n_out) {
-    const auto* blocks = static_cast<const Q80Block*>(gguf_blocks);
-    auto* qs = static_cast<int8_t*>(out);
-    auto *d = reinterpret_cast<sycl::half *>(qs + std::size_t(n_in) * n_out);
-    const std::size_t count = std::size_t(n_in / 32) * n_out;
-    for (std::size_t b = 0; b < count; ++b) {
-        std::memcpy(qs + b * 32, blocks[b].qs, 32);
-        std::memcpy(d + b, &blocks[b].d, sizeof(sycl::half));
-    }
-}
-
-void native_q8_0_packed_register(const void* gguf_weights, const void* packed, int n_in, int n_out) {
-    validate_pointer(gguf_weights);
-    validate_pointer(packed);
-    if (!native_q8_0_packed_eligible(n_in, n_out)) throw std::invalid_argument("Q8_0 packed: ineligible shape");
-    const auto* qs = static_cast<const int8_t*>(packed);
-    q8_packed_registry()[gguf_weights] = Q8Packed{
-        qs,
-        reinterpret_cast<const sycl::half *>(qs + std::size_t(n_in) * n_out),
-        n_in, n_out};
-}
-
-void native_q8_0_packed_unregister(const void* gguf_weights) { q8_packed_registry().erase(gguf_weights); }
-
-bool native_q6_k_packed_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("STRATA_Q6_PACKED");
-        return v && v[0] == '1' && v[1] == '\0';
-    }();
-    return enabled;
-}
-
-bool native_q6_k_pack(const void *weights, int n_in, int n_out,
-                      const char *what) try {
-    if (!weights || n_in <= 0 || n_in % 256 || n_in / 256 < WARPS * WARP / 32 || n_out < 2048) return false;
-    if (q6_packed_registry().count(weights)) return true;
-    const std::size_t nb = std::size_t(n_in / 256) * std::size_t(n_out);
-    const std::size_t bytes = nb * sizeof(Q6KBlock);
-    std::vector<Q6KBlock> host(nb);
-    /*
-    DPCT1026: The call to cudaGetLastError was removed because this
-    functionality is redundant in SYCL.
-    */
-    if (DPCT_CHECK_ERROR(dpct::get_in_order_queue()
-                             .memcpy(host.data(), weights, bytes)
-                             .wait()) != 0) {
-        ; return false;
-    }
-    // planes: ql | qh | scales | d, each 256-byte aligned
-    const std::size_t o_qh = (nb * 128 + 255) & ~std::size_t(255);
-    const std::size_t o_sc = (o_qh + nb * 64 + 255) & ~std::size_t(255);
-    const std::size_t o_d = (o_sc + nb * 16 + 255) & ~std::size_t(255);
-    const std::size_t total = o_d + nb * 2;
-    std::vector<uint8_t> packed(total, 0);
-    for (std::size_t b = 0; b < nb; ++b) {
-        std::memcpy(packed.data() + b * 128, host[b].ql, 128);
-        std::memcpy(packed.data() + o_qh + b * 64, host[b].qh, 64);
-        std::memcpy(packed.data() + o_sc + b * 16, host[b].scales, 16);
-        std::memcpy(packed.data() + o_d + b * 2, &host[b].d, 2);
-    }
-    void* dev = nullptr;
-    /*
-    DPCT1026: The call to cudaGetLastError was removed because this
-    functionality is redundant in SYCL.
-    */
-    if (DPCT_CHECK_ERROR(dev = (void *)sycl::malloc_device(
-                             total, dpct::get_in_order_queue())) != 0) {
-        ; return false;
-    }
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming in
-    the original code the source host memory is pageable memory. If the memory
-    is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    if (DPCT_CHECK_ERROR(dpct::get_in_order_queue().memcpy(dev, packed.data(),
-                                                           total).wait()) != 0) {
-        /*
-        DPCT1026: The call to cudaGetLastError was removed because this
-        functionality is redundant in SYCL.
-        */
-        sycl::free(dev, dpct::get_in_order_queue());; return false;
-    }
-    auto* base = static_cast<uint8_t*>(dev);
-    q6_packed_registry()[weights] =
-        Q6Packed{dev,
-                 reinterpret_cast<const int *>(base),
-                 reinterpret_cast<const int *>(base + o_qh),
-                 reinterpret_cast<const int8_t *>(base + o_sc),
-                 reinterpret_cast<const sycl::half *>(base + o_d),
-                 n_in,
-                 n_out};
-    std::fprintf(stderr, "strata: STRATA_Q6_PACKED=1 packed the %s (%d x %d, +%.1f MiB)\n", what, n_out, n_in,
-                 total / 1048576.0);
-    // STRATA_Q6P_SELFTEST=1: bitwise check against the GGUF-layout kernels (1..4 columns) and paired timings
-    if (const char* v = std::getenv("STRATA_Q6P_SELFTEST"); v && (v[0] == '1' || v[0] == '2')) {
-        dpct::queue_ptr s = &dpct::get_in_order_queue();
-        /*
-        DPCT1025: The SYCL queue is created ignoring the flag and priority
-        options.
-        */
-        s = dpct::get_current_device().create_queue(true);
-        const int nq = n_in / Q8K;
-        std::vector<Q81Block> hx(std::size_t(4) * nq);
-        uint32_t r = 12345u;
-        for (auto& blk : hx) {
-            for (auto& q : blk.qs) { r = r * 1664525u + 1013904223u; q = int8_t(int((r >> 24) & 255u) - 128); }
-            r = r * 1664525u + 1013904223u;
-            blk.ds = sycl::float2(0.001f + float(r >> 8) * 1e-9f, 0.0f)
-                         .convert<sycl::half, sycl::rounding_mode::rte>();
-        }
-        void *dx = nullptr, *ya = nullptr, *yb = nullptr;
-        dx = (void *)sycl::malloc_device(hx.size() * sizeof(Q81Block),
-                                         dpct::get_in_order_queue());
-        ya = (void *)sycl::malloc_device(std::size_t(4) * n_out * 4,
-                                         dpct::get_in_order_queue());
-        yb = (void *)sycl::malloc_device(std::size_t(4) * n_out * 4,
-                                         dpct::get_in_order_queue());
-        dpct::get_in_order_queue()
-            .memcpy(dx, hx.data(), hx.size() * sizeof(Q81Block))
-            .wait();
-        std::vector<float> a(std::size_t(4) * n_out), c(std::size_t(4) * n_out);
-        bool same = true;
-        for (int nc = 1; nc <= 4; ++nc) {
-            g_q6_bypass = true;
-            native_q6_k_mmvq(weights, dx, (float*) ya, n_in, n_out, nc, s);
-            g_q6_bypass = false;
-            native_q6_k_mmvq(weights, dx, (float*) yb, n_in, n_out, nc, s);
-            s->wait();
-            dpct::get_in_order_queue()
-                .memcpy(a.data(), ya, std::size_t(nc) * n_out * 4)
-                .wait();
-            dpct::get_in_order_queue()
-                .memcpy(c.data(), yb, std::size_t(nc) * n_out * 4)
-                .wait();
-            same = same && std::memcmp(a.data(), c.data(), std::size_t(nc) * n_out * 4) == 0;
-        }
-        dpct::event_ptr e0, e1;
-        e0 = new sycl::event(); e1 = new sycl::event();
-        for (int nc : {1, 2, 4}) {
-            std::vector<float> tb, tc;
-            for (int k = 0; k < 11; ++k) {
-                for (int pass = 0; pass < 2; ++pass) {
-                    const bool cand = (pass == 0) == (k % 2 == 1);
-                    g_q6_bypass = !cand;
-                    dpct::sync_barrier(e0, s);
-                    for (int it = 0; it < 5; ++it) native_q6_k_mmvq(weights, dx, (float*) (cand ? yb : ya), n_in, n_out, nc, s);
-                    dpct::sync_barrier(e1, s);
-                    e1->wait_and_throw();
-                    float ms = 0;
-                        ms = (e1->get_profiling_info<
-                                  sycl::info::event_profiling::command_end>() -
-                              e0->get_profiling_info<
-                                  sycl::info::event_profiling::
-                                      command_start>()) /
-                             1000000.0f;
-                    (cand ? tc : tb).push_back(ms * 1000.0f / 5);
-                }
-            }
-            g_q6_bypass = false;
-            std::sort(tb.begin(), tb.end()); std::sort(tc.begin(), tc.end());
-            std::fprintf(stderr, "strata: Q6_K packed self-test %s ncols %d: GGUF %.1f us (%.1f-%.1f), packed %.1f us "
-                         "(%.1f-%.1f), 11 paired samples\n", what, nc, tb[5], tb[0], tb[10], tc[5], tc[0], tc[10]);
-        }
-        std::fprintf(stderr, "strata: Q6_K packed self-test %s: outputs %s (1-4 columns)\n", what,
-                     same ? "BITWISE EQUAL" : "DIFFER");
-        if (v[0] == '2') {   // grid sweep of the packed kernel
-            for (int grid : {160, 320, 640, 1280, 2560, 5120, 20480}) {
-                g_q6p_grid_override = grid;
-                for (int nc : {1, 2, 4}) {
-                    std::vector<float> tc;
-                    for (int k = 0; k < 7; ++k) {
-                        dpct::sync_barrier(e0, s);
-                        for (int it = 0; it < 5; ++it) native_q6_k_mmvq(weights, dx, (float*) yb, n_in, n_out, nc, s);
-                        dpct::sync_barrier(e1, s);
-                        e1->wait_and_throw();
-                        float ms = 0; ms = (e1->get_profiling_info<
-                                                sycl::info::event_profiling::
-                                                    command_end>() -
-                                            e0->get_profiling_info<
-                                                sycl::info::event_profiling::
-                                                    command_start>()) /
-                                           1000000.0f;
-                        tc.push_back(ms * 1000.0f / 5);
-                    }
-                    std::sort(tc.begin(), tc.end());
-                    std::fprintf(stderr, "strata: Q6_K packed grid sweep %s grid %d ncols %d: %.1f us (%.1f-%.1f)\n",
-                                 what, grid, nc, tc[3], tc[0], tc[6]);
-                }
-            }
-            g_q6p_grid_override = 0;
-        }
-        dpct::destroy_event(e0); dpct::destroy_event(e1);
-        sycl::free(dx, dpct::get_in_order_queue());
-            sycl::free(ya, dpct::get_in_order_queue());
-            sycl::free(yb, dpct::get_in_order_queue());
-        dpct::get_current_device().destroy_queue(s);
-        if (!same) { native_q6_k_unpack(weights); return false; }
-    }
-    return true;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
-
-void native_q6_k_unpack(const void* weights) {
-    auto& registry = q6_packed_registry();
-    const auto found = registry.find(weights);
-    if (found == registry.end()) return;
-    sycl::free(found->second.base, dpct::get_in_order_queue());
-    registry.erase(found);
-}
-
-void native_mmvq_set_multi_exact(bool exact) { g_multi_exact = exact; }
-void native_mmvq_set_q6k_wide(bool on) { g_q6k_wide = on; }
-void native_q6_k_mmvq_stride224(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
-                                void* stream) {
-    const auto s = strata::q_of(stream);
-    switch (ncols) {
-        case 1: launch_q6k_wide224<1>(weights, x_q8_1, y, n_in, n_out, s); return;
-        case 2: launch_q6k_wide224<2>(weights, x_q8_1, y, n_in, n_out, s); return;
-        case 3: launch_q6k_wide224<3>(weights, x_q8_1, y, n_in, n_out, s); return;
-        case 4: launch_q6k_wide224<4>(weights, x_q8_1, y, n_in, n_out, s); return;
-        default: launch_q6k_wide224<6>(weights, x_q8_1, y, n_in, n_out, s); return;
-    }
-}
-bool native_mmvq_multi_exact() { return g_multi_exact; }
-
-std::size_t native_q8_1_bytes(int n_in, int ncols) {
-    validate_shape(n_in, ncols);
-    return std::size_t(ncols) * std::size_t(n_in / Q8K) * sizeof(Q81Block);
-}
-
-void native_quantize_q8_1(const float* x, void* x_q8_1, int n_in, int ncols, void* stream) {
-    validate_shape(n_in, ncols);
-    validate_pointer(x);
-    validate_pointer(x_q8_1);
-    validate_stream(stream);
-    // Columns are contiguous and n_in is a multiple of 32, so ncols columns quantize as one vector of
-    // ncols * n_in elements: every 32-element block stays inside one column.
-    const int n_total = n_in * ncols;
-    const unsigned blocks = unsigned((std::size_t(n_total) + QUANT_THREADS - 1) / QUANT_THREADS);
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        ((sycl::queue *)(strata::q_of(stream)))
-            ->parallel_for<
-                dpct_kernel_name<class native_quantize_q8_1_kernel_b480d2>>(
-                sycl::nd_range<3>(sycl::range(1, 1, blocks) *
-                                      sycl::range(1, 1, QUANT_THREADS),
-                                  sycl::range(1, 1, QUANT_THREADS)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        native_quantize_q8_1_kernel(
-                            x, static_cast<Q81Block *>(x_q8_1), n_total);
-                    });
-    }
-    launch_check();
-}
-
-void native_swiglu_quantize_q8_1(const float* gate, const float* up, void* x_q8_1,
-                                 int n_in, int ncols, void* stream) {
-    validate_shape(n_in, ncols);
-    validate_pointer(gate);
-    validate_pointer(up);
-    validate_pointer(x_q8_1);
-    validate_stream(stream);
-    const int n_total = n_in * ncols;
-    const unsigned blocks = unsigned((std::size_t(n_total) + QUANT_THREADS - 1) / QUANT_THREADS);
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-        dpct::has_capability_or_fail(
-            ((sycl::queue *)(strata::q_of(stream)))
-                ->get_device(),
-            {sycl::aspect::fp16});
-
-        ((sycl::queue *)(strata::q_of(stream)))
-            ->parallel_for<dpct_kernel_name<
-                class native_swiglu_quantize_q8_1_kernel_85e13e>>(
-                sycl::nd_range<3>(sycl::range(1, 1, blocks) *
-                                      sycl::range(1, 1, QUANT_THREADS),
-                                  sycl::range(1, 1, QUANT_THREADS)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        native_swiglu_quantize_q8_1_kernel(
-                            gate, up, static_cast<Q81Block *>(x_q8_1), n_total);
-                    });
-    }
-    launch_check();
-}
-
-void native_q5_k_mmvq(const void* weights, const void* x_q8_1, float* y,
-                      int n_in, int n_out, int ncols, void* stream) {
-    validate_shape(n_in, ncols, QK);
-    if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
-    validate_pointer(weights);
-    validate_pointer(x_q8_1);
-    validate_pointer(y);
-    validate_stream(stream);
-    if (try_wide<WideQ5K>(weights, x_q8_1, y, n_in, n_out, ncols, stream)) { launch_check(); return; }
-    STRATA_WAVE_MMVQ(Q5KTraits)
-    if (ncols > 1) {
-        launch_multi<Q5KTraits>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
-        launch_check();
-        return;
-    }
-    const auto* w = static_cast<const Q5KBlock*>(weights);
-    const auto* x = static_cast<const Q81Block*>(x_q8_1);
-    const auto s = strata::q_of(stream);
-    const dpct::dim3 threads(WARP, WARPS);
-    if (n_in / QK < VDR * WARPS * WARP / QI) {
-        const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
-        /*
-        DPCT1049: The work-group size passed to the SYCL kernel may exceed
-        the limit. To get the device limit, query
-        info::device::max_work_group_size. Adjust the work-group size if needed.
-        */
-        {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
-            dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
-
-            s->parallel_for<
-                dpct_kernel_name<class native_q5_k_mmvq_kernel_b1d5a2,
-                                 dpct_kernel_scalar<true>>>(
-                sycl::nd_range<3>(sycl::range(1, 1, blocks) * threads, threads),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        native_q5_k_mmvq_kernel<true>(w, x, y, n_in, n_out);
-                    });
-        }
-    } else {
-        /*
-        DPCT1049: The work-group size passed to the SYCL kernel may exceed
-        the limit. To get the device limit, query
-        info::device::max_work_group_size. Adjust the work-group size if needed.
-        */
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-        dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
-
-        s->parallel_for<dpct_kernel_name<class native_q5_k_mmvq_kernel_938b09,
-                                         dpct_kernel_scalar<false>>>(
-            sycl::nd_range<3>(sycl::range(1, 1, unsigned(n_out)) * threads,
-                              threads),
-            exp_props,
-            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
-                native_q5_k_mmvq_kernel<false>(w, x, y, n_in, n_out);
-            });
-    }
-    launch_check();
-}
-
-void native_q5_k_f32(const void* weights, const float* x, void* scratch_q8_1,
-                     float* y, int n_in, int n_out, int ncols, void* stream) {
-    // Validate all outputs before enqueueing the first operation.
-    validate_shape(n_in, ncols, QK);
-    if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
-    validate_pointer(weights);
-    validate_pointer(x);
-    validate_pointer(scratch_q8_1);
-    validate_pointer(y);
-    validate_stream(stream);
-    native_quantize_q8_1(x, scratch_q8_1, n_in, ncols, stream);
-    native_q5_k_mmvq(weights, scratch_q8_1, y, n_in, n_out, ncols, stream);
-}
-
-void native_q2_0_mmvq(const void* weights, const void* x_q8_1, float* y,
-                      int n_in, int n_out, int ncols, void* stream) {
-    validate_shape(n_in, ncols, 64);
-    if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
-    validate_pointer(weights);
-    validate_pointer(x_q8_1);
-    validate_pointer(y);
-    validate_stream(stream);
-    STRATA_WAVE_MMVQ(Q20Traits)
-    if (ncols > 1) {
-        launch_multi<Q20Traits>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
-        launch_check();
-        return;
-    }
-    const auto* w = static_cast<const Q20Block*>(weights);
-    const auto* x = static_cast<const Q81Block*>(x_q8_1);
-    const auto s = strata::q_of(stream);
-    const dpct::dim3 threads(WARP, WARPS);
-    if (n_in / 64 < WARPS * WARP / 2) {
-        const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
-        /*
-        DPCT1049: The work-group size passed to the SYCL kernel may exceed
-        the limit. To get the device limit, query
-        info::device::max_work_group_size. Adjust the work-group size if needed.
-        */
-        {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
-
-            s->parallel_for<
-                dpct_kernel_name<class native_q2_0_mmvq_kernel_dec305,
-                                 dpct_kernel_scalar<true>>>(
-                sycl::nd_range<3>(sycl::range(1, 1, blocks) * threads, threads),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        native_q2_0_mmvq_kernel<true>(w, x, y, n_in, n_out);
-                    });
-        }
-    } else {
-        /*
-        DPCT1049: The work-group size passed to the SYCL kernel may exceed
-        the limit. To get the device limit, query
-        info::device::max_work_group_size. Adjust the work-group size if needed.
-        */
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        s->parallel_for<dpct_kernel_name<class native_q2_0_mmvq_kernel_ef5f5c,
-                                         dpct_kernel_scalar<false>>>(
-            sycl::nd_range<3>(sycl::range(1, 1, unsigned(n_out)) * threads,
-                              threads),
-            exp_props,
-            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
-                native_q2_0_mmvq_kernel<false>(w, x, y, n_in, n_out);
-            });
-    }
-    launch_check();
-}
-
-void native_q2_0_f32(const void* weights, const float* x, void* scratch_q8_1,
-                     float* y, int n_in, int n_out, int ncols, void* stream) {
-    validate_shape(n_in, ncols, 64);
-    if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
-    validate_pointer(weights);
-    validate_pointer(x);
-    validate_pointer(scratch_q8_1);
-    validate_pointer(y);
-    validate_stream(stream);
-    native_quantize_q8_1(x, scratch_q8_1, n_in, ncols, stream);
-    native_q2_0_mmvq(weights, scratch_q8_1, y, n_in, n_out, ncols, stream);
-}
-
-void native_q3_k_mmvq(const void* weights, const void* x_q8_1, float* y,
-                      int n_in, int n_out, int ncols, void* stream) {
-    validate_shape(n_in, ncols, 256);
-    if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
-    validate_pointer(weights);
-    validate_pointer(x_q8_1);
-    validate_pointer(y);
-    validate_stream(stream);
-    STRATA_WAVE_MMVQ(Q3KTraits)
-    if (ncols > 1) {
-        launch_multi<Q3KTraits>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
-        launch_check();
-        return;
-    }
-    const auto* w = static_cast<const Q3KBlock*>(weights);
-    const auto* x = static_cast<const Q81Block*>(x_q8_1);
-    const auto s = strata::q_of(stream);
-    const dpct::dim3 threads(WARP, WARPS);
-    if (n_in / 256 < WARPS * WARP / 16) {
-        const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
-        /*
-        DPCT1049: The work-group size passed to the SYCL kernel may exceed
-        the limit. To get the device limit, query
-        info::device::max_work_group_size. Adjust the work-group size if needed.
-        */
-        {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
-
-            s->parallel_for<
-                dpct_kernel_name<class native_q3_k_mmvq_kernel_208be9,
-                                 dpct_kernel_scalar<true>>>(
-                sycl::nd_range<3>(sycl::range(1, 1, blocks) * threads, threads),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        native_q3_k_mmvq_kernel<true>(w, x, y, n_in, n_out);
-                    });
-        }
-    } else {
-        /*
-        DPCT1049: The work-group size passed to the SYCL kernel may exceed
-        the limit. To get the device limit, query
-        info::device::max_work_group_size. Adjust the work-group size if needed.
-        */
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        s->parallel_for<dpct_kernel_name<class native_q3_k_mmvq_kernel_926817,
-                                         dpct_kernel_scalar<false>>>(
-            sycl::nd_range<3>(sycl::range(1, 1, unsigned(n_out)) * threads,
-                              threads),
-            exp_props,
-            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
-                native_q3_k_mmvq_kernel<false>(w, x, y, n_in, n_out);
-            });
-    }
-    launch_check();
-}
-
-void native_q3_k_f32(const void* weights, const float* x, void* scratch_q8_1,
-                     float* y, int n_in, int n_out, int ncols, void* stream) {
-    validate_shape(n_in, ncols, 256);
-    if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
-    validate_pointer(weights);
-    validate_pointer(x);
-    validate_pointer(scratch_q8_1);
-    validate_pointer(y);
-    validate_stream(stream);
-    native_quantize_q8_1(x, scratch_q8_1, n_in, ncols, stream);
-    native_q3_k_mmvq(weights, scratch_q8_1, y, n_in, n_out, ncols, stream);
-}
-
-void native_iq4_xs_mmvq(const void* weights, const void* x_q8_1, float* y,
-                       int n_in, int n_out, int ncols, void* stream) {
-    validate_shape(n_in, ncols, 256);
-    if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
-    validate_pointer(weights);
-    validate_pointer(x_q8_1);
-    validate_pointer(y);
-    validate_stream(stream);
-    if (try_wide<WideIQ4XS>(weights, x_q8_1, y, n_in, n_out, ncols, stream)) { launch_check(); return; }
-    STRATA_WAVE_MMVQ(IQ4XSTraits)
-    if (ncols > 1) {
-        launch_multi<IQ4XSTraits>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
-        launch_check();
-        return;
-    }
-    const auto* w = static_cast<const IQ4XSBlock*>(weights);
-    const auto* x = static_cast<const Q81Block*>(x_q8_1);
-    const auto s = strata::q_of(stream);
-    const dpct::dim3 threads(WARP, WARPS);
-    if (n_in / 256 < 4 * WARPS * WARP / 32) {
-        const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
-        /*
-        DPCT1049: The work-group size passed to the SYCL kernel may exceed
-        the limit. To get the device limit, query
-        info::device::max_work_group_size. Adjust the work-group size if needed.
-        */
-        {
-            iq4nl_values.init(*s);
-
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
-
-            s->submit([&](sycl::handler &cgh) {
-                auto iq4nl_values_ptr_ct1 = iq4nl_values.get_ptr();
-
-                cgh.parallel_for<
-                    dpct_kernel_name<class native_iq4_xs_mmvq_kernel_22a688,
-                                     dpct_kernel_scalar<true>>>(
-                    sycl::nd_range<3>(sycl::range(1, 1, blocks) * threads,
-                                      threads),
-                    exp_props,
-                    [=](sycl::nd_item<3> item_ct1)
-                        [[sycl::reqd_sub_group_size(32)]] {
-                            native_iq4_xs_mmvq_kernel<true>(
-                                w, x, y, n_in, n_out, iq4nl_values_ptr_ct1);
-                        });
-            });
-        }
-    } else {
-        /*
-        DPCT1049: The work-group size passed to the SYCL kernel may exceed
-        the limit. To get the device limit, query
-        info::device::max_work_group_size. Adjust the work-group size if needed.
-        */
-        iq4nl_values.init(*s);
-
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        s->submit([&](sycl::handler &cgh) {
-            auto iq4nl_values_ptr_ct1 = iq4nl_values.get_ptr();
-
-            cgh.parallel_for<
-                dpct_kernel_name<class native_iq4_xs_mmvq_kernel_3ba00d,
-                                 dpct_kernel_scalar<false>>>(
-                sycl::nd_range<3>(sycl::range(1, 1, unsigned(n_out)) * threads,
-                                  threads),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        native_iq4_xs_mmvq_kernel<false>(w, x, y, n_in, n_out,
-                                                         iq4nl_values_ptr_ct1);
-                    });
-        });
-    }
-    launch_check();
-}
-
-void native_iq4_xs_f32(const void* weights, const float* x, void* scratch_q8_1,
-                      float* y, int n_in, int n_out, int ncols, void* stream) {
-    validate_shape(n_in, ncols, 256);
-    if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
-    validate_pointer(weights);
-    validate_pointer(x);
-    validate_pointer(scratch_q8_1);
-    validate_pointer(y);
-    validate_stream(stream);
-    native_quantize_q8_1(x, scratch_q8_1, n_in, ncols, stream);
-    native_iq4_xs_mmvq(weights, scratch_q8_1, y, n_in, n_out, ncols, stream);
-}
-
-void native_q4_k_mmvq(const void* weights, const void* x_q8_1, float* y,
-                      int n_in, int n_out, int ncols, void* stream) {
-    validate_shape(n_in, ncols, 256);
-    if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
-    validate_pointer(weights);
-    validate_pointer(x_q8_1);
-    validate_pointer(y);
-    validate_stream(stream);
-    if (try_wide<WideQ4K>(weights, x_q8_1, y, n_in, n_out, ncols, stream)) { launch_check(); return; }
-    STRATA_WAVE_MMVQ(Q4KTraits)
-    if (ncols > 1) {
-        launch_multi<Q4KTraits>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
-        launch_check();
-        return;
-    }
-    const auto* w = static_cast<const Q4KBlock*>(weights);
-    const auto* x = static_cast<const Q81Block*>(x_q8_1);
-    const auto s = strata::q_of(stream);
-    const dpct::dim3 threads(WARP, WARPS);
-    if (n_in / 256 < WARPS * WARP / 16) {
-        const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
-        /*
-        DPCT1049: The work-group size passed to the SYCL kernel may exceed
-        the limit. To get the device limit, query
-        info::device::max_work_group_size. Adjust the work-group size if needed.
-        */
-        {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
-            dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
-
-            s->parallel_for<
-                dpct_kernel_name<class native_q4_k_mmvq_kernel_da128d,
-                                 dpct_kernel_scalar<true>>>(
-                sycl::nd_range<3>(sycl::range(1, 1, blocks) * threads, threads),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        native_q4_k_mmvq_kernel<true>(w, x, y, n_in, n_out);
-                    });
-        }
-    } else {
-        /*
-        DPCT1049: The work-group size passed to the SYCL kernel may exceed
-        the limit. To get the device limit, query
-        info::device::max_work_group_size. Adjust the work-group size if needed.
-        */
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-        dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
-
-        s->parallel_for<dpct_kernel_name<class native_q4_k_mmvq_kernel_b29f4f,
-                                         dpct_kernel_scalar<false>>>(
-            sycl::nd_range<3>(sycl::range(1, 1, unsigned(n_out)) * threads,
-                              threads),
-            exp_props,
-            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
-                native_q4_k_mmvq_kernel<false>(w, x, y, n_in, n_out);
-            });
-    }
-    launch_check();
-}
-
-void native_q4_k_f32(const void* weights, const float* x, void* scratch_q8_1,
-                     float* y, int n_in, int n_out, int ncols, void* stream) {
-    validate_shape(n_in, ncols, 256);
-    if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
-    validate_pointer(weights);
-    validate_pointer(x);
-    validate_pointer(scratch_q8_1);
-    validate_pointer(y);
-    validate_stream(stream);
-    native_quantize_q8_1(x, scratch_q8_1, n_in, ncols, stream);
-    native_q4_k_mmvq(weights, scratch_q8_1, y, n_in, n_out, ncols, stream);
-}
-
-void native_q6_k_mmvq(const void* weights, const void* x_q8_1, float* y,
-                      int n_in, int n_out, int ncols, void* stream) {
-    if (q6_packed_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream)) return;   // STRATA_Q6_PACKED=1 heads
-    // SYCL port: 16-byte-load kernel for the decode shapes (ncols <= 4)
-    // With the aligned loads (load16_a2) the wide kernel wins on every Q6_K shape and window width: 2.6-3.4x the
-    // misaligned-load kernels in q6k_align_bench, decode 44.9 -> 54 tok/s on the Coder, output tokens identical.
-    // Without them (STRATA_MMVQ_A2=0) it won only on n_out >= 4096 at 1-4 columns, the old gate.
-    static const int wide_min = std::getenv("STRATA_MMVQ_WIDE_MIN") ? std::atoi(std::getenv("STRATA_MMVQ_WIDE_MIN")) : q6k_a2() ? 0 : 4096;
-    static const int wide_maxc = std::getenv("STRATA_MMVQ_WIDE_MAXC") ? std::atoi(std::getenv("STRATA_MMVQ_WIDE_MAXC")) : q6k_a2() ? 8 : 4;
-    if (g_q6k_wide && ncols >= 1 && ncols <= wide_maxc && n_in % 256 == 0 && n_out >= wide_min) {
-        const auto s = strata::q_of(stream);
-        switch (ncols) {
-            case 1: launch_q6k_wide<1>(weights, x_q8_1, y, n_in, n_out, s); return;
-            case 2: launch_q6k_wide<2>(weights, x_q8_1, y, n_in, n_out, s); return;
-            case 3: launch_q6k_wide<3>(weights, x_q8_1, y, n_in, n_out, s); return;
-            case 4: launch_q6k_wide<4>(weights, x_q8_1, y, n_in, n_out, s); return;
-            case 5: launch_q6k_wide<5>(weights, x_q8_1, y, n_in, n_out, s); return;
-            case 6: launch_q6k_wide<6>(weights, x_q8_1, y, n_in, n_out, s); return;
-            case 7: launch_q6k_wide<7>(weights, x_q8_1, y, n_in, n_out, s); return;
-            default: launch_q6k_wide<8>(weights, x_q8_1, y, n_in, n_out, s); return;
-        }
-    }
-    // SYCL port: the row-blocked kernel for the decode shapes (ncols <= 4)
-    if (ncols >= 1 && ncols <= 4 && rowwarp_rpw() > 0 && n_in % 256 == 0) {
-        dpct::queue_ptr s = strata::q_of(stream);
-        const int rpw = rowwarp_rpw();
-#define STRATA_RW(NC, RP) if (ncols == NC && rpw == RP) { launch_rowwarp<Q6KTraits, NC, RP>(weights, x_q8_1, y, n_in, n_out, s); return; }
-        STRATA_RW(1, 1) STRATA_RW(1, 2) STRATA_RW(1, 4) STRATA_RW(2, 1) STRATA_RW(2, 2) STRATA_RW(2, 4)
-        STRATA_RW(3, 1) STRATA_RW(3, 2) STRATA_RW(3, 4) STRATA_RW(4, 1) STRATA_RW(4, 2) STRATA_RW(4, 4)
-#undef STRATA_RW
-    }
-
-    validate_shape(n_in, ncols, 256);
-    if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
-    validate_pointer(weights);
-    validate_pointer(x_q8_1);
-    validate_pointer(y);
-    validate_stream(stream);
-    STRATA_WAVE_MMVQ(Q6KTraits)
-    if (ncols > 1) {
-        launch_multi<Q6KTraits>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
-        launch_check();
-        return;
-    }
-    const auto* w = static_cast<const Q6KBlock*>(weights);
-    const auto* x = static_cast<const Q81Block*>(x_q8_1);
-    const auto s = strata::q_of(stream);
-    const dpct::dim3 threads(WARP, WARPS);
-    if (n_in / 256 < WARPS * WARP / 32) {
-        const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
-        /*
-        DPCT1049: The work-group size passed to the SYCL kernel may exceed
-        the limit. To get the device limit, query
-        info::device::max_work_group_size. Adjust the work-group size if needed.
-        */
-        {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
-
-            s->parallel_for<
-                dpct_kernel_name<class native_q6_k_mmvq_kernel_4d887f,
-                                 dpct_kernel_scalar<true>>>(
-                sycl::nd_range<3>(sycl::range(1, 1, blocks) * threads, threads),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        native_q6_k_mmvq_kernel<true>(w, x, y, n_in, n_out);
-                    });
-        }
-    } else {
-        /*
-        DPCT1049: The work-group size passed to the SYCL kernel may exceed
-        the limit. To get the device limit, query
-        info::device::max_work_group_size. Adjust the work-group size if needed.
-        */
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        s->parallel_for<dpct_kernel_name<class native_q6_k_mmvq_kernel_19484e,
-                                         dpct_kernel_scalar<false>>>(
-            sycl::nd_range<3>(sycl::range(1, 1, unsigned(n_out)) * threads,
-                              threads),
-            exp_props,
-            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
-                native_q6_k_mmvq_kernel<false>(w, x, y, n_in, n_out);
-            });
-    }
-    launch_check();
-}
-
-void native_q6_k_f32(const void* weights, const float* x, void* scratch_q8_1,
-                     float* y, int n_in, int n_out, int ncols, void* stream) {
-    validate_shape(n_in, ncols, 256);
-    if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
-    validate_pointer(weights);
-    validate_pointer(x);
-    validate_pointer(scratch_q8_1);
-    validate_pointer(y);
-    validate_stream(stream);
-    native_quantize_q8_1(x, scratch_q8_1, n_in, ncols, stream);
-    native_q6_k_mmvq(weights, scratch_q8_1, y, n_in, n_out, ncols, stream);
-}
-
-void native_q4_0_mmvq(const void* weights, const void* x_q8_1, float* y,
-                       int n_in, int n_out, int ncols, void* stream) {
-    small_mmvq<Q40Block, 4>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
-}
-
-void native_q4_0_f32(const void* weights, const float* x, void* scratch_q8_1,
-                      float* y, int n_in, int n_out, int ncols, void* stream) {
-    small_f32<Q40Block, 4>(weights, x, scratch_q8_1, y, n_in, n_out, ncols, stream);
-}
-
-void native_q5_0_mmvq(const void* weights, const void* x_q8_1, float* y,
-                       int n_in, int n_out, int ncols, void* stream) {
-    small_mmvq<Q50Block, 4>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
-}
-
-void native_q5_0_f32(const void* weights, const float* x, void* scratch_q8_1,
-                      float* y, int n_in, int n_out, int ncols, void* stream) {
-    small_f32<Q50Block, 4>(weights, x, scratch_q8_1, y, n_in, n_out, ncols, stream);
-}
-
-template <int NCOLS>
-void q8_0_pair_launch(const Q80Block *w1, const Q80Block *w2, const Q81Block *x,
-                      float *y1, float *y2, int n_in, int n_out,
-                      dpct::queue_ptr s) {
-    using F = SmallTraits<Q80Block, 8>;
-    const dpct::dim3 threads(WARP, WARPS);
-    if (s26_tsum_on())
-        /*
-        DPCT1049: The work-group size passed to the SYCL kernel may exceed
-        the limit. To get the device limit, query
-        info::device::max_work_group_size. Adjust the work-group size if needed.
-        */
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-        dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
-
-        s->parallel_for<dpct_kernel_name<
-            class native_mmvq_multi_kernel_ab153b, F, dpct_kernel_scalar<NCOLS>,
-            dpct_kernel_scalar<WARPS>, dpct_kernel_scalar<1>,
-            dpct_kernel_scalar<true>, dpct_kernel_scalar<true>>>(
-            sycl::nd_range<3>(sycl::range(1, 1, unsigned(2 * n_out)) * threads,
-                              threads),
-            exp_props,
-            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
-                native_mmvq_multi_kernel<F, NCOLS, WARPS, 1, true, true>(
-                    w1, x, y1, n_in, n_out, w2, y2);
-            });
-    } else
-    /*
-    DPCT1049: The work-group size passed to the SYCL kernel may exceed
-    the limit. To get the device limit, query
-    info::device::max_work_group_size. Adjust the work-group size if needed.
-    */
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-        dpct::has_capability_or_fail(s->get_device(), {sycl::aspect::fp16});
-
-        s->parallel_for<dpct_kernel_name<
-            class native_mmvq_multi_kernel_50d9c5, F, dpct_kernel_scalar<NCOLS>,
-            dpct_kernel_scalar<WARPS>, dpct_kernel_scalar<1>,
-            dpct_kernel_scalar<false>, dpct_kernel_scalar<true>>>(
-            sycl::nd_range<3>(sycl::range(1, 1, unsigned(2 * n_out)) * threads,
-                              threads),
-            exp_props,
-            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
-                native_mmvq_multi_kernel<F, NCOLS, WARPS, 1, false, true>(
-                    w1, x, y1, n_in, n_out, w2, y2);
-            });
-    }
-}
-
-bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2,
-                      int n_in, int n_out, int ncols, void* stream) {
-    using F = SmallTraits<Q80Block, 8>;
-    // only where both calls would run native_mmvq_multi_kernel<F, ncols, WARPS, 1> (exact layout, not packed)
-    if (ggml_type != 8 || !g_multi_exact || ncols < 2 || ncols > 8 || n_out <= 0 || n_in <= 0 || n_in % 32 != 0 ||
-        n_in / F::DIV < F::BPI || !w1 || !w2 || !x_q8_1 || !y1 || !y2 || !stream)
-        return false;
-    const auto& reg = q8_packed_registry();
-    if (reg.count(w1) || reg.count(w2)) return false;
-    const auto* a = static_cast<const Q80Block*>(w1);
-    const auto* b = static_cast<const Q80Block*>(w2);
-    const auto* x = static_cast<const Q81Block*>(x_q8_1);
-    const auto s = strata::q_of(stream);
-    switch (ncols) {
-        case 2: q8_0_pair_launch<2>(a, b, x, y1, y2, n_in, n_out, s); break;
-        case 3: q8_0_pair_launch<3>(a, b, x, y1, y2, n_in, n_out, s); break;
-        case 4: q8_0_pair_launch<4>(a, b, x, y1, y2, n_in, n_out, s); break;
-        case 5: q8_0_pair_launch<5>(a, b, x, y1, y2, n_in, n_out, s); break;
-        case 6: q8_0_pair_launch<6>(a, b, x, y1, y2, n_in, n_out, s); break;
-        case 7: q8_0_pair_launch<7>(a, b, x, y1, y2, n_in, n_out, s); break;
-        default: q8_0_pair_launch<8>(a, b, x, y1, y2, n_in, n_out, s); break;
-    }
-    launch_check();
-    return true;
-}
-
-void native_q8_0_mmvq(const void* weights, const void* x_q8_1, float* y,
-                       int n_in, int n_out, int ncols, void* stream) {
-    if (q8_packed_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream)) return;   // STRATA_Q8_PACKED=1 tensors
-    if (try_wide32<Wide32Q8>(weights, x_q8_1, y, n_in, n_out, ncols, stream)) { launch_check(); return; }
-    small_mmvq<Q80Block, 8>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
-}
-
-void native_q8_0_f32(const void* weights, const float* x, void* scratch_q8_1,
-                      float* y, int n_in, int n_out, int ncols, void* stream) {
-    small_f32<Q80Block, 8>(weights, x, scratch_q8_1, y, n_in, n_out, ncols, stream);
-}
-
-void native_iq4_nl_mmvq(const void* weights, const void* x_q8_1, float* y,
-                       int n_in, int n_out, int ncols, void* stream) {
-    if (try_wide32<Wide32IQ4NL>(weights, x_q8_1, y, n_in, n_out, ncols, stream)) { launch_check(); return; }
-    small_mmvq<IQ4NLBlock, 4>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
-}
-
-void native_iq4_nl_f32(const void* weights, const float* x, void* scratch_q8_1,
-                      float* y, int n_in, int n_out, int ncols, void* stream) {
-    small_f32<IQ4NLBlock, 4>(weights, x, scratch_q8_1, y, n_in, n_out, ncols, stream);
-}
-
-bool native_mmvq_supported(int ggml_type) noexcept {
-    return ggml_type == 2 || ggml_type == 6 || ggml_type == 7 || ggml_type == 8 || ggml_type == 11 ||
-           ggml_type == 12 || ggml_type == 13 || ggml_type == 14 || ggml_type == 20 ||
-           ggml_type == 23 || ggml_type == 42 || ggml_type == 16 || ggml_type == 17 || ggml_type == 18 ||
-           ggml_type == 21 || ggml_type == 22 || ggml_type == 29;
-}
-
-std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out) {
-    int block_elems, block_bytes;
-    switch (ggml_type) {
-    case 2: block_elems = 32; block_bytes = 18; break;
-    case 6: block_elems = 32; block_bytes = 22; break;
-    case 7: block_elems = 32; block_bytes = 24; break;
-    case 8: block_elems = 32; block_bytes = 34; break;
-    case 20: block_elems = 32; block_bytes = 18; break;
-    case 11: block_elems = 256; block_bytes = 110; break;
-    case 12: block_elems = 256; block_bytes = 144; break;
-    case 13: block_elems = 256; block_bytes = 176; break;
-    case 14: block_elems = 256; block_bytes = 210; break;
-    case 23: block_elems = 256; block_bytes = 136; break;
-    case 42: block_elems = 64; block_bytes = 18; break;
-    case 16: case 17: case 18: case 21: case 22: case 29:
-        block_elems = 256; block_bytes = (int) iq_row_bytes(ggml_type, 256); break;
-    default: throw std::invalid_argument("unsupported native MMVQ GGML type");
-    }
-    validate_shape(n_in, 1, block_elems);
-    if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
-    const std::size_t row_bytes = std::size_t(n_in / block_elems) * block_bytes;
-    if (row_bytes > std::numeric_limits<std::size_t>::max() / std::size_t(n_out)) {
-        throw std::length_error("native MMVQ weight byte count overflows size_t");
-    }
-    return row_bytes * std::size_t(n_out);
-}
-
-void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y,
-                 int n_in, int n_out, int ncols, void* stream) {
-    switch (ggml_type) {
-    case 2: native_q4_0_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
-    case 6: native_q5_0_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
-    case 7: iq_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
-    case 8: native_q8_0_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
-    case 20: native_iq4_nl_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
-    case 11: native_q3_k_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
-    case 12: native_q4_k_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
-    case 13: native_q5_k_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
-    case 14: native_q6_k_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
-    case 23: native_iq4_xs_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
-    case 42: native_q2_0_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
-    case 16: case 17: case 18: case 21: case 22: case 29:
-        iq_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
-    default: throw std::invalid_argument("unsupported native MMVQ GGML type");
-    }
-}
+#include "native_mmvq.kern.inc"
 
 } // namespace strata::kernels

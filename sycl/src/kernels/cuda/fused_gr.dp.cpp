@@ -1,56 +1,13 @@
 // src/kernels/cuda/fused_gr.cu - see include/strata/kernels/fused_gr.hpp.
-#define DPCT_PROFILING_ENABLED
-#include <mutex>
-#include <unordered_map>
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
-#include "strata/sycl_queue.hpp"
-#include "strata/core/emulate.hpp"
+#include "strata/port.hpp"
 #include "strata/kernels/fused_gr.hpp"
-#include "strata/kernels/bf16_bits.hpp"
-#include "strata/kernels/verify_kernels.hpp"
-
-#include <atomic>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <random>
-#include <string>
-#include <vector>
+#include "fused_gr_shared.hpp"
 
 namespace strata::kernels {
 namespace {
 
-constexpr int N = 2560;         // n_embd
-constexpr int HC = 4;           // streams
-constexpr int D = N * HC;       // 10240
-constexpr int LR = 320;         // hc_lr
-constexpr int THREADS = 256;
-constexpr int WARPS = THREADS / 32;
-#if defined(__HIPCC__)
-constexpr int TILE = 1280;             // eight-token tile fits gfx1100's 64 KiB LDS limit
-#else
-constexpr int TILE = 2560;             // xn floats per token staged at a time: 320 chunks of 8, 10 per lane
-#endif
-constexpr int TQ = TILE / 8 / 32;      // uint4 weight chunks per lane per tile
-// SYCL port: the down kernel's 41 work-groups filled 15% of the B70's threads (metrics 2026-09-30); each row's
-// D = 4 tiles are split over DOWN_SPLIT work-groups that write partial sums, summed in a fixed order by the up
-// kernel (deterministic, unlike atomics) before the row's nonlinearity.
-#ifndef STRATA_GR_DOWN_SPLIT
-#define STRATA_GR_DOWN_SPLIT (D / TILE)   // 4: one tile per split (1: the unsplit order, for A/B)
-#endif
-constexpr int DOWN_SPLIT = STRATA_GR_DOWN_SPLIT;
-constexpr int DOWN_BLOCKS = LR / WARPS;          // 40 blocks of 8 rows; one more for the inject rows
-constexpr int UP_COLS = 32;                      // columns d per `up` block (x 4 streams = 128 rows)
-constexpr int UP_BLOCKS = N / UP_COLS;           // 80
-
 __dpct_inline__ float warp_sum(float v) {
 #pragma unroll
-    /*
-    DPCT1108: '__shfl_xor_sync' was migrated with the experimental feature
-    masked sub_group function which may not be supported by all compilers or
-    runtimes. You may need to adjust the code.
-    */
     for (int o = 16; o > 0; o >>= 1) v +=
         dpct::experimental::permute_sub_group_by_xor(
             0xffffffffu, sycl::ext::oneapi::this_work_item::get_sub_group(), v,
@@ -75,12 +32,6 @@ __dpct_inline__ float dot8(const sycl::uint4 w, const float *x) {
     return acc;
 }
 
-/*
-DPCT1110: The total declared local variable size in device function
-gr_down_kernel exceeds 128 bytes and may cause high register pressure. Consult
-with your hardware vendor to find the total register size available and adjust
-the code, or use smaller sub-group size to avoid high register pressure.
-*/
 __dpct_inline__ void gr_down_kernel(FusedGrArgs a) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
 auto &xn = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[D]>(
@@ -122,11 +73,6 @@ auto &xn = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[D]>(
         const float v = warp_sum(ss[c]);
         if (lane == 0) part[warp][c] = v;
     }
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
     if (t < HC) {
         float s = 0.0f;
@@ -135,19 +81,9 @@ auto &xn = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[D]>(
         s_rs[t] = sycl::rsqrt(s / (float)N + a.eps);
         if (item_ct1.get_group(2) == 0) a.rs[t] = s_rs[t];
     }
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
 #pragma unroll
     for (int i = t; i < D; i += THREADS) xn[i] *= s_rs[i / N];
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
     // 2. one warp per output row: 10240 bf16 = 1280 chunks of 8, 40 per lane.
     const bool inject_block = item_ct1.get_group(2) == DOWN_BLOCKS;
@@ -190,28 +126,13 @@ auto &lo = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[LR]>(
     const int d0 = item_ct1.get_group(2) * UP_COLS;
 #pragma unroll
     for (int k = t; k < LR; k += THREADS) lo[k] = a.lo[k];
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
     // 128 rows (4 streams x 32 columns), 16 per warp: 320 bf16 = 40 chunks of 8.
     for (int r = warp; r < HC * UP_COLS; r += WARPS) {
         const int c = r / UP_COLS, dd = r - c * UP_COLS, i = c * N + d0 + dd;
         const sycl::uint4 *w4 =
             reinterpret_cast<const sycl::uint4 *>(a.w_up + (size_t)i * LR);
-        /*
-        DPCT1098: The '*' expression is used instead of the __ldg call.
-        These two expressions do not provide the exact same functionality. Check
-        the generated code for potential precision and/or performance issues.
-        */
         float acc = dot8(*(w4 + lane), lo + lane * 8);
-        /*
-        DPCT1098: The '*' expression is used instead of the __ldg call.
-        These two expressions do not provide the exact same functionality. Check
-        the generated code for potential precision and/or performance issues.
-        */
         if (lane < LR / 8 - 32) acc +=
             dot8(*(w4 + 32 + lane), lo + (32 + lane) * 8);
         acc = warp_sum(acc);
@@ -226,11 +147,6 @@ auto &lo = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[LR]>(
             g[c][dd] = x * sigmoidf_(acc);
         }
     }
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
     if (t < UP_COLS) {
         float s = 0.0f;
@@ -241,22 +157,8 @@ auto &lo = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[LR]>(
 }
 
 // ================================ plan v0.3 P6: T tokens, one weight read ================================
-struct GrMulti {
-    FusedGrArgs a[kFusedGrMaxT];
-    float* xn;
-    int T;
-    float* part;   ///< [DOWN_SPLIT][kFusedGrMaxT][LR] partial row sums of the down kernel
-    int nsplit = DOWN_SPLIT;   ///< SYCL port: splits the up kernel sums (1 after the sliced down kernel's reduce)
-    float* part2 = nullptr;    ///< SYCL port: [GRS_SLICES][kFusedGrMaxT][LR + HC] slice partials of the sliced kernel
-};
 
 // Step 1 of `gr_down_kernel`, one block per token, same threads and reduction order: rs[t] and xn[t] to global.
-/*
-DPCT1110: The total declared local variable size in device function
-gr_norm_multi_kernel exceeds 128 bytes and may cause high register pressure.
-Consult with your hardware vendor to find the total register size available and
-adjust the code, or use smaller sub-group size to avoid high register pressure.
-*/
 __dpct_inline__ void gr_norm_multi_kernel(GrMulti m) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
 auto &part =
@@ -297,11 +199,6 @@ auto &part =
         const float v = warp_sum(ss[c]);
         if (lane == 0) part[warp][c] = v;
     }
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
     if (t < HC) {
         float s = 0.0f;
@@ -310,11 +207,6 @@ auto &part =
         s_rs[t] = sycl::rsqrt(s / (float)N + a.eps);
         a.rs[t] = s_rs[t];
     }
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
 #pragma unroll
     for (int i = t; i < D; i += THREADS) xn[i] *= s_rs[i / N];
@@ -373,10 +265,6 @@ __dpct_inline__ void gr_norm_split_port_kernel(GrMulti m) {
         *reinterpret_cast<sycl::float4*>(xn + i) = sycl::float4(x.x() * rs, x.y() * rs, x.z() * rs, x.w() * rs);
     }
 }
-bool gr_norm_split() {   // default; STRATA_GR_NORM_SPLIT=0: one work-group per token
-    static const bool v = std::getenv("STRATA_GR_NORM_SPLIT") == nullptr || std::atoi(std::getenv("STRATA_GR_NORM_SPLIT")) != 0;
-    return v;
-}
 
 // Step 2 of `gr_down_kernel` for T tokens.  One warp per row (so each lane accumulates the same chunks in the
 // same order as the single-token kernel); per tile the lane's weight chunks are loaded BEFORE the activation
@@ -390,12 +278,6 @@ bool gr_norm_split() {   // default; STRATA_GR_NORM_SPLIT=0: one work-group per 
 // for the weight prefetch); smaller tiles raise how many blocks share an SM (the 41-block grid), e.g. three blocks
 // of four tokens instead of one on sm_75.
 template <int TILEV, int MAX_T = kFusedGrMaxT>
-/*
-DPCT1110: The total declared local variable size in device function
-gr_down_multi_kernel exceeds 128 bytes and may cause high register pressure.
-Consult with your hardware vendor to find the total register size available and
-adjust the code, or use smaller sub-group size to avoid high register pressure.
-*/
 __dpct_inline__ void gr_down_multi_kernel(GrMulti m, uint8_t *dpct_local) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     constexpr int TQ = TILEV / 8 / 32; // uint4 weight chunks per lane per tile
@@ -416,24 +298,9 @@ __dpct_inline__ void gr_down_multi_kernel(GrMulti m, uint8_t *dpct_local) {
         sycl::uint4 wv[TQ];
         if (active) {
 #pragma unroll
-            /*
-            DPCT1098: The '*' expression is used instead of the __ldg call.
-            These two expressions do not provide the exact same functionality.
-            Check the generated code for potential precision and/or performance
-            issues.
-            */
             for (int q = 0; q < TQ; ++q)
                 wv[q] = *(w4 + base / 8 + lane + 32 * q);
         }
-        /*
-        DPCT1118: SYCL group functions and algorithms must be encountered in
-        converged control flow. You may need to adjust the code.
-        */
-        /*
-        DPCT1065: Consider replacing sycl::nd_item::barrier() with
-        sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
-        better performance if there is no access to global memory.
-        */
         item_ct1.barrier(); // the previous tile is consumed
         const sycl::float4 *src4 = reinterpret_cast<const sycl::float4 *>(m.xn);
         sycl::float4 *tile4 = reinterpret_cast<sycl::float4 *>(tile);
@@ -441,15 +308,6 @@ __dpct_inline__ void gr_down_multi_kernel(GrMulti m, uint8_t *dpct_local) {
             const int k = i / (TILEV / 4), off = i - k * (TILEV / 4);
             tile4[i] = src4[((size_t) k * D + base) / 4 + off];
         }
-        /*
-        DPCT1118: SYCL group functions and algorithms must be encountered in
-        converged control flow. You may need to adjust the code.
-        */
-        /*
-        DPCT1065: Consider replacing sycl::nd_item::barrier() with
-        sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
-        better performance if there is no access to global memory.
-        */
         item_ct1.barrier();
         if (!active) continue;
 #pragma unroll
@@ -528,7 +386,6 @@ __dpct_inline__ void gr_down_multi_direct_kernel(GrMulti m) {
 // columns [128 s, 128 s + 128) of all 324 rows (320 down + 4 inject): it stages that slice of xn for the T tokens
 // once (<= 4 KB of SLM) and streams the rows through it, 4 lanes per row (one 64-byte line per step), reducing over
 // those 4 lanes once per row. gr_down_reduce then sums the 80 slice partials in a fixed order.
-constexpr int GRS_COLS = 128, GRS_SLICES = D / GRS_COLS, GRS_ROWS = LR + HC;   // 80 slices, 324 rows
 __dpct_inline__ void gr_down_sliced_kernel(GrMulti m, float* tile) {
     auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const int t = (int) item.get_local_id(2), lane = t & 31, warp = t >> 5;
@@ -579,36 +436,9 @@ __dpct_inline__ void gr_down_reduce_kernel(GrMulti m) {
     if (r < LR) m.part[(size_t) k * LR + r] = x;   // split 0
     else m.a[k].inject_out[r - LR] = x;
 }
-bool gr_down_sliced() {   // default (gr_bench: GR read 108.6 -> 76.5 us at 6 tokens); STRATA_GR_DOWN_SLICED=0: direct
-    static const bool v = std::getenv("STRATA_GR_DOWN_SLICED") == nullptr || std::atoi(std::getenv("STRATA_GR_DOWN_SLICED")) != 0;
-    return v;
-}
-float* slice_partials(sycl::queue* q) {
-    static std::mutex mu;
-    static std::unordered_map<sycl::queue*, float*> bufs;
-    std::lock_guard<std::mutex> lk(mu);
-    auto it = bufs.find(q);
-    if (it != bufs.end()) return it->second;
-    float* p = sycl::malloc_device<float>((size_t) GRS_SLICES * kFusedGrMaxT * GRS_ROWS, *q);
-    bufs[q] = p;
-    return p;
-}
-bool gr_down_direct() {   // default; STRATA_GR_DOWN_DIRECT=0: the tiled kernel (gr_bench: 13-19% slower at 3-6 tokens)
-    static const bool v = std::getenv("STRATA_GR_DOWN_DIRECT") == nullptr || std::atoi(std::getenv("STRATA_GR_DOWN_DIRECT")) != 0;
-    return v;
-}
-
-constexpr int UPM_COLS = 16;                      // columns per block (x 4 streams = 64 rows, 8 per warp)
-constexpr int UPM_BLOCKS = N / UPM_COLS;          // 160
 
 // `gr_up_kernel` for T tokens: each row of w_up read once; the T dots reduced by xor so every lane holds every
 // sum, and lane k runs token k's epilogue - the T epilogues in parallel instead of one after another.
-/*
-DPCT1110: The total declared local variable size in device function
-gr_up_multi_kernel exceeds 128 bytes and may cause high register pressure.
-Consult with your hardware vendor to find the total register size available and
-adjust the code, or use smaller sub-group size to avoid high register pressure.
-*/
 __dpct_inline__ void gr_up_multi_kernel(GrMulti m) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
 auto &lo = *sycl::ext::oneapi::group_local_memory_for_overwrite<
@@ -631,27 +461,12 @@ auto &lo = *sycl::ext::oneapi::group_local_memory_for_overwrite<
         lo[k][r] = v;
         m.a[k].lo[r] = v;
     }
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
     for (int r = warp; r < HC * UPM_COLS; r += WARPS) {
         const int c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
         const sycl::uint4 *w4 =
             reinterpret_cast<const sycl::uint4 *>(m.a[0].w_up + (size_t)i * LR);
-        /*
-        DPCT1098: The '*' expression is used instead of the __ldg call.
-        These two expressions do not provide the exact same functionality. Check
-        the generated code for potential precision and/or performance issues.
-        */
         const sycl::uint4 wa = *(w4 + lane);
-        /*
-        DPCT1098: The '*' expression is used instead of the __ldg call.
-        These two expressions do not provide the exact same functionality. Check
-        the generated code for potential precision and/or performance issues.
-        */
         const sycl::uint4 wb =
             lane < LR / 8 - 32 ? *(w4 + 32 + lane) : sycl::uint4(0, 0, 0, 0);
         // the epilogue inputs of this lane's token, fetched while the dots run
@@ -683,11 +498,6 @@ auto &lo = *sycl::ext::oneapi::group_local_memory_for_overwrite<
             g[lane][c][dd] = x * sigmoidf_(mine);
         }
     }
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
     for (int i = t; i < T * UPM_COLS; i += THREADS) {
         const int k = i / UPM_COLS, col = i - k * UPM_COLS;
@@ -708,16 +518,9 @@ auto &lo = *sycl::ext::oneapi::group_local_memory_for_overwrite<
 // opt-in.  Dynamic shared memory is T * (N / S) floats: S (1 or 2 column halves) is the smallest that fits the
 // card's opt-in limit at kFusedGrMaxT tokens (Ampere 99 KB: S = 1; Turing / HIP 64 KB: S = 2); a card where
 // neither fits keeps the default kernels.
-constexpr int PR = LR + HC;                        // partial rows per (token, stream): 320 down + 4 inject
 constexpr int TQ3 = N / 8 / 32;                    // uint4 weight chunks per lane in one stream's slice (10)
 
 template <int S>
-/*
-DPCT1110: The total declared local variable size in device function
-gr_down_v3_kernel exceeds 128 bytes and may cause high register pressure.
-Consult with your hardware vendor to find the total register size available and
-adjust the code, or use smaller sub-group size to avoid high register pressure.
-*/
 __dpct_inline__ void gr_down_v3_kernel(GrMulti m, float *__restrict__ part,
                                        float *__restrict__ ssg,
                                        uint8_t *dpct_local) {
@@ -747,11 +550,6 @@ __dpct_inline__ void gr_down_v3_kernel(GrMulti m, float *__restrict__ part,
         const sycl::uint4 *w4 = reinterpret_cast<const sycl::uint4 *>(
             wbase + (size_t)(row0 + r) * D + (size_t)c * N + (size_t)h * SL);
 #pragma unroll
-        /*
-        DPCT1098: The '*' expression is used instead of the __ldg call.
-        These two expressions do not provide the exact same functionality. Check
-        the generated code for potential precision and/or performance issues.
-        */
         for (int q = 0; q < TQS; ++q) wv[r][q] = *(w4 + lane + 32 * q);
     }
     float ssp[kFusedGrMaxT];
@@ -791,11 +589,6 @@ __dpct_inline__ void gr_down_v3_kernel(GrMulti m, float *__restrict__ part,
         const float v = warp_sum(ssp[k]);
         if (lane == 0) red[warp][k] = v;
     }
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
     if (rg == 0 && t < T) {
         float sum = 0.0f;
@@ -828,12 +621,6 @@ __dpct_inline__ void gr_down_v3_kernel(GrMulti m, float *__restrict__ part,
 }
 
 template <int S>
-/*
-DPCT1110: The total declared local variable size in device function
-gr_up_v3_kernel exceeds 128 bytes and may cause high register pressure. Consult
-with your hardware vendor to find the total register size available and adjust
-the code, or use smaller sub-group size to avoid high register pressure.
-*/
 __dpct_inline__ void gr_up_v3_kernel(GrMulti m, const float *__restrict__ part,
                                      const float *__restrict__ ssg) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
@@ -859,11 +646,6 @@ auto &lo = *sycl::ext::oneapi::group_local_memory_for_overwrite<
         rsS[k][c] = r;
         if (item_ct1.get_group(2) == 0) m.a[k].rs[c] = r;
     }
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
     for (int i = t; i < T * LR; i += THREADS) {
         const int k = i / LR, r = i - k * LR;
@@ -892,11 +674,6 @@ auto &lo = *sycl::ext::oneapi::group_local_memory_for_overwrite<
             m.a[k].inject_out[cc] = sum;
         }
     }
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
 #pragma unroll
     for (int q = 0; q < RPW; ++q) {
@@ -904,17 +681,7 @@ auto &lo = *sycl::ext::oneapi::group_local_memory_for_overwrite<
         const int c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
         const sycl::uint4 *w4 =
             reinterpret_cast<const sycl::uint4 *>(m.a[0].w_up + (size_t)i * LR);
-        /*
-        DPCT1098: The '*' expression is used instead of the __ldg call.
-        These two expressions do not provide the exact same functionality. Check
-        the generated code for potential precision and/or performance issues.
-        */
         const sycl::uint4 wa = *(w4 + lane);
-        /*
-        DPCT1098: The '*' expression is used instead of the __ldg call.
-        These two expressions do not provide the exact same functionality. Check
-        the generated code for potential precision and/or performance issues.
-        */
         const sycl::uint4 wb =
             lane < LR / 8 - 32 ? *(w4 + 32 + lane) : sycl::uint4(0, 0, 0, 0);
         float rv = 0.0f, wn = 0.0f, bo = 0.0f, ip = 0.0f;
@@ -944,11 +711,6 @@ auto &lo = *sycl::ext::oneapi::group_local_memory_for_overwrite<
             g[lane][c][dd] = x * sigmoidf_(mine);
         }
     }
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
     for (int i = t; i < T * UPM_COLS; i += THREADS) {
         const int k = i / UPM_COLS, col = i - k * UPM_COLS;
@@ -975,19 +737,7 @@ auto &lo = *sycl::ext::oneapi::group_local_memory_for_overwrite<
 //    weights are loaded while the current one is used.  A tile is 160 = 5 x 32 chunks of 8, so a lane still
 //    accumulates its chunks lane + 32 q in ascending order, as in the plain read with either tile.  Before sm_80
 //    (and on HIP) the staging is a plain copy: the same bits, only not asynchronous.
-constexpr int kHcPlain = 1, kHcSplit = 2, kHcStaged = 3;
-constexpr int H_TILE = 1280;                          // staged tile: half a stream = 160 chunks of 8, 5 per lane
-constexpr int HQ = H_TILE / 8 / 32;
-constexpr int N_HTILES = D / H_TILE;                  // 8
-static_assert(N % H_TILE == 0, "a staged tile never straddles two streams");
-static_assert(H_TILE % 256 == 0, "a staged tile holds whole rounds of 32 chunks: the plain read's lane order");
 
-/*
-DPCT1110: The total declared local variable size in device function
-gr_norm_split_kernel exceeds 128 bytes and may cause high register pressure.
-Consult with your hardware vendor to find the total register size available and
-adjust the code, or use smaller sub-group size to avoid high register pressure.
-*/
 __dpct_inline__ void gr_norm_split_kernel(GrMulti m) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
 auto &part = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[WARPS]>(
@@ -1018,11 +768,6 @@ auto &part = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[WARPS]>(
     }
     const float v = warp_sum(ss);
     if (lane == 0) part[warp] = v;
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
     if (t == 0) {
         float s = 0.0f;
@@ -1031,11 +776,6 @@ auto &part = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[WARPS]>(
         s_rs = sycl::rsqrt(s / (float)N + a.eps);
         a.rs[c] = s_rs;
     }
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
     const float rs = s_rs;
     for (int i = t * 4; i < D; i += THREADS * 4) {
@@ -1144,12 +884,6 @@ __dpct_inline__ void stage_htile(const GrMulti &m, int T, int h,
 }
 
 template <int MAX_T = kFusedGrMaxT>
-/*
-DPCT1110: The total declared local variable size in device function
-gr_down_staged_kernel exceeds 128 bytes and may cause high register pressure.
-Consult with your hardware vendor to find the total register size available and
-adjust the code, or use smaller sub-group size to avoid high register pressure.
-*/
 __dpct_inline__ void gr_down_staged_kernel(GrMulti m, uint8_t *dpct_local) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     auto hbuf = (sycl::float4 *)dpct_local; // 2 buffers x [T][2][160] float4
@@ -1167,11 +901,6 @@ __dpct_inline__ void gr_down_staged_kernel(GrMulti m, uint8_t *dpct_local) {
     sycl::uint4 wv[HQ], wnext[HQ];
     if (active) {
 #pragma unroll
-        /*
-        DPCT1098: The '*' expression is used instead of the __ldg call.
-        These two expressions do not provide the exact same functionality. Check
-        the generated code for potential precision and/or performance issues.
-        */
         for (int q = 0; q < HQ; ++q) wv[q] = *(w4 + lane + 32 * q);
     }
     stage_htile(m, T, 0, hbuf, t);
@@ -1182,26 +911,11 @@ __dpct_inline__ void gr_down_staged_kernel(GrMulti m, uint8_t *dpct_local) {
     for (int h = 0; h < N_HTILES; ++h) {
         if (active && h + 1 < N_HTILES) {
 #pragma unroll
-            /*
-            DPCT1098: The '*' expression is used instead of the __ldg call.
-            These two expressions do not provide the exact same functionality.
-            Check the generated code for potential precision and/or performance
-            issues.
-            */
             for (int q = 0; q < HQ; ++q)
                 wnext[q] = *(w4 + (h + 1) * (H_TILE / 8) + lane + 32 * q);
         }
         if (h + 1 < N_HTILES) cp_async_wait1();         // tile h has landed (h + 1 may still be on its way)
         else cp_async_wait0();
-        /*
-        DPCT1118: SYCL group functions and algorithms must be encountered in
-        converged control flow. You may need to adjust the code.
-        */
-        /*
-        DPCT1065: Consider replacing sycl::nd_item::barrier() with
-        sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
-        better performance if there is no access to global memory.
-        */
         item_ct1.barrier();
         const sycl::float4 *cur = hbuf + (h & 1) * buf_f4;
         if (active) {
@@ -1217,15 +931,6 @@ __dpct_inline__ void gr_down_staged_kernel(GrMulti m, uint8_t *dpct_local) {
                 }
             }
         }
-        /*
-        DPCT1118: SYCL group functions and algorithms must be encountered in
-        converged control flow. You may need to adjust the code.
-        */
-        /*
-        DPCT1065: Consider replacing sycl::nd_item::barrier() with
-        sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
-        better performance if there is no access to global memory.
-        */
         item_ct1.barrier(); // every warp is done with buffer h & 1
         if (h + 2 < N_HTILES) stage_htile(m, T, h + 2, hbuf + (h & 1) * buf_f4, t);
         cp_async_commit();                              // an empty group at the end keeps the wait counts simple
@@ -1251,977 +956,8 @@ __dpct_inline__ void gr_down_staged_kernel(GrMulti m, uint8_t *dpct_local) {
     }
 }
 
-// The tokens a down kernel may carry in one launch on the current card, and the plain read's tile: the plain read
-// stages n_tok * TILEV floats (1280 on sm_75, 2560 elsewhere), staged two tiles of n_tok * H_TILE.  The shared-memory
-// opt-in is set here once per device (a per-DEVICE setting: a layer split runs these kernels on two cards).
-int down_chunk(bool staged, int* tile_out) {
-    static bool attr[64] = {};
-    static int chunk[64] = {};   // tokens the plain down kernel may carry in one launch on this card
-    static int chunk_staged[64] = {};  // the same for staged
-    static int tile[64] = {};    // the plain down kernel's TILEV on this card (1280 on sm_75, 2560 elsewhere)
-    int dev = 0;
-    dev = dpct::get_current_device_id();
-    if (dev < 0 || dev >= 64) {
-        *tile_out = 2560;
-        return kFusedGrMaxT;
-    }
-    if (!attr[dev]) {
-        int optin = 0;
-        /*
-        DPCT1019: local_mem_size in SYCL is not a complete equivalent of
-        cudaDevAttrMaxSharedMemoryPerBlockOptin in CUDA. You may need to adjust
-        the code.
-        */
-        optin = dpct::get_device(dev).get_local_mem_size();
-        optin = strata::smem_optin_of(optin);   // STRATA_EMULATE_CC (tests only)
-        // the down kernel stages n_tok*TILEV floats of dynamic shared memory - 80 KB at the full 8 tokens of the
-        // CUDA tile.  sm_75 gets the smaller tile: all eight tokens fit one 40 KiB launch there (no more slicing),
-        // the TQ-5 prefetch holds half the registers, and the smaller blocks raise how many of the 41-block grid
-        // share an SM.  Cards whose opt-in is still below that (or that report no opt-in at all) slice the tokens;
-        // the down kernel's outputs (lo, inject_out) are strictly per-token, so the chunk boundaries are safe, and
-        // the up kernel below still sees every token of the batch in one launch.
-#if defined(__HIPCC__)
-        const bool small_tile = true;   // all eight tokens fit gfx1100's 64 KiB LDS at this tile
-#else
-        int cc_maj = 0, cc_min = 0;
-        cc_maj = dpct::get_device(dev).get_major_version();
-        cc_min = dpct::get_device(dev).get_minor_version();
-        const bool small_tile = strata::cc_major_of(cc_maj) * 10 + strata::cc_minor_of(cc_min) == 75;
-#endif
-        const int tv = small_tile ? 1280 : 2560;
-        tile[dev] = tv;
-        int want = (int) (kFusedGrMaxT * tv * sizeof(float));
-        if (optin > 0 && want > optin) want = optin;
-        if (small_tile) {
-            /*
-            DPCT1026: The call to cudaFuncSetAttribute was removed because
-            SYCL currently does not support corresponding setting.
-            */
-        } else {
-            /*
-            DPCT1026: The call to cudaFuncSetAttribute was removed because
-            SYCL currently does not support corresponding setting.
-            */
-        }
-        int want_staged = (int) (2 * kFusedGrMaxT * H_TILE * sizeof(float));
-        if (optin > 0 && want_staged > optin) want_staged = optin;
-        /*
-        DPCT1026: The call to cudaFuncSetAttribute was removed because SYCL
-        currently does not support corresponding setting.
-        */
-        /*
-        DPCT1026: The call to cudaGetLastError was removed because this
-        functionality is redundant in SYCL.
-        */
-; // drop any error the attempt left behind
-  // The opt-in is a promise a pre-Volta card does not keep: an sm_60 answers
-  // 65536 and accepts the cudaFuncSetAttribute for 61440 B, then fails the
-  // LAUNCH with "invalid argument".  What such a card will launch is its
-  // per-block limit, so the capacity comes from that below sm_70 - the same
-  // tokens the "no opt-in" branch assumes, but taken from the attribute that is
-  // actually enforced.
-#if defined(__HIPCC__)
-        const int usable = optin > 0 ? optin : 48 * 1024;
-#else
-        int cc = 0, per_block = 0;
-        cc = dpct::get_device(dev).get_major_version();
-        per_block = (int) dpct::get_device(dev).get_local_mem_size();   // SYCL: the work-group local memory
-        cc = strata::cc_major_of(cc);
-        const int usable = (cc >= 7 && optin > 0) ? optin : per_block;
-#endif
-        const int capacity = usable / (int) (tv * sizeof(float));
-        chunk[dev] = capacity < 1 ? 1 : (capacity > kFusedGrMaxT ? kFusedGrMaxT : capacity);
-        const int capacity_staged = usable / (int) (2 * H_TILE * sizeof(float));
-        chunk_staged[dev] = capacity_staged < 1 ? 1 : (capacity_staged > kFusedGrMaxT ? kFusedGrMaxT : capacity_staged);
-        attr[dev] = true;
-    }
-    *tile_out = tile[dev] ? tile[dev] : 2560;
-    return staged ? chunk_staged[dev] : chunk[dev];
-}
-
-// The multi read as `variant` (kHcPlain, kHcSplit or kHcStaged): the norm, the down projection in launches of as
-// many tokens as fit the card, the up projection; the profile's stamps after the norm and after the down projection.
-// kHcPlain is the default read exactly as before (never main's opt-in STRATA_GR_V3 path, which fused_gr_read_multi
-// takes first).
-void launch_multi(const GrMulti &m, int variant, dpct::queue_ptr st,
-                  unsigned long long *stamp_buf, int stamp_i0) {
-    const int n_tok = m.T;
-    if (variant >= kHcSplit) {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        st->parallel_for<dpct_kernel_name<class gr_norm_split_kernel_200589>>(
-            sycl::nd_range<3>(sycl::range(1, HC, (unsigned)n_tok) *
-                                  sycl::range(1, 1, THREADS),
-                              sycl::range(1, 1, THREADS)),
-            exp_props,
-            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
-                gr_norm_split_kernel(m);
-            });
-    } else {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        st->parallel_for<dpct_kernel_name<class gr_norm_multi_kernel_2f4d93>>(
-            sycl::nd_range<3>(sycl::range(1, 1, n_tok) *
-                                  sycl::range(1, 1, THREADS),
-                              sycl::range(1, 1, THREADS)),
-            exp_props,
-            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
-                gr_norm_multi_kernel(m);
-            });
-    }
-    if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0, (void*) st);
-    const bool staged = variant >= kHcStaged;
-    int tv = 2560;
-    const int chunk_tok = down_chunk(staged, &tv);
-    /*
-    DPCT1083: The size of local memory in the migrated code may be different
-    from the original code. Check that the allocated memory size in the migrated
-    code is correct.
-    */
-    const size_t per_tok =
-        (staged ? (size_t)2 * H_TILE : (size_t)tv) * sizeof(float);
-    for (int c0 = 0; c0 < n_tok; c0 += chunk_tok) {
-        const int ct = n_tok - c0 < chunk_tok ? n_tok - c0 : chunk_tok;
-        GrMulti c{};
-        if (ct == n_tok) {
-            c = m;
-        } else {
-            c.xn = m.xn + (size_t) c0 * D;
-            c.T = ct;
-            for (int k = 0; k < ct; ++k) c.a[k] = m.a[c0 + k];
-        }
-        const size_t smem = (size_t) ct * per_tok;
-        // #443, opt-in STRATA_GR_DOWN_MAX4=1: launches of up to 4 tokens hold 4 tokens' sums per thread instead of
-        // kFusedGrMaxT - the same tile, block size, accumulation order and plain/split/staged path, so the same bits
-        // (read once: this runs per layer when decode is not captured)
-        static const bool max4_on = [] { const char* v = std::getenv("STRATA_GR_DOWN_MAX4"); return v && std::atoi(v) != 0; }();
-        const bool max4 = max4_on && ct <= 4;
-        if (staged) {
-            if (max4) {
-                auto exp_props = sycl::ext::oneapi::experimental::properties{
-                    sycl::ext::oneapi::experimental::use_root_sync};
-
-                st->submit([&](sycl::handler &cgh) {
-                    sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
-                        sycl::range(smem), cgh);
-
-                    cgh.parallel_for<
-                        dpct_kernel_name<class gr_down_staged_kernel_41b428,
-                                         dpct_kernel_scalar<4>>>(
-                        sycl::nd_range<3>(sycl::range(1, 1, DOWN_BLOCKS + 1) *
-                                              sycl::range(1, 1, THREADS),
-                                          sycl::range(1, 1, THREADS)),
-                        exp_props,
-                        [=](sycl::nd_item<3> item_ct1)
-                            [[sycl::reqd_sub_group_size(32)]] {
-                                gr_down_staged_kernel<4>(
-                                    c, dpct_local_acc_ct1
-                                           .get_multi_ptr<
-                                               sycl::access::decorated::no>()
-                                           .get());
-                            });
-                });
-            } else {
-                auto exp_props = sycl::ext::oneapi::experimental::properties{
-                    sycl::ext::oneapi::experimental::use_root_sync};
-
-                st->submit([&](sycl::handler &cgh) {
-                    sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
-                        sycl::range(smem), cgh);
-
-                    /*
-                    DPCT1050: The template argument of the dpct_kernel_name
-                    could not be deduced. You need to update this code.
-                    */
-                    cgh.parallel_for<dpct_kernel_name<
-                        class gr_down_staged_kernel_41b428>>(
-                        sycl::nd_range<3>(sycl::range(1, 1, DOWN_BLOCKS + 1) *
-                                              sycl::range(1, 1, THREADS),
-                                          sycl::range(1, 1, THREADS)),
-                        exp_props,
-                        [=](sycl::nd_item<3> item_ct1)
-                            [[sycl::reqd_sub_group_size(32)]] {
-                                gr_down_staged_kernel(
-                                    c, dpct_local_acc_ct1
-                                           .get_multi_ptr<
-                                               sycl::access::decorated::no>()
-                                           .get());
-                            });
-                });
-            }
-        } else if (tv == 1280) {
-            if (max4) {
-                auto exp_props = sycl::ext::oneapi::experimental::properties{
-                    sycl::ext::oneapi::experimental::use_root_sync};
-
-                st->submit([&](sycl::handler &cgh) {
-                    sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
-                        sycl::range(smem), cgh);
-
-                    cgh.parallel_for<dpct_kernel_name<
-                        class gr_down_multi_kernel_4a9670,
-                        dpct_kernel_scalar<1280>, dpct_kernel_scalar<4>>>(
-                        sycl::nd_range<3>(sycl::range(1, 1, DOWN_BLOCKS + 1) *
-                                              sycl::range(1, 1, THREADS),
-                                          sycl::range(1, 1, THREADS)),
-                        exp_props,
-                        [=](sycl::nd_item<3> item_ct1)
-                            [[sycl::reqd_sub_group_size(32)]] {
-                                gr_down_multi_kernel<1280, 4>(
-                                    c, dpct_local_acc_ct1
-                                           .get_multi_ptr<
-                                               sycl::access::decorated::no>()
-                                           .get());
-                            });
-                });
-            } else {
-                auto exp_props = sycl::ext::oneapi::experimental::properties{
-                    sycl::ext::oneapi::experimental::use_root_sync};
-
-                st->submit([&](sycl::handler &cgh) {
-                    sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
-                        sycl::range(smem), cgh);
-
-                    /*
-                    DPCT1050: The template argument of the dpct_kernel_name
-                    could not be deduced. You need to update this code.
-                    */
-                    cgh.parallel_for<dpct_kernel_name<
-                        class gr_down_multi_kernel_6a749c,
-                        dpct_kernel_scalar<1280>, dpct_kernel_scalar<1280>>>(
-                        sycl::nd_range<3>(sycl::range(1, 1, DOWN_BLOCKS + 1) *
-                                              sycl::range(1, 1, THREADS),
-                                          sycl::range(1, 1, THREADS)),
-                        exp_props,
-                        [=](sycl::nd_item<3> item_ct1)
-                            [[sycl::reqd_sub_group_size(32)]] {
-                                gr_down_multi_kernel<1280>(
-                                    c, dpct_local_acc_ct1
-                                           .get_multi_ptr<
-                                               sycl::access::decorated::no>()
-                                           .get());
-                            });
-                });
-            }
-        } else {
-            if (max4) {
-                auto exp_props = sycl::ext::oneapi::experimental::properties{
-                    sycl::ext::oneapi::experimental::use_root_sync};
-
-                st->submit([&](sycl::handler &cgh) {
-                    sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
-                        sycl::range(smem), cgh);
-
-                    cgh.parallel_for<dpct_kernel_name<
-                        class gr_down_multi_kernel_2d8885,
-                        dpct_kernel_scalar<2560>, dpct_kernel_scalar<4>>>(
-                        sycl::nd_range<3>(sycl::range(1, 1, DOWN_BLOCKS + 1) *
-                                              sycl::range(1, 1, THREADS),
-                                          sycl::range(1, 1, THREADS)),
-                        exp_props,
-                        [=](sycl::nd_item<3> item_ct1)
-                            [[sycl::reqd_sub_group_size(32)]] {
-                                gr_down_multi_kernel<2560, 4>(
-                                    c, dpct_local_acc_ct1
-                                           .get_multi_ptr<
-                                               sycl::access::decorated::no>()
-                                           .get());
-                            });
-                });
-            } else {
-                auto exp_props = sycl::ext::oneapi::experimental::properties{
-                    sycl::ext::oneapi::experimental::use_root_sync};
-
-                st->submit([&](sycl::handler &cgh) {
-                    sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
-                        sycl::range(smem), cgh);
-
-                    /*
-                    DPCT1050: The template argument of the dpct_kernel_name
-                    could not be deduced. You need to update this code.
-                    */
-                    cgh.parallel_for<dpct_kernel_name<
-                        class gr_down_multi_kernel_df2ead,
-                        dpct_kernel_scalar<2560>, dpct_kernel_scalar<2560>>>(
-                        sycl::nd_range<3>(sycl::range(1, 1, DOWN_BLOCKS + 1) *
-                                              sycl::range(1, 1, THREADS),
-                                          sycl::range(1, 1, THREADS)),
-                        exp_props,
-                        [=](sycl::nd_item<3> item_ct1)
-                            [[sycl::reqd_sub_group_size(32)]] {
-                                gr_down_multi_kernel<2560>(
-                                    c, dpct_local_acc_ct1
-                                           .get_multi_ptr<
-                                               sycl::access::decorated::no>()
-                                           .get());
-                            });
-                });
-            }
-        }
-    }
-    if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, (void*) st);
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        st->parallel_for<dpct_kernel_name<class gr_up_multi_kernel_1a7280>>(
-            sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
-                                  sycl::range(1, 1, THREADS),
-                              sycl::range(1, 1, THREADS)),
-            exp_props,
-            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
-                gr_up_multi_kernel(m);
-            });
-    }
-}
-
-/// STRATA_HC_SPLIT: unset or 2 = the newest the check accepts (staged), 1 = at most split, 0 = the plain read
-int env_variant() {
-    const char* e = std::getenv("STRATA_HC_SPLIT");
-    if (e == nullptr || e[0] == '\0') return kHcStaged;
-    if (e[0] == '0') return kHcPlain;
-    if (e[0] == '1') return kHcSplit;
-    return kHcStaged;
-}
-
-// per device: the variant `fused_gr_check` chose (0 = not checked yet)
-std::atomic<int> g_variant[64];
-
 }  // namespace
 
-// one partials buffer per queue (the verifier's and the drafter's launches never share a queue; within a queue the
-// launches are ordered, and a graph capture records the pointer)
-static float* down_partials(sycl::queue* q) {
-    static std::mutex mu;
-    static std::unordered_map<sycl::queue*, float*> bufs;
-    std::lock_guard<std::mutex> lk(mu);
-    auto it = bufs.find(q);
-    if (it != bufs.end()) return it->second;
-    float* p = sycl::malloc_device<float>((size_t) DOWN_SPLIT * kFusedGrMaxT * LR, *q);
-    bufs[q] = p;
-    return p;
-}
-
-bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream, unsigned long long* stamp_buf,
-                         int stamp_i0) {
-    if (n_tok < 1 || n_tok > kFusedGrMaxT || xn_scratch == nullptr) {
-        std::fprintf(stderr, "fused_gr_read_multi: invalid arguments\n");
-        std::exit(1);
-    }
-    GrMulti m;
-    for (int t = 0; t < n_tok; ++t) {
-        m.a[t] = a[t];
-        const FusedGrArgs& x = a[t];
-        if (!x.R || !x.w_norm || !x.w_down || !x.w_up || !x.lo || !x.rs || !x.mixed || (x.w_inject && !x.inject_out) ||
-            (x.apply && (!x.bo_prev || !x.inj_prev || !x.R_out)) || x.w_down != a[0].w_down || x.w_up != a[0].w_up ||
-            x.w_inject != a[0].w_inject || x.w_norm != a[0].w_norm) {
-            std::fprintf(stderr, "fused_gr_read_multi: invalid arguments for token %d\n", t);
-            std::exit(1);
-        }
-    }
-    m.xn = xn_scratch;
-    m.T = n_tok;
-    dpct::queue_ptr st = strata::q_of(stream);
-    // STRATA_GR_V3=1: the two-kernel read above (another summation order - opt-in)
-    static const bool v3 = [] { const char* v = std::getenv("STRATA_GR_V3"); return v != nullptr && std::atoi(v) != 0; }();
-    static int split3[64] = {};   // per device: 0 = not decided yet, 1 / 2 = column halves S, -1 = does not fit
-    int dev3 = 0;
-    if (v3) {
-        dev3 = dpct::get_current_device_id();
-        if (dev3 >= 0 && dev3 < 64 && split3[dev3] == 0) {
-            int optin = 0;
-            // SYCL port: the device's local memory is the limit (no per-kernel opt-in to raise)
-            optin = (int) dpct::get_device(dev3).get_local_mem_size();
-            const int limit = optin > 0 ? optin : 48 * 1024;
-            const int need1 = (int) (kFusedGrMaxT * N * sizeof(float)), need2 = need1 / 2;
-            int split = -1;
-            if (need1 <= limit &&
-                /*
-                DPCT1027: The call to cudaFuncSetAttribute was replaced with
-                0 because SYCL currently does not support corresponding setting.
-                */
-                0 == 0)
-                split = 1;
-            else if (need2 <= limit)
-                // #375 (kenh0u): the S = 2 split (a 64 KB opt-in card: Turing) disagrees with itself in gr_parity
-                // (graph replay vs direct call) - such a card keeps the default read until that split is fixed
-                std::fprintf(stderr, "strata: STRATA_GR_V3=1 needs the two-half split on this card, which fails its "
-                                     "checks (#375): the default read is used\n");
-            /*
-            DPCT1026: The call to cudaGetLastError was removed because this
-            functionality is redundant in SYCL.
-            */
-; // drop any error the attempts left behind
-            split3[dev3] = split;
-        }
-    }
-    const int split = v3 && dev3 >= 0 && dev3 < 64 ? split3[dev3] : -1;
-    if (split > 0) {   // 2 kernels; scratch = partials + sums of squares
-        float* part = xn_scratch;
-        float* ssg = xn_scratch + (size_t) n_tok * HC * 2 * PR;   // room for S = 2
-        /*
-        DPCT1083: The size of local memory in the migrated code may be
-        different from the original code. Check that the allocated memory size
-        in the migrated code is correct.
-        */
-        const size_t sm = (size_t)n_tok * (N / split) * sizeof(float);
-        if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0, stream);
-        if (split == 2) {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
-
-            st->submit([&](sycl::handler &cgh) {
-                sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
-                    sycl::range(sm), cgh);
-
-                cgh.parallel_for<dpct_kernel_name<
-                    class gr_down_v3_kernel_c14ff7, dpct_kernel_scalar<2>>>(
-                    sycl::nd_range<3>(sycl::range(1, HC * 2, LR / WARPS + 1) *
-                                          sycl::range(1, 1, THREADS),
-                                      sycl::range(1, 1, THREADS)),
-                    exp_props,
-                    [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(
-                        32)]] {
-                        gr_down_v3_kernel<2>(
-                            m, part, ssg,
-                            dpct_local_acc_ct1
-                                .get_multi_ptr<sycl::access::decorated::no>()
-                                .get());
-                    });
-            });
-        } else {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
-
-            st->submit([&](sycl::handler &cgh) {
-                sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
-                    sycl::range(sm), cgh);
-
-                cgh.parallel_for<dpct_kernel_name<
-                    class gr_down_v3_kernel_88bc89, dpct_kernel_scalar<1>>>(
-                    sycl::nd_range<3>(sycl::range(1, HC, LR / WARPS + 1) *
-                                          sycl::range(1, 1, THREADS),
-                                      sycl::range(1, 1, THREADS)),
-                    exp_props,
-                    [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(
-                        32)]] {
-                        gr_down_v3_kernel<1>(
-                            m, part, ssg,
-                            dpct_local_acc_ct1
-                                .get_multi_ptr<sycl::access::decorated::no>()
-                                .get());
-                    });
-            });
-        }
-        if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, stream);
-        if (split == 2) {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
-
-            st->parallel_for<dpct_kernel_name<class gr_up_v3_kernel_6e945c,
-                                              dpct_kernel_scalar<2>>>(
-                sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
-                                      sycl::range(1, 1, THREADS),
-                                  sycl::range(1, 1, THREADS)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        gr_up_v3_kernel<2>(m, part, ssg);
-                    });
-        } else {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
-
-            st->parallel_for<dpct_kernel_name<class gr_up_v3_kernel_716779,
-                                              dpct_kernel_scalar<1>>>(
-                sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
-                                      sycl::range(1, 1, THREADS),
-                                  sycl::range(1, 1, THREADS)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        gr_up_v3_kernel<1>(m, part, ssg);
-                    });
-        }
-        /*
-        DPCT1010: SYCL uses exceptions to report errors and does not use the
-        error codes. The cudaGetLastError function call was replaced with 0. You
-        need to rewrite this code.
-        */
-        const dpct::err0 e3 = 0;
-
-        return false;   // SYCL port: never writes the q8_1 images (STRATA_QFUSE is not supported here)
-    }
-    m.part = down_partials(st);
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        if (gr_norm_split())
-            st->parallel_for<dpct_kernel_name<class gr_norm_split_k>>(
-                sycl::nd_range<3>(sycl::range(1, 1, n_tok * HC) * sycl::range(1, 1, THREADS), sycl::range(1, 1, THREADS)),
-                [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] { gr_norm_split_port_kernel(m); });
-        else
-        st->parallel_for<dpct_kernel_name<class gr_norm_multi_kernel_2f4d92>>(
-            sycl::nd_range<3>(sycl::range(1, 1, n_tok) *
-                                  sycl::range(1, 1, THREADS),
-                              sycl::range(1, 1, THREADS)),
-            exp_props,
-            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
-                gr_norm_multi_kernel(m);
-            });
-    }
-    if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0, stream);
-    // the local-memory capacity is a per-DEVICE property: once per device (a layer split runs this on two cards).
-    // SYCL port: upstream picks TILEV 1280 on sm_75 and takes the per-block limit below sm_70 (CUDA compute
-    // capabilities, cudaFuncSetAttribute opt-ins); here the tile is the port's TILE and the device's local memory is
-    // the only limit. The tiled kernel is the fallback (STRATA_GR_DOWN_SLICED=0 STRATA_GR_DOWN_DIRECT=0); the
-    // default is the sliced kernel below.
-    static bool attr[64] = {};
-    static int chunk[64] = {};   // tokens the tiled down kernel may carry in one launch on this card
-    int dev = 0;
-    dev = dpct::get_current_device_id();
-    if (dev >= 0 && dev < 64 && !attr[dev]) {
-        const int optin = (int) dpct::get_device(dev).get_local_mem_size();
-        const int capacity = (optin > 0 ? optin : 48 * 1024) / (int) (TILE * sizeof(float));
-        chunk[dev] = capacity < 1 ? 1 : (capacity > kFusedGrMaxT ? kFusedGrMaxT : capacity);
-        attr[dev] = true;
-    }
-    const int chunk_tok = (dev >= 0 && dev < 64 && chunk[dev]) ? chunk[dev] : kFusedGrMaxT;
-    if (gr_down_sliced()) {
-        m.part2 = slice_partials(st);
-        m.nsplit = 1;
-        st->submit([&](sycl::handler& cgh) {
-            sycl::local_accessor<float, 1> tl(sycl::range<1>((size_t) kFusedGrMaxT * GRS_COLS), cgh);
-            cgh.parallel_for<dpct_kernel_name<class gr_down_sliced_k>>(
-                sycl::nd_range<3>(sycl::range(1, 1, GRS_SLICES) * sycl::range(1, 1, THREADS), sycl::range(1, 1, THREADS)),
-                [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
-                    gr_down_sliced_kernel(m, tl.get_multi_ptr<sycl::access::decorated::no>().get());
-                });
-        });
-        const unsigned nred = unsigned((n_tok * GRS_ROWS + 127) / 128);
-        st->parallel_for<dpct_kernel_name<class gr_down_reduce_k>>(
-            sycl::nd_range<3>(sycl::range(1, 1, nred) * sycl::range(1, 1, 128), sycl::range(1, 1, 128)),
-            [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] { gr_down_reduce_kernel(m); });
-    } else if (gr_down_direct()) {
-        st->parallel_for<dpct_kernel_name<class gr_down_multi_direct>>(
-            sycl::nd_range<3>(sycl::range(1, 1, DOWN_BLOCKS * DOWN_SPLIT + 1) * sycl::range(1, 1, THREADS),
-                              sycl::range(1, 1, THREADS)),
-            [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] { gr_down_multi_direct_kernel(m); });
-    } else if (chunk_tok >= n_tok) {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-        st->submit([&](sycl::handler &cgh) {
-            sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
-                sycl::range((size_t)n_tok * TILE * sizeof(float)), cgh);
-            cgh.parallel_for<
-                dpct_kernel_name<class gr_down_multi_kernel_7f5820, dpct_kernel_scalar<TILE>>>(
-                sycl::nd_range<3>(sycl::range(1, 1, DOWN_BLOCKS * DOWN_SPLIT + 1) *
-                                      sycl::range(1, 1, THREADS),
-                                  sycl::range(1, 1, THREADS)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        gr_down_multi_kernel<TILE>(
-                            m, dpct_local_acc_ct1
-                                   .get_multi_ptr<sycl::access::decorated::no>()
-                                   .get());
-                    });
-        });
-    } else {
-        for (int c0 = 0; c0 < n_tok; c0 += chunk_tok) {
-            const int ct = n_tok - c0 < chunk_tok ? n_tok - c0 : chunk_tok;
-            GrMulti c{};
-            c.xn = xn_scratch + (size_t) c0 * D;
-            c.T = ct;
-            for (int k = 0; k < ct; ++k) c.a[k] = a[c0 + k];
-            c.part = m.part;
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
-            st->submit([&](sycl::handler &cgh) {
-                sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
-                    sycl::range((size_t)ct * TILE * sizeof(float)), cgh);
-                cgh.parallel_for<
-                    dpct_kernel_name<class gr_down_multi_kernel_88cb86, dpct_kernel_scalar<TILE>>>(
-                    sycl::nd_range<3>(sycl::range(1, 1, DOWN_BLOCKS * DOWN_SPLIT + 1) *
-                                          sycl::range(1, 1, THREADS),
-                                      sycl::range(1, 1, THREADS)),
-                    exp_props,
-                    [=](sycl::nd_item<3> item_ct1)
-                        [[sycl::reqd_sub_group_size(32)]] {
-                            gr_down_multi_kernel<TILE>(
-                                c, dpct_local_acc_ct1
-                                       .get_multi_ptr<sycl::access::decorated::no>()
-                                       .get());
-                        });
-            });
-        }
-    }
-    if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, stream);
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        st->parallel_for<dpct_kernel_name<class gr_up_multi_kernel_1a727f>>(
-            sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) *
-                                  sycl::range(1, 1, THREADS),
-                              sycl::range(1, 1, THREADS)),
-            exp_props,
-            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
-                gr_up_multi_kernel(m);
-            });
-    }
-    /*
-    DPCT1010: SYCL uses exceptions to report errors and does not use the
-    error codes. The cudaGetLastError function call was replaced with 0. You
-    need to rewrite this code.
-    */
-    const dpct::err0 e = 0;
-    return false;   // SYCL port: the q8_1 images (S26 STRATA_QFUSE) and the Q8_0 reads (S23 STRATA_HC_Q8) are not built; the caller quantizes
-}
-
-// the bench only (AMD latency-hidden kernels): nothing to switch on the SYCL port
-void fused_gr_set_fast(int) {}
-
-bool fused_gr_supported(int64_t n_embd, int64_t hc, int64_t hc_lr) {
-    return n_embd == N && hc == HC && hc_lr == LR;
-}
-
-void fused_gr_read(const FusedGrArgs& a, void* stream) {
-    if (!a.R || !a.w_norm || !a.w_down || !a.w_up || !a.lo || !a.rs || !a.mixed ||
-        (a.w_inject && !a.inject_out) || (a.apply && (!a.bo_prev || !a.inj_prev || !a.R_out)) ||
-        (a.apply && a.inj_prev == a.inject_out)) {
-        std::fprintf(stderr, "fused_gr_read: invalid arguments\n");
-        std::exit(1);
-    }
-    dpct::queue_ptr st = strata::q_of(stream);
-    // SYCL port: the multi-token read's sliced down kernel and per-(token, stream) norm sum in their own orders, so a
-    // window's token would differ in its last bits from this kernel's. The header promises "every token's outputs
-    // are bitwise fused_gr_read(a[t])" (gr_parity checks it): with those paths on, the single read IS the multi read
-    // of one token (each token's sums run in the same order whatever the window size).
-    if (gr_down_sliced() || gr_norm_split() || gr_down_direct()) {
-        static std::mutex mu;
-        static std::unordered_map<sycl::queue*, float*> xn;
-        float* scratch;
-        {
-            std::lock_guard<std::mutex> lk(mu);
-            float*& p = xn[st];
-            if (!p) p = sycl::malloc_device<float>((size_t) D, *st);
-            scratch = p;
-        }
-        fused_gr_read_multi(&a, 1, scratch, stream);
-        return;
-    }
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        st->parallel_for<dpct_kernel_name<class gr_down_kernel_a5fa71>>(
-            sycl::nd_range<3>(sycl::range(1, 1, DOWN_BLOCKS + 1) *
-                                  sycl::range(1, 1, THREADS),
-                              sycl::range(1, 1, THREADS)),
-            exp_props,
-            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
-                gr_down_kernel(a);
-            });
-    }
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        st->parallel_for<dpct_kernel_name<class gr_up_kernel_fe3258>>(
-            sycl::nd_range<3>(sycl::range(1, 1, UP_BLOCKS) *
-                                  sycl::range(1, 1, THREADS),
-                              sycl::range(1, 1, THREADS)),
-            exp_props,
-            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
-                gr_up_kernel(a);
-            });
-    }
-    /*
-    DPCT1010: SYCL uses exceptions to report errors and does not use the
-    error codes. The cudaGetLastError function call was replaced with 0. You
-    need to rewrite this code.
-    */
-    const dpct::err0 e = 0;
-}
-
-
-namespace {
-
-/// The plain read, split, staged and (for one token) the single-token read on random bf16 weights and random inputs,
-/// 1..8 tokens, with and without the pending write; every output of split and staged compared with the plain read's
-/// bit for bit (and the plain read's with the single-token read's).  `why[v]` gets the first difference of variant
-/// v; false if the check itself could not run.
-bool fused_gr_selftest(bool ok_variant[4], std::string why[4]) try {
-    constexpr int TM = kFusedGrMaxT;
-    constexpr int NV = 4;                             // sets: 0 = plain, 1 = split, 2 = staged, 3 = single-token
-    std::mt19937 rng(20260930u);
-    std::normal_distribution<float> nd(0.0f, 1.0f);
-    std::vector<uint16_t> h_down((size_t) LR * D), h_up((size_t) D * LR), h_inj((size_t) HC * D);
-    std::vector<float> h_norm(D), h_R((size_t) TM * D), h_bo((size_t) TM * N), h_ip((size_t) TM * HC);
-    for (auto& w : h_down) w = bf16_from_f32(0.02f * nd(rng));
-    for (auto& w : h_up) w = bf16_from_f32(0.05f * nd(rng));
-    for (auto& w : h_inj) w = bf16_from_f32(0.02f * nd(rng));
-    for (auto& w : h_norm) w = 1.0f + 0.1f * nd(rng);
-    for (auto& x : h_R) x = nd(rng);
-    for (auto& x : h_bo) x = 0.5f * nd(rng);
-    for (auto& x : h_ip) x = 2.0f * nd(rng);
-    for (int v = 0; v < 4; ++v) { ok_variant[v] = v == 1; why[v].clear(); }
-
-    const size_t n_set = (size_t) TM * (D + D + LR + HC + HC + N);   // R_out, xn, lo, rs, inject, mixed (floats)
-    const size_t bytes = h_down.size() * 2 + h_up.size() * 2 + h_inj.size() * 2 +
-                         (h_norm.size() + h_R.size() + h_bo.size() + h_ip.size() + NV * n_set) * 4 + 32 * 256;
-    uint8_t* base = nullptr;
-    if (DPCT_CHECK_ERROR(base = (uint8_t *)sycl::malloc_device(
-                             bytes, dpct::get_in_order_queue())) != 0) {
-        /*
-        DPCT1026: The call to cudaGetLastError was removed because this
-        functionality is redundant in SYCL.
-        */
-        why[0] =
-            "no room for the check (" + std::to_string(bytes >> 20) + " MiB)";
-        return false;
-    }
-    size_t off = 0;
-    auto take = [&](size_t b) { void* p = base + off; off += (b + 255) / 256 * 256; return p; };
-    uint16_t* d_down = (uint16_t*) take(h_down.size() * 2);
-    uint16_t* d_up = (uint16_t*) take(h_up.size() * 2);
-    uint16_t* d_inj = (uint16_t*) take(h_inj.size() * 2);
-    float* d_norm = (float*) take(h_norm.size() * 4);
-    float* d_R = (float*) take(h_R.size() * 4);
-    float* d_bo = (float*) take(h_bo.size() * 4);
-    float* d_ip = (float*) take(h_ip.size() * 4);
-    struct Set { float *R_out, *xn, *lo, *rs, *inj, *mixed; } set[NV];
-    for (Set& x : set) {
-        x.R_out = (float*) take((size_t) TM * D * 4); x.xn = (float*) take((size_t) TM * D * 4);
-        x.lo = (float*) take((size_t) TM * LR * 4); x.rs = (float*) take((size_t) TM * HC * 4);
-        x.inj = (float*) take((size_t) TM * HC * 4); x.mixed = (float*) take((size_t) TM * N * 4);
-    }
-    dpct::queue_ptr st = &dpct::get_in_order_queue();
-    /*
-    DPCT1025: The SYCL queue is created ignoring the flag and priority
-    options.
-    */
-    bool ok =
-        off <= bytes &&
-        DPCT_CHECK_ERROR(st = dpct::get_current_device().create_queue(true)) ==
-            0 &&
-        /*
-        DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy API.
-        While the origin API might be synchronous, it depends on the type of
-        operand memory, so you may need to call wait() on event return by memcpy
-        API to ensure synchronization behavior.
-        */
-        DPCT_CHECK_ERROR(
-            st->memcpy(d_down, h_down.data(), h_down.size() * 2)) == 0 &&
-        /*
-        DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy API.
-        While the origin API might be synchronous, it depends on the type of
-        operand memory, so you may need to call wait() on event return by memcpy
-        API to ensure synchronization behavior.
-        */
-        DPCT_CHECK_ERROR(st->memcpy(d_up, h_up.data(), h_up.size() * 2)) == 0 &&
-        /*
-        DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy API.
-        While the origin API might be synchronous, it depends on the type of
-        operand memory, so you may need to call wait() on event return by memcpy
-        API to ensure synchronization behavior.
-        */
-        DPCT_CHECK_ERROR(st->memcpy(d_inj, h_inj.data(), h_inj.size() * 2)) ==
-            0 &&
-        /*
-        DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy API.
-        While the origin API might be synchronous, it depends on the type of
-        operand memory, so you may need to call wait() on event return by memcpy
-        API to ensure synchronization behavior.
-        */
-        DPCT_CHECK_ERROR(
-            st->memcpy(d_norm, h_norm.data(), h_norm.size() * 4)) == 0 &&
-        /*
-        DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy API.
-        While the origin API might be synchronous, it depends on the type of
-        operand memory, so you may need to call wait() on event return by memcpy
-        API to ensure synchronization behavior.
-        */
-        DPCT_CHECK_ERROR(st->memcpy(d_R, h_R.data(), h_R.size() * 4)) == 0 &&
-        /*
-        DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy API.
-        While the origin API might be synchronous, it depends on the type of
-        operand memory, so you may need to call wait() on event return by memcpy
-        API to ensure synchronization behavior.
-        */
-        DPCT_CHECK_ERROR(st->memcpy(d_bo, h_bo.data(), h_bo.size() * 4)) == 0 &&
-        /*
-        DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy API.
-        While the origin API might be synchronous, it depends on the type of
-        operand memory, so you may need to call wait() on event return by memcpy
-        API to ensure synchronization behavior.
-        */
-        DPCT_CHECK_ERROR(st->memcpy(d_ip, h_ip.data(), h_ip.size() * 4)) == 0;
-    if (!ok) why[0] = "setting up the check failed";
-    std::vector<float> h1, h2;
-    // true when equal; false with the first difference in `w` (or a read-back failure in `ok`)
-    auto same = [&](const float* d1, const float* d2, size_t n, const char* what, int T, int apply, std::string& w) {
-        h1.resize(n);
-        h2.resize(n);
-        /*
-        DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy API.
-        While the origin API might be synchronous, it depends on the type of
-        operand memory, so you may need to call wait() on event return by memcpy
-        API to ensure synchronization behavior.
-        */
-        if (DPCT_CHECK_ERROR(st->memcpy(h1.data(), d1, n * 4)) != 0 ||
-            /*
-            DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy
-            API. While the origin API might be synchronous, it depends on the
-            type of operand memory, so you may need to call wait() on event
-            return by memcpy API to ensure synchronization behavior.
-            */
-            DPCT_CHECK_ERROR(st->memcpy(h2.data(), d2, n * 4)) != 0 ||
-            DPCT_CHECK_ERROR(st->wait()) != 0) {
-            why[0] = "reading back the check failed";
-            ok = false;
-            return false;
-        }
-        for (size_t i = 0; i < n; ++i) {
-            uint32_t u1, u2;
-            std::memcpy(&u1, &h1[i], 4);
-            std::memcpy(&u2, &h2[i], 4);
-            if (u1 != u2) {
-                char buf[192];
-                std::snprintf(buf, sizeof buf, "%s differs for %d token(s)%s at %zu (%08x, not %08x)", what, T,
-                              apply ? " with the pending write" : "", i, u2, u1);
-                w = buf;
-                return false;
-            }
-        }
-        return true;
-    };
-    auto all_same = [&](const Set& s1, const Set& s2, int T, int apply, std::string& w) {
-        return same(s1.lo, s2.lo, (size_t) T * LR, "lo", T, apply, w) &&
-               same(s1.rs, s2.rs, (size_t) T * HC, "rs", T, apply, w) &&
-               same(s1.inj, s2.inj, (size_t) T * HC, "inject", T, apply, w) &&
-               same(s1.mixed, s2.mixed, (size_t) T * N, "mixed", T, apply, w) &&
-               same(s1.R_out, s2.R_out, (size_t) T * D, "R", T, apply, w);
-    };
-    ok_variant[2] = ok_variant[3] = ok;
-    bool single_ok = ok;
-    for (int apply = 0; apply < 2 && ok; ++apply) {
-        for (int T = 1; T <= TM && ok; ++T) {
-            FusedGrArgs a[NV][TM];
-            for (int v = 0; v < NV; ++v) {
-                const size_t span = (size_t) ((uint8_t*) (set[v].mixed + (size_t) TM * N) - (uint8_t*) set[v].R_out);
-                ok = ok &&
-                     DPCT_CHECK_ERROR(st->memset(set[v].R_out, 0xFF, span)) ==
-                         0; // the whole set
-                for (int k = 0; k < T; ++k) {
-                    FusedGrArgs& x = a[v][k];
-                    x.R = d_R + (size_t) k * D; x.R_out = set[v].R_out + (size_t) k * D; x.apply = apply != 0;
-                    x.bo_prev = d_bo + (size_t) k * N; x.inj_prev = d_ip + (size_t) k * HC;
-                    x.w_norm = d_norm; x.w_down = d_down; x.w_up = d_up; x.w_inject = d_inj; x.eps = 1e-6f;
-                    x.lo = set[v].lo + (size_t) k * LR; x.rs = set[v].rs + (size_t) k * HC;
-                    x.inject_out = set[v].inj + (size_t) k * HC; x.mixed = set[v].mixed + (size_t) k * N;
-                }
-            }
-            for (int v = 0; v < 3; ++v) {
-                GrMulti m;
-                for (int k = 0; k < T; ++k) m.a[k] = a[v][k];
-                m.xn = set[v].xn;
-                m.T = T;
-                launch_multi(m, v + 1, st, nullptr, 0);
-            }
-            if (T == 1) fused_gr_read(a[3][0], st);
-            /*
-            DPCT1010: SYCL uses exceptions to report errors and does not
-            use the error codes. The cudaGetLastError function call was replaced
-            with 0. You need to rewrite this code.
-            */
-            if (0 != 0 || DPCT_CHECK_ERROR(st->wait()) != 0) {
-                why[0] = "a kernel of the check failed";
-                ok = false;
-                break;
-            }
-            if (ok_variant[2] && !all_same(set[0], set[1], T, apply, why[2])) ok_variant[2] = false;
-            if (ok && ok_variant[3] && !all_same(set[0], set[2], T, apply, why[3])) ok_variant[3] = false;
-            if (ok && T == 1 && single_ok && !all_same(set[3], set[0], T, apply, why[1])) single_ok = false;
-        }
-    }
-    if (!single_ok && ok) {                            // the plain read itself disagrees with the single-token read
-        why[2] = why[3] = "the plain read differs from the single-token read: " + why[1];
-        ok_variant[2] = ok_variant[3] = false;
-    }
-    if (st != &dpct::get_in_order_queue()) {
-        st->wait();
-        dpct::get_current_device().destroy_queue(st);
-    }
-    sycl::free(base, dpct::get_in_order_queue());
-    /*
-    DPCT1026: The call to cudaGetLastError was removed because this
-    functionality is redundant in SYCL.
-    */
-    if (!ok) ok_variant[2] = ok_variant[3] = false;
-    return ok;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
-
-}  // namespace
-
-int fused_gr_variant() {
-    int dev = 0;
-    dev = dpct::get_current_device_id();
-    const int v = dev >= 0 && dev < 64 ? g_variant[dev].load() : 0;
-    if (v > 0) return v;
-    // not checked on this card: the plain read, unless STRATA_HC_SPLIT names a variant (a test such as gr_parity)
-    const char* e = std::getenv("STRATA_HC_SPLIT");
-    return e != nullptr && (e[0] == '1' || e[0] == '2') ? env_variant() : kHcPlain;
-}
-
-void fused_gr_check() {
-    int dev = 0;
-    dev = dpct::get_current_device_id();
-    if (dev < 0 || dev >= 64 || g_variant[dev].load() > 0) return;
-    // SYCL port: the port's own read (sliced down / split norm, STRATA_GR_DOWN_SLICED etc.) does not use upstream's
-    // variants, and their self-test crashes on the B70 (0.1.32 merge, under investigation): opt-in only.
-    if (std::getenv("STRATA_HC_CHECK") == nullptr) {
-        g_variant[dev].store(kHcPlain);
-        return;
-    }
-    const int want = env_variant();
-    if (want == kHcPlain) {
-        g_variant[dev].store(kHcPlain);
-        std::fprintf(stderr, "strata hc: CUDA%d: the hyper-connection read runs as the plain one (STRATA_HC_SPLIT=0)\n",
-                     dev);
-        return;
-    }
-    bool okv[4];
-    std::string why[4];
-    const bool ran = fused_gr_selftest(okv, why);
-    int use = kHcPlain;
-    if (want >= kHcStaged && okv[kHcStaged]) use = kHcStaged;
-    else if (okv[kHcSplit]) use = kHcSplit;
-    g_variant[dev].store(use);
-    if (!ran)
-        std::fprintf(stderr, "strata hc: CUDA%d: the check of split/staged could not run (%s)\n", dev, why[0].c_str());
-    static const char* const name[4] = {"", "plain", "split", "staged"};
-    for (int v = kHcStaged; v >= kHcSplit; --v)
-        if (v <= want && !okv[v] && ran)
-            std::fprintf(stderr, "strata hc: CUDA%d: the %s read differs from the plain read on this card - not used: "
-                                 "%s\n", dev, name[v], why[v].c_str());
-    static const char* const what[4] = {
-        "", "the plain read (the norm per token, the down projection on 41 blocks)",
-        "split (the norm per token and stream, then the plain read's down projection)",
-        "staged (the norm per token and stream, the down projection's activations staged ahead by cp.async)"};
-    std::fprintf(stderr, "strata hc: CUDA%d: the hyper-connection read runs as %s%s\n", dev, what[use],
-                 use >= kHcSplit ? "; checked bit for bit against the plain read on this card (STRATA_HC_SPLIT=1 or 0 "
-                                   "for the earlier ones)" : "");
-}
-
+#include "fused_gr.kern.inc"
 
 }  // namespace strata::kernels

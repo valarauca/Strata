@@ -1,9 +1,7 @@
 
 // src/core/layer.cpp - the GDN layer, composed.  See the header for the operation order and its traps.
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
-#include "strata/sycl_queue.hpp"
+#include "strata/ze/ze.hpp"
+#include "strata/intel_gpu.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/kernels/bf16_bits.hpp"
@@ -226,8 +224,8 @@ void gdn_buffers_zero_state(const GdnBuffers &b, const ModelGeometry &g,
                         g.ssm_state_size * sizeof(float);
     const uint64_t cs = (uint64_t)g.ssm_conv_channels * (g.ssm_d_conv - 1) *
                         sizeof(float);
-    strata::q_of(stream)-> memset(b.state, 0, st);
-    strata::q_of(stream)->memset(b.conv_state, 0, cs);
+    strata::ze::stream_of(stream)-> memset(b.state, 0, st);
+    strata::ze::stream_of(stream)->memset(b.conv_state, 0, cs);
 }
 // Forward-declared because `gdn_layer` and `qsa_layer` are both defined above the timer's own definition, and
 // the sub-stage marks live inside them.
@@ -255,7 +253,7 @@ const float *conv_kernel = (const float *)w_conv->data;
                     err)) return false;
     if (!plane_ptrs(*w_out, v.name("ssm_out.weight"), p_out, err)) return false;
     using namespace strata::kernels;
-    dpct::queue_ptr st = strata::q_of(stream);
+    strata::ze::Stream* st = strata::ze::stream_of(stream);
 // ---- 1. the activation, in EVERY format a weight on this layer might ask for.  BOTH quantized images are
 //         produced, because which one is wanted is a property of the TENSOR and the pack mixes them by
 //         layer - producing only the "right" one is how the per-role assumption gets baked back in.
@@ -282,12 +280,6 @@ try {
     if (native_gdn_enabled()) native_gdn_conv_silu(b.conv_state, b.qkv, conv_kernel, b.conv_out, b.h, C, g.ssm_d_conv, stream);
     else {
         gdn_conv_step(b.conv_state, b.qkv, conv_kernel, b.conv_out, C, g.ssm_d_conv, stream);
-        /*
-        DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy API.
-        While the origin API might be synchronous, it depends on the type of
-        operand memory, so you may need to call wait() on event return by memcpy
-        API to ensure synchronization behavior.
-        */
         st->memcpy(b.h, b.conv_out, (size_t)C * 4);
         silu_inplace(b.h, C, stream);
     }
@@ -389,7 +381,7 @@ q8k_bytes(g.n_embd),
 uint64_t moe_buffers_init(const ModelGeometry& g, int64_t k, void* base, MoEBuffers& b) {    const uint64_t parts[] = {        (uint64_t) g.n_embd * 2, (uint64_t) g.n_embd * 2, (uint64_t) g.n_expert * 4,        (uint64_t) k * 4, (uint64_t) k * 4, (uint64_t) g.n_embd * 4,        strata::kernels::shared_expert_scratch_bytes(g.n_ff),        (uint64_t) (g.n_embd / 32) * 34, q8k_bytes(g.n_embd),    };    uint8_t* p = (uint8_t*) base;    void* ptr[9];    uint64_t total = 0;    for (int i = 0; i < 9; ++i) {        ptr[i] = p;        const uint64_t al = (parts[i] + 15) & ~(uint64_t) 15;        p += al;        total += al;    }    b.x_bf16 = (uint16_t*) ptr[0];    b.x_f16 = (uint16_t*) ptr[1];    b.logits = (float*) ptr[2];    b.ids = (int*) ptr[3];    b.weights = (float*) ptr[4];    b.shared = (float*) ptr[5];    b.sh_scratch = (float*) ptr[6];    b.x_q8_0 = (uint8_t*) ptr[7];    b.x_q8k = (uint8_t*) ptr[8];    return total;}
 bool moe_route(const WeightTable &tables, const ModelGeometry &g, int64_t layer,
                int64_t k, const MoEBuffers &b, const float *x, void *stream,
-               std::string &err, const Doorbell *db) try {
+               std::string &err, const Doorbell *db) {
     using namespace strata::kernels; const LayerView v(tables, layer);
     const WeightRef *w_router = v.get("ffn_gate_inp.weight");
     if (w_router == nullptr) {
@@ -411,7 +403,7 @@ if (!native_bf16_projections) f32_to_bf16_bulk(x, b.x_bf16, g.n_embd, stream);
 project_bf16(x, b.x_bf16, (const uint16_t*) w_router->data, b.logits, g.n_embd, g.n_expert, true, stream);
 // ---- routing: softmax over ALL experts, stable descending argsort with ties by index, gather, renormalise
 // the native fused router is canonical-512x10 only; anything else takes the generic top-k kernel
-if (native_router_enabled() && (g.n_expert == 512 || g.n_expert == 256) && k == 10) {   // SYCL port: 256 too
+if (native_router_enabled() && (g.n_expert == 512 || g.n_expert == 256) && k == 10) {   // 256 experts too
     try { native_router_top10_multi_ne(b.logits, b.ids, b.weights, 1, (int) g.n_expert, stream); }
     catch (const std::exception& error) { err = v.name("router") + ": " + error.what(); return false; }
 } else router_top10(b.logits, 1, (int) g.n_expert, (int) k, b.ids, b.weights, stream);
@@ -423,21 +415,10 @@ if (native_router_enabled() && (g.n_expert == 512 || g.n_expert == 256) && k == 
 if (db != nullptr && g_publish_kernel) {
     strata::kernels::doorbell_publish(x, b.ids, b.weights, g.n_embd, k, db->d_x_f, db->d_ids, db->d_weights, db->d_seq,
                                       stream);
-/*
-DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy API. While the
-origin API might be synchronous, it depends on the type of operand memory, so
-you may need to call wait() on event return by memcpy API to ensure
-synchronization behavior.
-*/
 } else if (db != nullptr) {
-    if (DPCT_CHECK_ERROR(strata::q_of(stream)->memcpy(
-            db->d_x_f, x, (size_t)g.n_embd * 4)) != 0 ||
-        DPCT_CHECK_ERROR(strata::q_of(stream)->memcpy(db->d_ids, b.ids,
-                                                         (size_t)k * 4)) != 0 ||
-        DPCT_CHECK_ERROR(strata::q_of(stream)->memcpy(
-            db->d_weights, b.weights, (size_t)k * 4)) != 0) {
-        err = "moe_route: the doorbell handoff copy failed"; return false;
-    }
+    strata::ze::stream_of(stream)->memcpy(db->d_x_f, x, (size_t)g.n_embd * 4);
+    strata::ze::stream_of(stream)->memcpy(db->d_ids, b.ids, (size_t)k * 4);
+    strata::ze::stream_of(stream)->memcpy(db->d_weights, b.weights, (size_t)k * 4);
 // THE RING IS LAST, so a host that sees it knows every byte above is in place.  Ordering within a
 // stream is what makes that true; it is not a timing assumption.
 // THE RING LIVES IN A .cu: this file is compiled by the HOST compiler, where `__global__` and `<<<>>>` do
@@ -445,11 +426,6 @@ synchronization behavior.
 // write idempotent across replays of the same graph - a captured literal would ring the same number
 // forever and the host would never see a change.
 strata::kernels::doorbell_ring(db->d_seq, stream);    }    return true;}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
 // The verify window's routing: n tokens' logits in one BF16 projection and their top-k in one launch, each token
 // bitwise what `moe_route` gives it (the projection is the same kernel per column, the top-k kernel is per token).
 // Anything else (a native router, the canonical BF16 GEMVs, a doorbell) takes the per-token `moe_route`.
@@ -609,7 +585,7 @@ int64_t pool_slots_mapped(const ElasticPool& p) {
     return slots;
 }
 bool pool_grow(ElasticPool &p, int64_t cells,
-               const std::function<strata::core::VmmChunk()> &take) try {
+               const std::function<strata::core::VmmChunk()> &take) {
     const uint64_t G = strata::core::vmm_granularity();
     const int64_t slots = pool_slots(p, cells);
     for (size_t a = 0; a < p.off.size(); ++a) {
@@ -624,35 +600,12 @@ bool pool_grow(ElasticPool &p, int64_t cells,
             return false;
         }
         // what the chunk held before (another pool's cells, an expert) is not K/V: zeroed, as a new session is
-        for (const int64_t c : fresh)
-            if (DPCT_CHECK_ERROR(
-                    dpct::get_in_order_queue()
-                        .memset(p.range.base() + (uint64_t)c * G, 0, (size_t)G)
-                        .wait()) != 0) {
-                std::fprintf(
-                    stderr,
-                    "strata: the elastic K/V could not clear a chunk: %s\n",
-                    /*
-                    DPCT1009: SYCL reports errors using exceptions and does
-                    not use error codes. Please replace the
-                    "get_error_string_dummy(...)" with a real error-handling
-                    function.
-                    */
-                    /*
-                    DPCT1010: SYCL uses exceptions to report errors and
-                    does not use the error codes. The cudaGetLastError function
-                    call was replaced with 0. You need to rewrite this code.
-                    */
-                    dpct::get_error_string_dummy(0));
-                return false;
-            }
+        for (const int64_t c : fresh) {
+            strata::ze::default_stream().memset(p.range.base() + (uint64_t)c * G, 0, (size_t)G);
+            strata::ze::default_stream().sync();
+        }
     }
     return true;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
 }
 }  // namespace
 
@@ -679,16 +632,11 @@ int64_t qsa_kv_elastic_need(int64_t cells) {
     return n;
 }
 bool qsa_kv_elastic_grow(
-    int64_t cells, const std::function<strata::core::VmmChunk()> &take) try {
+    int64_t cells, const std::function<strata::core::VmmChunk()> &take) {
     for (auto& p : g_pools)
         if (!pool_grow(*p, cells, take)) return false;
-    return DPCT_CHECK_ERROR(
-               dpct::get_current_device().queues_wait_and_throw()) == 0;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+    strata::ze::device_sync();
+    return true;
 }
 int64_t qsa_kv_elastic_shrink(int64_t cells, const std::function<void(strata::core::VmmChunk)>& give) {
     const uint64_t G = strata::core::vmm_granularity();
@@ -879,23 +827,8 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     st.attention_status = c.take<int32_t>(1);
     st.pos_dev = c.take<int32_t>((uint64_t) s.n_head);
     // the pinned staging the uploads copy FROM - see the note on `host_step` in the header
-    if (DPCT_CHECK_ERROR(
-            st.host_step = (int32_t *)sycl::malloc_host(
-                strata::kernels::qsa_step_bytes() + sizeof(int32_t),
-                dpct::get_in_order_queue())) != 0 ||
-        /*
-        DPCT1048: The original value cudaHostAllocMapped is not meaningful in
-        the migrated code and was removed or replaced with 0. You may need to
-        check the migrated code.
-        */
-        /*
-        DPCT1048: The original value cudaHostAllocPortable is not meaningful
-        in the migrated code and was removed or replaced with 0. You may need to
-        check the migrated code.
-        */
-        DPCT_CHECK_ERROR(
-            st.host_pos = (int32_t *)sycl::malloc_host(
-                (size_t)s.n_head * 4, dpct::get_in_order_queue())) != 0) {
+    if ((st.host_step = (int32_t *)strata::ze::malloc_host(strata::kernels::qsa_step_bytes() + sizeof(int32_t))) == nullptr ||
+        (st.host_pos = (int32_t *)strata::ze::malloc_host((size_t)s.n_head * 4)) == nullptr) {
         return 0;   // the caller sees a zero byte count; a half-built state is worse than none
     }
     st.host_step[strata::kernels::kStepCount] = 0;
@@ -904,21 +837,9 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     if (p.mode != 0) {
         const uint64_t hrows = (uint64_t) pages * s.n_head_kv * s.page_size;
         const uint64_t bytes = (uint64_t) pages * strata::kernels::kv_block_bytes(s, qsa_kv_format(st)) + 4 * 256;
-        uint8_t* h = nullptr;
-        uint8_t* d = nullptr;
-        /*
-        DPCT1048: The original value cudaHostAllocMapped is not meaningful in
-        the migrated code and was removed or replaced with 0. You may need to
-        check the migrated code.
-        */
-        /*
-        DPCT1048: The original value cudaHostAllocPortable is not meaningful
-        in the migrated code and was removed or replaced with 0. You may need to
-        check the migrated code.
-        */
-        if (DPCT_CHECK_ERROR(h = (uint8_t *)sycl::malloc_host(
-                                 bytes, dpct::get_in_order_queue())) != 0 ||
-            DPCT_CHECK_ERROR(*(void **)&d = (uint8_t *)h) != 0) {
+        uint8_t* h = (uint8_t *)strata::ze::malloc_host(bytes);
+        uint8_t* d = h;
+        if (h == nullptr) {
             // under WSL the NVIDIA driver pins only ~1 GiB in all, which is less than 128K of 8-bit KV needs
             if (p.mode == 1) std::fprintf(stderr, "strata: KV streaming: cannot pin %.2f GiB of RAM for a layer's KV copy "
                                  "(%.2f GiB pinned so far) - lower the context, or run without --kv-resident (under "
@@ -953,12 +874,10 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         std::vector<float> hc((size_t) max_cells * (s.n_rot / 2)), hs((size_t) max_cells * (s.n_rot / 2));
         strata::kernels::build_rope_table((int) s.n_rot, strata::kernels::rope_scaling(), (int) max_cells,
                                           hc.data(), hs.data());
-        dpct::get_in_order_queue()
-            .memcpy(st.cos_tab, hc.data(), hc.size() * 4)
-            .wait();
-        dpct::get_in_order_queue()
-            .memcpy(st.sin_tab, hs.data(), hs.size() * 4)
-            .wait();
+        strata::ze::default_stream().memcpy(st.cos_tab, hc.data(), hc.size() * 4);
+        strata::ze::default_stream().sync();
+        strata::ze::default_stream().memcpy(st.sin_tab, hs.data(), hs.size() * 4);
+        strata::ze::default_stream().sync();
         st.owns_rope = true;
         if (s.n_rot == 64)   // the native and prompt-path rope kernels read it (mrope.hpp, STRATA_ROPE_TABLE=1)
             strata::kernels::rope_table_set(st.cos_tab, st.sin_tab, (int) max_cells, strata::kernels::rope_scaling());
@@ -968,48 +887,41 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     if (p.mode == 0) {
         std::vector<int32_t> tab((size_t) pages);
         for (int64_t i = 0; i < pages; ++i) tab[(size_t) i] = (int32_t) i;
-        dpct::get_in_order_queue()
-            .memcpy(st.page_table, tab.data(), tab.size() * 4)
-            .wait();
+        strata::ze::default_stream().memcpy(st.page_table, tab.data(), tab.size() * 4);
+        strata::ze::default_stream().sync();
     } else if (p.mode == 1) {
         strata::kernels::kv_stream_reset(st.map, nullptr);
     } else {
         strata::kernels::kv_ring_table(st.page_table, pages, p.slots, nullptr);
     }
-    dpct::get_current_device().queues_wait_and_throw();
+    strata::ze::device_sync();
     return c.used;
 }
 
 void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
     const QsaShapes s = qsa_shapes(g);
-    dpct::queue_ptr cs = strata::q_of(stream);
+    strata::ze::Stream* cs = strata::ze::stream_of(stream);
     // an elastic state zeroes what is mapped (the rest is zeroed when it is mapped)
     const int64_t live_slots = st.kv_elastic >= 0 ? pool_slots_mapped(*g_pools[(size_t) st.kv_elastic]) : st.n_slots;
     const size_t rows = (size_t) live_slots * s.n_head_kv * s.page_size;
     if (st.kv_hybrid) {
-        strata::big_fill_zero(*cs, st.k_q, rows * s.head_dim);
-        strata::big_fill_zero(*cs, st.k_scale,
-                   rows * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2);
-        strata::big_fill_zero(*cs, st.v_q4,
-                   rows *
+        strata::ze::fill_zero(*cs, st.k_q, rows * s.head_dim);
+        strata::ze::fill_zero(*cs, st.k_scale, rows * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2);
+        strata::ze::fill_zero(*cs, st.v_q4, rows *
                        strata::kernels::kv_q4_bytes_per_head((int)s.head_dim));
     } else if (st.kv_q4) {
-        strata::big_fill_zero(*cs, st.k_q4,
-                   rows *
+        strata::ze::fill_zero(*cs, st.k_q4, rows *
                        strata::kernels::kv_q4_bytes_per_head((int)s.head_dim));
-        strata::big_fill_zero(*cs, st.v_q4,
-                   rows *
+        strata::ze::fill_zero(*cs, st.v_q4, rows *
                        strata::kernels::kv_q4_bytes_per_head((int)s.head_dim));
     } else if (st.kv_int8) {
-        strata::big_fill_zero(*cs, st.k_q, rows * s.head_dim);
-        strata::big_fill_zero(*cs, st.v_q, rows * s.head_dim);
-        strata::big_fill_zero(*cs, st.k_scale,
-                   rows * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2);
-        strata::big_fill_zero(*cs, st.v_scale,
-                   rows * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2);
+        strata::ze::fill_zero(*cs, st.k_q, rows * s.head_dim);
+        strata::ze::fill_zero(*cs, st.v_q, rows * s.head_dim);
+        strata::ze::fill_zero(*cs, st.k_scale, rows * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2);
+        strata::ze::fill_zero(*cs, st.v_scale, rows * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2);
     } else {
-        strata::big_fill_zero(*cs, st.k_pool, rows * s.head_dim * 2);
-        strata::big_fill_zero(*cs, st.v_pool, rows * s.head_dim * 2);
+        strata::ze::fill_zero(*cs, st.k_pool, rows * s.head_dim * 2);
+        strata::ze::fill_zero(*cs, st.v_pool, rows * s.head_dim * 2);
     }
     // A streamed state starts over with nothing resident. Its host copy is not cleared (GBs over PCIe per new
     // conversation): no reader names a cell before this sequence has written it, and a block copied in whole
@@ -1071,31 +983,24 @@ constexpr int STAGE_SLOTS = 20;
 
 struct StageTimer {
     bool on = false;
-    dpct::event_ptr a[64][STAGE_SLOTS] = {};
-    dpct::event_ptr b[64][STAGE_SLOTS] = {};
+    strata::ze::Event* a[64][STAGE_SLOTS] = {};
+    strata::ze::Event* b[64][STAGE_SLOTS] = {};
     const char* names[STAGE_SLOTS] = {};
     int nslots = 0;
 };
 
 static StageTimer g_st;
 
-bool stage_timing_enable() try {
+bool stage_timing_enable() {
     if (g_st.on) return true;
     for (int l = 0; l < 64; ++l) {
         for (int s = 0; s < STAGE_SLOTS; ++s) {
-            if (DPCT_CHECK_ERROR(g_st.a[l][s] = new sycl::event()) !=
-                0) return false;
-            if (DPCT_CHECK_ERROR(g_st.b[l][s] = new sycl::event()) !=
-                0) return false;
+            g_st.a[l][s] = new strata::ze::Event(true);
+            g_st.b[l][s] = new strata::ze::Event(true);
         }
     }
     g_st.on = true;
     return true;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
 }
 
 void stage_timing_name(int slot, const char* name) {
@@ -1110,29 +1015,22 @@ void stage_mark_end(int64_t layer, int slot, void* stream) { st_end(layer, slot,
 
 static void st_begin(int64_t layer, int slot, void* stream) {
     if (g_st.on && layer < 64)
-        dpct::sync_barrier(g_st.a[layer][slot], strata::q_of(stream));
+        strata::ze::stream_of(stream)->record(*g_st.a[layer][slot]);
 }
 
 static void st_end(int64_t layer, int slot, void* stream) {
     if (g_st.on && layer < 64)
-        dpct::sync_barrier(g_st.b[layer][slot], strata::q_of(stream));
+        strata::ze::stream_of(stream)->record(*g_st.b[layer][slot]);
 }
 
-void stage_timing_report(int64_t n_layers) try {
+void stage_timing_report(int64_t n_layers) {
     if (!g_st.on) return;
-    dpct::get_current_device().queues_wait_and_throw();
+    strata::ze::device_sync();
     double tot[STAGE_SLOTS] = {};
     for (int s = 0; s < g_st.nslots; ++s) {
         for (int64_t l = 0; l < n_layers && l < 64; ++l) {
-            float ms = 0.0f;
-            if (DPCT_CHECK_ERROR(
-                    ms = (g_st.b[l][s]
-                              ->get_profiling_info<
-                                  sycl::info::event_profiling::command_end>() -
-                          g_st.a[l][s]
-                              ->get_profiling_info<sycl::info::event_profiling::
-                                                       command_start>()) /
-                         1000000.0f) == 0) tot[s] += (double)ms;
+            const float ms = g_st.b[l][s]->elapsed_ms_since(*g_st.a[l][s]);
+            tot[s] += (double)ms;
         }
     }
     double sum = 0;
@@ -1152,15 +1050,8 @@ void stage_timing_report(int64_t n_layers) try {
     double gdn = 0, qsa = 0;
     int ng = 0, nq = 0;
     for (int64_t l = 0; l < n_layers && l < 64; ++l) {
-        float ms = 0.0f;
-        if (DPCT_CHECK_ERROR(
-                ms = (g_st.b[l][1]
-                          ->get_profiling_info<
-                              sycl::info::event_profiling::command_end>() -
-                      g_st.a[l][1]
-                          ->get_profiling_info<
-                              sycl::info::event_profiling::command_start>()) /
-                     1000000.0f) != 0) continue;
+        const float ms = g_st.b[l][1]->elapsed_ms_since(*g_st.a[l][1]);
+        if (ms <= 0.0f) continue;
         const bool is_qsa = (l % 4) == 3;
         if (is_qsa) { qsa += ms; ++nq; } else { gdn += ms; ++ng; }
         std::fprintf(stderr, "  %s%2lld %7.3f%s", is_qsa ? "*" : " ", (long long) l, (double) ms,
@@ -1168,11 +1059,6 @@ void stage_timing_report(int64_t n_layers) try {
     }
     std::fprintf(stderr, "\n  GDN: %d layers, %.3f ms total, %.4f ms/layer\n", ng, gdn, ng ? gdn / ng : 0.0);
     std::fprintf(stderr, "  QSA: %d layers, %.3f ms total, %.4f ms/layer\n", nq, qsa, nq ? qsa / nq : 0.0);
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
 }
 
 // Declared here because `qsa_layer` is defined above `block_layer_pre`, where the body lives.  The dump buffer
@@ -1213,22 +1099,13 @@ if (!w_attnk->native_data || !w_attnv->native_data || !w_attnq->native_data) {
 // `layer.hpp`.  That is a silent failure, not a fault: the copy succeeds, the counts are wrong, and the
 // token that comes out is plausible.
 {        qsa_step_fill(st.host_step, pos, s);        for (int64_t h = 0; h < g.n_head; ++h) st.host_pos[h] = (int32_t) (pos_base + pos);
-        int32_t* m_step = nullptr;
-        int32_t* m_pos = nullptr;
-        if (g_publish_kernel &&
-            DPCT_CHECK_ERROR(*(void **)&m_step = (int32_t *)st.host_step) ==
-                0 &&
-            DPCT_CHECK_ERROR(*(void **)&m_pos = (int32_t *)st.host_pos) == 0) {
-            strata::kernels::copy_i32_from_mapped(st.step, m_step, strata::kernels::kStepCount, stream);
-            strata::kernels::copy_i32_from_mapped(st.pos_dev, m_pos, g.n_head, stream);
-        } else
-        /*
-        DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy API.
-        While the origin API might be synchronous, it depends on the type of
-        operand memory, so you may need to call wait() on event return by memcpy
-        API to ensure synchronization behavior.
-        */
-        if (DPCT_CHECK_ERROR(strata::q_of(stream)->memcpy(st.step, st.host_step, qsa_step_bytes())) != 0 ||            DPCT_CHECK_ERROR(strata::q_of(stream)->memcpy(st.pos_dev, st.host_pos, (size_t) g.n_head * 4)) != 0) {            err = "qsa_layer: the step-state upload failed";            return false;        }    }
+        if (g_publish_kernel) {
+            strata::kernels::copy_i32_from_mapped(st.step, st.host_step, strata::kernels::kStepCount, stream);
+            strata::kernels::copy_i32_from_mapped(st.pos_dev, st.host_pos, g.n_head, stream);
+        } else {
+            strata::ze::stream_of(stream)->memcpy(st.step, st.host_step, qsa_step_bytes());
+            strata::ze::stream_of(stream)->memcpy(st.pos_dev, st.host_pos, (size_t) g.n_head * 4);
+        }    }
 // ---- 3. the indexer's RAW key: appended before any norm, pooled later once per block
 project_bf16(x, b.x_bf16, (const uint16_t*) w_idxk->data, b.idx_raw, g.n_embd, g.idx_key_dim, false, stream);
 // ---- 4. K and V, in Q8_K, then norm and rotate K only
@@ -1278,18 +1155,8 @@ if (!gemv_quantized(*w_attnq, p_q, f_q, b.x_q8_0, b.x_q8k, b.q_full, g.n_embd, g
 // `per_head[:, :head_dim]` - the FIRST half of each head's 2*head_dim block, copied out contiguously so
 // the norm and the rotation see whole rows.  A 2-D copy is a memcpy node, which captures (`pinned_capture`
 // case A) and needs no kernel.
-/*
-DPCT1124: cudaMemcpy2DAsync is migrated to asynchronous memcpy API. While
-the origin API might be synchronous, it depends on the type of operand memory,
-so you may need to call wait() on event return by memcpy API to ensure
-synchronization behavior.
-*/
-if (DPCT_CHECK_ERROR(dpct::async_dpct_memcpy(
-        b.qcur, (size_t)g.head_dim * 4, b.q_full, (size_t)g.head_dim * 2 * 4,
-        (size_t)g.head_dim * 4, (size_t)g.n_head, dpct::device_to_device,
-        *strata::q_of(stream))) != 0) {
-    err = "qsa_layer: the q/gate split failed"; return false;
-} if (!normalize_rotate(b.qcur, w_qn, (int)g.n_head,
+strata::ze::stream_of(stream)->memcpy_2d(b.qcur, (size_t)g.head_dim * 4, b.q_full, (size_t)g.head_dim * 2 * 4, (size_t)g.head_dim * 4, (size_t)g.n_head);
+if (!normalize_rotate(b.qcur, w_qn, (int)g.n_head,
                         (int)g.head_dim)) return false;
 // ---- 7. the indexer's query: BF16, then norm and rotate
 project_bf16(x, b.x_bf16, (const uint16_t*) w_idxq->data, b.q_idx, g.n_embd, g.idx_q_heads * g.idx_key_dim, false, stream);
@@ -1328,17 +1195,7 @@ int64_t max_blocks = (st.max_cells / s.idx_block) + 2;
         native_flash_attn_short_step(b.qcur, b.k_scratch, b.v_scratch, st.step, cap,
             (int) st.max_cells, s, b.attn, st.attention_status, nullptr, stream);
     } catch (const std::exception& error) { err = v.name("native_flash_attn") + ": " + error.what(); return false; }
-    /*
-    DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy API. While
-    the origin API might be synchronous, it depends on the type of operand
-    memory, so you may need to call wait() on event return by memcpy API to
-    ensure synchronization behavior.
-    */
-    if (DPCT_CHECK_ERROR(strata::q_of(stream)->memcpy(
-            st.host_step + kStepCount, st.attention_status, sizeof(int32_t))) !=
-        0) {
-        err = v.name("native_flash_attn") + ": status readback failed"; return false;
-    }
+    strata::ze::stream_of(stream)->memcpy(st.host_step + kStepCount, st.attention_status, sizeof(int32_t));
 } else qsa_attend_step(b.qcur, b.k_scratch, b.v_scratch, st.step, cap, s, b.attn, nullptr, stream);
     }
     if (st.kv_rot || st.kv_hybrid) strata::kernels::fwht256_inplace_cuda(b.attn, g.n_head, stream);   // the output back: H is self-inverse
@@ -1363,26 +1220,14 @@ namespace {}
 uint64_t doorbell_init(const ModelGeometry& g, int64_t k, Doorbell& db) {    db.n_embd = g.n_embd;    db.k = k;    uint64_t bytes = 0;
 // ONE region per field, each MAPPED PINNED, so the device and the host have different pointers to the same
 // bytes and no copy is needed to publish them.
-/*
-DPCT1048: The original value cudaHostAllocMapped is not meaningful in the
-migrated code and was removed or replaced with 0. You may need to check the
-migrated code.
-*/
 auto alloc = [&](size_t n, void** h, void** d, const char* what) {
-                                                                          try {
-if (DPCT_CHECK_ERROR(*h = (void *)sycl::malloc_host(n, dpct::get_in_order_queue())) != 0) {            std::fprintf(stderr, "doorbell_init: cudaHostAlloc(%s) failed\n", what);            return false;        }        if (DPCT_CHECK_ERROR(*d = (void *)*h) != 0) {            std::fprintf(stderr, "doorbell_init: cudaHostGetDevicePointer(%s) failed\n", what);            return false;        }        std::memset(*h, 0, n);        bytes += n;        return true;    }
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
-};    if (!alloc((size_t) g.n_embd * 4, (void**) &db.h_x_f, (void**) &db.d_x_f, "x_f")) return 0;    if (!alloc((size_t) k * 4, (void**) &db.h_ids, (void**) &db.d_ids, "ids")) return 0;    if (!alloc((size_t) k * 4, (void**) &db.h_weights, (void**) &db.d_weights, "weights")) return 0;    if (!alloc(64, (void**) &db.h_seq, (void**) &db.d_seq, "seq")) return 0;   /* + the payload tag and checksum */    if (!alloc(4, (void**) &db.h_flag, (void**) &db.d_flag, "flag")) return 0;    return bytes;}
+if ((*h = strata::ze::malloc_host(n)) == nullptr) {            std::fprintf(stderr, "doorbell_init: cudaHostAlloc(%s) failed\n", what);            return false;        }        *d = *h;        std::memset(*h, 0, n);        bytes += n;        return true;    };    if (!alloc((size_t) g.n_embd * 4, (void**) &db.h_x_f, (void**) &db.d_x_f, "x_f")) return 0;    if (!alloc((size_t) k * 4, (void**) &db.h_ids, (void**) &db.d_ids, "ids")) return 0;    if (!alloc((size_t) k * 4, (void**) &db.h_weights, (void**) &db.d_weights, "weights")) return 0;    if (!alloc(64, (void**) &db.h_seq, (void**) &db.d_seq, "seq")) return 0;   /* + the payload tag and checksum */    if (!alloc(4, (void**) &db.h_flag, (void**) &db.d_flag, "flag")) return 0;    return bytes;}
 void doorbell_free(Doorbell &db) {
-    if (db.h_x_f) sycl::free(db.h_x_f, dpct::get_in_order_queue());
-    if (db.h_ids) sycl::free(db.h_ids, dpct::get_in_order_queue());
-    if (db.h_weights) sycl::free(db.h_weights, dpct::get_in_order_queue());
-    if (db.h_seq) sycl::free(db.h_seq, dpct::get_in_order_queue());
-    if (db.h_flag) sycl::free(db.h_flag, dpct::get_in_order_queue());
+    if (db.h_x_f) strata::ze::free(db.h_x_f);
+    if (db.h_ids) strata::ze::free(db.h_ids);
+    if (db.h_weights) strata::ze::free(db.h_weights);
+    if (db.h_seq) strata::ze::free(db.h_seq);
+    if (db.h_flag) strata::ze::free(db.h_flag);
     db = Doorbell{};
 }
 void doorbell_reset(const Doorbell& db) {
@@ -1520,13 +1365,7 @@ uint64_t dump_stride_floats(const ModelGeometry& g) {
 static void dump_slot(float* dump, const ModelGeometry& g, int64_t layer, const float* src, uint64_t off,
                       uint64_t n, void* stream) {
     if (dump == nullptr || src == nullptr || n == 0) return;
-    /*
-    DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy API. While
-    the origin API might be synchronous, it depends on the type of operand
-    memory, so you may need to call wait() on event return by memcpy API to
-    ensure synchronization behavior.
-    */
-    strata::q_of(stream)->memcpy(dump + (size_t)layer * dump_stride_floats(g) + off, src,
+    strata::ze::stream_of(stream)->memcpy(dump + (size_t)layer * dump_stride_floats(g) + off, src,
                        n * sizeof(float));
 }
 static void dump_half(const BlockBuffers& bb, const ModelGeometry& g, int64_t layer, const float* src,
@@ -1539,7 +1378,7 @@ bool block_layer_pre(const WeightTable &tables, const ModelGeometry &g,
                      const QsaBuffers &qb, const MoEBuffers &mb, int64_t k,
                      const BlockBuffers &bb, void *stream, std::string &err,
                      const Doorbell *db, const PleRun *ple, int half,
-                     int stage_prefix) try {
+                     int stage_prefix) {
     // ================================ THE PLE, AT LAYER 1 ONLY ================================
     //
     // **THIS IS THE CALL WHOSE ABSENCE FAILED GATE C1.**  Layer 1 carries the six `blk.1.ple_*` tensors and no
@@ -1592,15 +1431,6 @@ bool block_layer_pre(const WeightTable &tables, const ModelGeometry &g,
         // NG_HIST-1 elements per channel and an append is a strided copy of one - not a flat memmove, which
         // would be the natural reading and would scramble the channels.
         strata::kernels::ple_history_advance(ple->hist, po.normalized, stream);
-        /*
-        DPCT1010: SYCL uses exceptions to report errors and does not use
-        the error codes. The cudaPeekAtLastError function call was replaced with
-        0. You need to rewrite this code.
-        */
-        if (0 != 0) {
-            err = "block_layer_pre: the PLE history shift failed";
-            return false;
-        }
     }
     const bool qsa = is_qsa_layer(g, layer);    const LayerView v(tables, layer);    const strata::kernels::GrShapes gs{g.n_embd, g.hc, g.hc_lr};
 // ---- the two halves' GR tensors.  Both halves have the same four names with a different prefix, and the
@@ -1664,11 +1494,6 @@ st_begin(layer, 3, stream);
     // lived inside the stage-4 block and restructuring that left the function with no return at all.
     return true;
 }
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
 bool ple_issue_token(const PleRun& p, std::string& err) {
     if (!p.ready()) { err = "ple_issue_token: the PLE run is not ready"; return false; }
     uint32_t rows[strata::kernels::PLE_N_HEADS];
@@ -1677,27 +1502,11 @@ bool ple_issue_token(const PleRun& p, std::string& err) {
     return true;
 }
 
-bool ple_finish_token(const PleRun &p, void *stream, std::string &err) try {
+bool ple_finish_token(const PleRun &p, void *stream, std::string &err) {
     if (!p.ready()) { err = "ple_finish_token: the PLE run is not ready"; return false; }
     if (!p.table->collect(p.emb_host, err)) { err = "ple_finish_token: " + err; return false; }
-    /*
-    DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy API. While
-    the origin API might be synchronous, it depends on the type of operand
-    memory, so you may need to call wait() on event return by memcpy API to
-    ensure synchronization behavior.
-    */
-    if (DPCT_CHECK_ERROR(strata::q_of(stream)->memcpy(
-            p.emb_dev, p.emb_host,
-            (size_t)strata::kernels::NG_N_EMBD * sizeof(float))) != 0) {
-        err = "ple_finish_token: the row upload failed";
-        return false;
-    }
+    strata::ze::stream_of(stream)->memcpy(p.emb_dev, p.emb_host, (size_t)strata::kernels::NG_N_EMBD * sizeof(float));
     return true;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
 }
 
 bool ple_stage_token(const PleRun& p, void* stream, std::string& err) {

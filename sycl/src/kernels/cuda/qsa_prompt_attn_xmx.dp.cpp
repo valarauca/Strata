@@ -12,45 +12,27 @@
 // v2: 64-cell chunks (a quarter of the per-cell overhead), V packed two cells at a time as 32-byte contiguous stores,
 // K^T packed as 4-byte pairs with INT8 converted on the load, hi and lo halves of Q accumulated into one accumulator per
 // scale group, and one accumulator update per chunk after the whole P.V product has run in registers.
+#include "strata/port.hpp"
 #include "strata/kernels/qsa_prompt_attn_xmx.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/kv_q8.hpp"
-#include "strata/sycl_queue.hpp"
-#include <sycl/sycl.hpp>
 #include <sycl/ext/oneapi/matrix/matrix.hpp>
-#include <dpct/dpct.hpp>
 #include <cmath>
 #include <cstdint>
-#include <cstdio>
-#include <cstdlib>
 
 namespace strata::kernels {
 namespace {
 namespace jm = sycl::ext::oneapi::experimental::matrix;
-constexpr int HD = 256, G = 12, SG = 16, NSG = 8, THREADS = SG * NSG, QS = HD + 8;
+using qsa_xmx::HD;
+using qsa_xmx::G;
+using qsa_xmx::SG;
+using qsa_xmx::NSG;
+using qsa_xmx::THREADS;
+using qsa_xmx::QS;
+using qsa_xmx::Layout;
 constexpr int QK4_0 = 32;
 struct q4_0_block { uint16_t d; uint8_t qs[QK4_0 / 2]; };
-
-// local memory layout for CH cells per chunk; the P tiles reuse the K^T region (K is done once the scores are)
-template <int CH>
-struct Layout {
-    static constexpr int PS = CH + 8;                        // P / score row stride
-    static constexpr int NT = CH / 16;                       // cell tiles
-    static constexpr int UNITS = NT * 4;                     // (cell tile, scale group) score units
-    static constexpr size_t q = 2 * 16 * QS * 2;             // Q hi, Q lo (halves)
-    static constexpr size_t kp = (size_t) CH * HD * 2;       // packed K^T, then the P tiles
-    static constexpr size_t pv = (size_t) 4 * 2 * 16 * PS * 2;
-    static constexpr size_t kp_or_pv = kp > pv ? kp : pv;
-    static constexpr size_t vp = (size_t) CH * HD * 2;       // packed V
-    static constexpr size_t parts = (size_t) (UNITS > 16 ? UNITS : 16) * 256 * 4;   // score units, then P.V tiles
-    static constexpr size_t s = (size_t) 16 * PS * 4;        // probabilities
-    static constexpr size_t acc = (size_t) 16 * HD * 4;
-    static constexpr size_t scal = (size_t) CH * 4 * 4 * 2;  // ks, vs
-    static constexpr size_t misc = 80 * 4;
-    static constexpr size_t row = (size_t) CH * 8;
-    static constexpr size_t bytes = q + kp_or_pv + vp + parts + s + acc + scal + misc + row + 16 * 12;
-};
 
 template <typename T>
 __dpct_inline__ auto lptr(T* p) {
@@ -321,65 +303,8 @@ void prompt_attn_xmx2(const float* __restrict__ q, QsaAttnPools p, const int32_t
     }
 }
 
-template <int KV_MODE, int CH>
-bool launch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
-            const QsaShapes& s, float* attn, int64_t n_q, dpct::queue_ptr st) {
-    const float scale_log2 = 1.4426950408889634f / std::sqrt((float) HD);
-    constexpr size_t bytes = Layout<CH>::bytes;
-    for (int64_t q0 = 0; q0 < n_q; q0 += 65535) {
-        const int64_t nb = n_q - q0 < 65535 ? n_q - q0 : 65535;
-        const float* qq = q + q0 * s.n_head * HD;
-        const int32_t* idq = ids + q0 * cap;
-        const int32_t* stq = steps + q0 * kStepCount;
-        float* aq = attn + q0 * s.n_head * HD;
-        const int nkv = (int) s.n_head_kv, ps = (int) s.page_size, capi = (int) cap;
-        st->submit([&](sycl::handler& cgh) {
-            sycl::local_accessor<uint8_t, 1> slm(sycl::range<1>(bytes), cgh);
-            cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, (size_t) nkv, (size_t) nb * THREADS), sycl::range<3>(1, 1, THREADS)),
-                             [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(16)]] {
-                                 prompt_attn_xmx2<KV_MODE, CH>(qq, pools, idq, stq, nkv, ps, scale_log2, aq, capi,
-                                                               slm.get_multi_ptr<sycl::access::decorated::no>().get());
-                             });
-        });
-    }
-    return true;
-}
-
-template <int CH>
-bool dispatch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
-              const QsaShapes& s, float* attn, int64_t n_q, dpct::queue_ptr st) {
-    if (pools.k_q != nullptr && pools.v_q4 != nullptr) {
-        if (!pools.k_scale) return false;
-        return launch<3, CH>(q, pools, ids, steps, cap, s, attn, n_q, st);
-    }
-    if (pools.k_q != nullptr) {
-        if (!pools.v_q || !pools.k_scale || !pools.v_scale) return false;
-        return launch<1, CH>(q, pools, ids, steps, cap, s, attn, n_q, st);
-    }
-    if (!pools.k_pool || !pools.v_pool) return false;
-    return launch<0, CH>(q, pools, ids, steps, cap, s, attn, n_q, st);
-}
 }  // namespace
 
-bool qsa_prompt_attn_xmx(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
-                         const QsaShapes& s, float* attn, int64_t n_q, void* stream) {
-    // STRATA_PROMPT_ATTN_XMX=1 (64-cell chunks) or =32 (32-cell chunks); unset or 0: the caller's fallback
-    static const int mode = [] { const char* v = std::getenv("STRATA_PROMPT_ATTN_XMX"); return v ? std::atoi(v) : 0; }();
-    if (mode == 0 || n_q <= 0) return false;
-    if (pools.k_q4 != nullptr || s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !ids || !steps ||
-        !pools.page_table)
-        return false;
-    dpct::queue_ptr st = strata::q_of(stream);
-    const size_t have = st->get_device().get_info<sycl::info::device::local_mem_size>();
-    const bool ch64 = mode != 32 && have >= Layout<64>::bytes;
-    static bool told = false;
-    if (!told) {
-        told = true;
-        std::fprintf(stderr, "strata: prompt attention on XMX, %d-cell chunks (%zu of %zu bytes of local memory)\n",
-                     ch64 ? 64 : 32, ch64 ? Layout<64>::bytes : Layout<32>::bytes, have);
-    }
-    if (!ch64 && have < Layout<32>::bytes) return false;
-    return ch64 ? dispatch<64>(q, pools, ids, steps, cap, s, attn, n_q, st)
-                : dispatch<32>(q, pools, ids, steps, cap, s, attn, n_q, st);
-}
+#include "qsa_prompt_attn_xmx.kern.inc"
+
 }  // namespace strata::kernels

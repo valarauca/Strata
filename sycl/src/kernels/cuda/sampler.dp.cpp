@@ -19,31 +19,10 @@
 //     block per token, `top_k` block-argmax rounds, each over the logits after the previous pick;
 //   - `sampler_kernel` (`STRATA_OLD_SAMPLER=1`), the kernel of engine 0.1.20, kept as the reference.
 // The two new ones share `sampled_tail_warp` (top_p / min_p / temperature / draw on one warp).
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
-#include "strata/sycl_queue.hpp"
+#include "strata/port.hpp"
 #include "strata/sycl_math.hpp"
 #include "strata/kernels/sampler.hpp"
 #include "strata/core/coupled_draft.hpp"
-#include "strata/core/emulate.hpp"
-
-#include <cmath>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <mutex>
-#include <type_traits>
-#include <vector>
-
-namespace {
-// The sampler's accumulators are strata::samp_acc_t (float unless -DSTRATA_SYCL_SAMPLER_FP64=1), so its kernels need FP64
-// only in that build. dpct left an `aspect::fp64` check before every launch; on an Arc Alchemist (A750, no FP64) it
-// threw "'double' is not supported" at the first sampled token unless Intel's FP64 emulation was switched on.
-inline void sampler_require_fp64([[maybe_unused]] const sycl::device& d) {
-    if constexpr (std::is_same_v<strata::samp_acc_t, double>) dpct::has_capability_or_fail(d, {sycl::aspect::fp64});
-}
-}  // namespace
 
 namespace strata::kernels {
 namespace {
@@ -147,10 +126,6 @@ sampler_greedy_kernel(const float *__restrict__ logits, int n_vocab,
 #pragma unroll
         for (int w = item_ct1.get_local_id(2); w < bits_words;
              w += item_ct1.get_local_range(2)) penal_bits[w] = 0u;
-        /*
-        DPCT1118: SYCL group functions and algorithms must be encountered in
-        converged control flow. You may need to adjust the code.
-        */
         item_ct1.barrier(sycl::access::fence_space::local_space);
 #pragma unroll
         for (int i = item_ct1.get_local_id(2); i < hlen;
@@ -159,10 +134,6 @@ sampler_greedy_kernel(const float *__restrict__ logits, int n_vocab,
                 dpct::atomic_fetch_or<
                     sycl::access::address_space::generic_space>(
                     &penal_bits[hrow[i] >> 5], 1u << (hrow[i] & 31));
-        /*
-        DPCT1118: SYCL group functions and algorithms must be encountered in
-        converged control flow. You may need to adjust the code.
-        */
         item_ct1.barrier(sycl::access::fence_space::local_space);
     }
     auto hit_count = [&](int v, uint8_t *dpct_local) -> int {
@@ -180,19 +151,9 @@ sampler_greedy_kernel(const float *__restrict__ logits, int n_vocab,
         if (s > bv) { bv = s; best = v; }
     }
     for (int off = 16; off > 0; off >>= 1) {
-        /*
-        DPCT1108: '__shfl_down_sync' was migrated with the experimental
-        feature masked sub_group function which may not be supported by all
-        compilers or runtimes. You may need to adjust the code.
-        */
         const float ov = dpct::experimental::shift_sub_group_left(
             0xFFFFFFFFu, sycl::ext::oneapi::this_work_item::get_sub_group(), bv,
             off);
-        /*
-        DPCT1108: '__shfl_down_sync' was migrated with the experimental
-        feature masked sub_group function which may not be supported by all
-        compilers or runtimes. You may need to adjust the code.
-        */
         const int oi = dpct::experimental::shift_sub_group_left(
             0xFFFFFFFFu, sycl::ext::oneapi::this_work_item::get_sub_group(),
             best, off);
@@ -212,19 +173,9 @@ sampler_greedy_kernel(const float *__restrict__ logits, int n_vocab,
             lane < nw ? sv[lane] : sycl::bit_cast<float, int>(0xff800000);
         int wi = lane < nw ? si[lane] : n_vocab;
         for (int off = 16; off > 0; off >>= 1) {
-            /*
-            DPCT1108: '__shfl_down_sync' was migrated with the experimental
-            feature masked sub_group function which may not be supported by all
-            compilers or runtimes. You may need to adjust the code.
-            */
             const float ov = dpct::experimental::shift_sub_group_left(
                 0xFFFFFFFFu, sycl::ext::oneapi::this_work_item::get_sub_group(),
                 wv, off);
-            /*
-            DPCT1108: '__shfl_down_sync' was migrated with the experimental
-            feature masked sub_group function which may not be supported by all
-            compilers or runtimes. You may need to adjust the code.
-            */
             const int oi = dpct::experimental::shift_sub_group_left(
                 0xFFFFFFFFu, sycl::ext::oneapi::this_work_item::get_sub_group(),
                 wi, off);
@@ -282,13 +233,7 @@ auto &sv = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[32]>(
         *sycl::ext::oneapi::group_local_memory_for_overwrite<int[kAmCtas]>(
             sycl::ext::oneapi::this_work_item::get_work_group<3>());
     unsigned rank;
-    /*
-    DPCT1053: Migration of device assembly code is not supported.
-    */
     asm volatile("mov.u32 %0, %%cluster_ctarank;\n" : "=r"(rank));
-    /*
-    DPCT1053: Migration of device assembly code is not supported.
-    */
     asm volatile("barrier.cluster.arrive.relaxed.aligned;\n" ::: "memory");
     const float *l = logits + (size_t)item_ct1.get_group(1) * n_vocab;
     float bv = sycl::bit_cast<float, int>(
@@ -308,11 +253,6 @@ auto &sv = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[32]>(
     for (; v < n_vocab; v += S) am_take(l[v], v, bv, best);
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1)
-        /*
-        DPCT1108: '__shfl_down_sync' was migrated with the experimental
-        feature masked sub_group function which may not be supported by all
-        compilers or runtimes. You may need to adjust the code.
-        */
         am_merge(
             dpct::experimental::shift_sub_group_left(
                 0xFFFFFFFFu, sycl::ext::oneapi::this_work_item::get_sub_group(),
@@ -330,11 +270,6 @@ auto &sv = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[32]>(
         best = si[lane];
 #pragma unroll
         for (int off = 16; off > 0; off >>= 1)
-            /*
-            DPCT1108: '__shfl_down_sync' was migrated with the experimental
-            feature masked sub_group function which may not be supported by all
-            compilers or runtimes. You may need to adjust the code.
-            */
             am_merge(dpct::experimental::shift_sub_group_left(
                          0xFFFFFFFFu,
                          sycl::ext::oneapi::this_work_item::get_sub_group(), bv,
@@ -345,47 +280,27 @@ auto &sv = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[32]>(
                          best, off),
                      bv, best);
     }
-    /*
-    DPCT1053: Migration of device assembly code is not supported.
-    */
     asm volatile("barrier.cluster.wait.acquire.aligned;\n" ::
                      : "memory"); // CTA 0 runs
     if (item_ct1.get_local_id(2) == 0) {
         uint64_t a;
-        /*
-        DPCT1053: Migration of device assembly code is not supported.
-        */
         asm volatile("mapa.u64 %0, %1, %2;\n"
                      : "=l"(a)
                      : "l"((uint64_t)&cv[rank]), "r"(0u));
         *reinterpret_cast<float*>(a) = bv;
-        /*
-        DPCT1053: Migration of device assembly code is not supported.
-        */
         asm volatile("mapa.u64 %0, %1, %2;\n"
                      : "=l"(a)
                      : "l"((uint64_t)&ci[rank]), "r"(0u));
         *reinterpret_cast<int*>(a) = best;
     }
-    /*
-    DPCT1053: Migration of device assembly code is not supported.
-    */
     asm volatile("barrier.cluster.arrive.release.aligned;\n" ::: "memory");
     if (rank != 0) return;
-    /*
-    DPCT1053: Migration of device assembly code is not supported.
-    */
     asm volatile("barrier.cluster.wait.acquire.aligned;\n" ::: "memory");
     if (warp == 0) {
         bv = lane < kAmCtas ? cv[lane] : sycl::bit_cast<float, int>(0xff800000);
         best = lane < kAmCtas ? ci[lane] : n_vocab;
 #pragma unroll
         for (int off = 16; off > 0; off >>= 1)
-            /*
-            DPCT1108: '__shfl_down_sync' was migrated with the experimental
-            feature masked sub_group function which may not be supported by all
-            compilers or runtimes. You may need to adjust the code.
-            */
             am_merge(dpct::experimental::shift_sub_group_left(
                          0xFFFFFFFFu,
                          sycl::ext::oneapi::this_work_item::get_sub_group(), bv,
@@ -399,7 +314,7 @@ auto &sv = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[32]>(
     }
 #else
     (void) logits; (void) n_vocab; (void) out;
-    __trap();
+    __builtin_trap();
 #endif
 }
 #endif  // !__HIPCC__
@@ -422,12 +337,6 @@ auto &sv = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[32]>(
 /// sweep is O(k) per logit per round, O(k^2 x n_vocab) per row (47 M shared-memory compares at k = 20, 500 M at
 /// 64), and the double-precision tail runs on all 1,024 threads where one warp suffices - GeForce issues FP64 at
 /// 1/64 of FP32.  The kernels after this one remove both and select the same list in the same order.
-/*
-DPCT1110: The total declared local variable size in device function
-sampler_kernel exceeds 128 bytes and may cause high register pressure. Consult
-with your hardware vendor to find the total register size available and adjust
-the code, or use smaller sub-group size to avoid high register pressure.
-*/
 __dpct_inline__ void sampler_kernel(const float *__restrict__ logits,
                                     int n_vocab, int n_tokens,
                                     const int *__restrict__ history,
@@ -463,10 +372,6 @@ __dpct_inline__ void sampler_kernel(const float *__restrict__ logits,
 #pragma unroll
         for (int w = item_ct1.get_local_id(2); w < bits_words;
              w += item_ct1.get_local_range(2)) penal_bits[w] = 0u;
-        /*
-        DPCT1118: SYCL group functions and algorithms must be encountered in
-        converged control flow. You may need to adjust the code.
-        */
         item_ct1.barrier(sycl::access::fence_space::local_space);
 #pragma unroll
         for (int i = item_ct1.get_local_id(2); i < hlen;
@@ -475,10 +380,6 @@ __dpct_inline__ void sampler_kernel(const float *__restrict__ logits,
                 dpct::atomic_fetch_or<
                     sycl::access::address_space::generic_space>(
                     &penal_bits[hrow[i] >> 5], 1u << (hrow[i] & 31));
-        /*
-        DPCT1118: SYCL group functions and algorithms must be encountered in
-        converged control flow. You may need to adjust the code.
-        */
         item_ct1.barrier(sycl::access::fence_space::local_space);
     }
     auto hit_count = [&](int v, uint8_t *dpct_local) -> int {
@@ -522,19 +423,9 @@ __dpct_inline__ void sampler_kernel(const float *__restrict__ logits,
             if (s > bv) { bv = s; best = v; }
         }
         for (int off = 16; off > 0; off >>= 1) {
-            /*
-            DPCT1108: '__shfl_down_sync' was migrated with the experimental
-            feature masked sub_group function which may not be supported by all
-            compilers or runtimes. You may need to adjust the code.
-            */
             const float ov = dpct::experimental::shift_sub_group_left(
                 0xFFFFFFFFu, sycl::ext::oneapi::this_work_item::get_sub_group(),
                 bv, off);
-            /*
-            DPCT1108: '__shfl_down_sync' was migrated with the experimental
-            feature masked sub_group function which may not be supported by all
-            compilers or runtimes. You may need to adjust the code.
-            */
             const int oi = dpct::experimental::shift_sub_group_left(
                 0xFFFFFFFFu, sycl::ext::oneapi::this_work_item::get_sub_group(),
                 best, off);
@@ -543,10 +434,6 @@ __dpct_inline__ void sampler_kernel(const float *__restrict__ logits,
         const int warp = (int)(item_ct1.get_local_id(2) >> 5),
                   lane = (int)(item_ct1.get_local_id(2) & 31);
         if (lane == 0) { sv[warp] = bv; si[warp] = best; }
-        /*
-        DPCT1118: SYCL group functions and algorithms must be encountered in
-        converged control flow. You may need to adjust the code.
-        */
         item_ct1.barrier(sycl::access::fence_space::local_space);
         if (warp == 0) {
             const int nw = (int)((item_ct1.get_local_range(2) + 31) >> 5);
@@ -554,22 +441,10 @@ __dpct_inline__ void sampler_kernel(const float *__restrict__ logits,
                 lane < nw ? sv[lane] : sycl::bit_cast<float, int>(0xff800000);
             int wi = lane < nw ? si[lane] : n_vocab;
             for (int off = 16; off > 0; off >>= 1) {
-                /*
-                DPCT1108: '__shfl_down_sync' was migrated with the
-                experimental feature masked sub_group function which may not be
-                supported by all compilers or runtimes. You may need to adjust
-                the code.
-                */
                 const float ov = dpct::experimental::shift_sub_group_left(
                     0xFFFFFFFFu,
                     sycl::ext::oneapi::this_work_item::get_sub_group(), wv,
                     off);
-                /*
-                DPCT1108: '__shfl_down_sync' was migrated with the
-                experimental feature masked sub_group function which may not be
-                supported by all compilers or runtimes. You may need to adjust
-                the code.
-                */
                 const int oi = dpct::experimental::shift_sub_group_left(
                     0xFFFFFFFFu,
                     sycl::ext::oneapi::this_work_item::get_sub_group(), wi,
@@ -578,10 +453,6 @@ __dpct_inline__ void sampler_kernel(const float *__restrict__ logits,
             }
             if (lane == 0) { sel_ids[i] = (wi < n_vocab) ? wi : 0; sel_logit[i] = wv; }
         }
-        /*
-        DPCT1118: SYCL group functions and algorithms must be encountered in
-        converged control flow. You may need to adjust the code.
-        */
         item_ct1.barrier(sycl::access::fence_space::local_space);
     }
 
@@ -667,19 +538,9 @@ __dpct_inline__ void take_first(float &bv, int &bi, float ov, int oi) {
 __dpct_inline__ void warp_first(float &bv, int &bi) {
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
-        /*
-        DPCT1108: '__shfl_xor_sync' was migrated with the experimental
-        feature masked sub_group function which may not be supported by all
-        compilers or runtimes. You may need to adjust the code.
-        */
         const float ov = dpct::experimental::permute_sub_group_by_xor(
             kFullMask, sycl::ext::oneapi::this_work_item::get_sub_group(), bv,
             off);
-        /*
-        DPCT1108: '__shfl_xor_sync' was migrated with the experimental
-        feature masked sub_group function which may not be supported by all
-        compilers or runtimes. You may need to adjust the code.
-        */
         const int oi = dpct::experimental::permute_sub_group_by_xor(
             kFullMask, sycl::ext::oneapi::this_work_item::get_sub_group(), bi,
             off);
@@ -720,11 +581,6 @@ inline void sampled_tail_warp(const int *sel_ids, const float *sel_logit, int k,
         if (lane == 0)
 #pragma unroll
             for (int i = 0; i < k; ++i) sum += ex[i];
-        /*
-        DPCT1108: '__shfl_sync' was migrated with the experimental feature
-        masked sub_group function which may not be supported by all compilers or
-        runtimes. You may need to adjust the code.
-        */
         sum = dpct::experimental::select_from_sub_group(
             kFullMask, sycl::ext::oneapi::this_work_item::get_sub_group(), sum,
             0);
@@ -743,11 +599,6 @@ inline void sampled_tail_warp(const int *sel_ids, const float *sel_logit, int k,
                 if (cum >= (strata::samp_acc_t) p.top_p) { cut = i + 1; break; }
             }
         }
-        /*
-        DPCT1108: '__shfl_sync' was migrated with the experimental feature
-        masked sub_group function which may not be supported by all compilers or
-        runtimes. You may need to adjust the code.
-        */
         cut = dpct::experimental::select_from_sub_group(
             kFullMask, sycl::ext::oneapi::this_work_item::get_sub_group(), cut,
             0);
@@ -776,11 +627,6 @@ inline void sampled_tail_warp(const int *sel_ids, const float *sel_logit, int k,
     if (lane == 0)
 #pragma unroll
         for (int i = 0; i < n_keep; ++i) sum += ex[i];
-    /*
-    DPCT1108: '__shfl_sync' was migrated with the experimental feature
-    masked sub_group function which may not be supported by all compilers or
-    runtimes. You may need to adjust the code.
-    */
     sum = dpct::experimental::select_from_sub_group(
         kFullMask, sycl::ext::oneapi::this_work_item::get_sub_group(), sum, 0);
     sycl::group_barrier(sycl::ext::oneapi::this_work_item::get_sub_group());
@@ -809,12 +655,6 @@ inline void sampled_tail_warp(const int *sel_ids, const float *sel_logit, int k,
 /// same list in the same order.  An empty round leaves (-inf, id 0) as before, and every round after it is empty
 /// in both versions (nothing after -inf beats -inf).  O(k x n_vocab) per row instead of O(k^2 x n_vocab), then warp
 /// 0 runs the tail.  `STRATA_SAMPLER_ONE_BLOCK=1`, and the fallback when the split path cannot run.
-/*
-DPCT1110: The total declared local variable size in device function
-sampler_one_block_kernel exceeds 128 bytes and may cause high register pressure.
-Consult with your hardware vendor to find the total register size available and
-adjust the code, or use smaller sub-group size to avoid high register pressure.
-*/
 __dpct_inline__ void
 sampler_one_block_kernel(const float *__restrict__ logits, int n_vocab,
                          const int *__restrict__ history, int history_len,
@@ -839,10 +679,6 @@ sampler_one_block_kernel(const float *__restrict__ logits, int n_vocab,
 #pragma unroll
         for (int w = item_ct1.get_local_id(2); w < bits_words;
              w += item_ct1.get_local_range(2)) penal_bits[w] = 0u;
-        /*
-        DPCT1118: SYCL group functions and algorithms must be encountered in
-        converged control flow. You may need to adjust the code.
-        */
         item_ct1.barrier(sycl::access::fence_space::local_space);
 #pragma unroll
         for (int i = item_ct1.get_local_id(2); i < hlen;
@@ -851,10 +687,6 @@ sampler_one_block_kernel(const float *__restrict__ logits, int n_vocab,
                 dpct::atomic_fetch_or<
                     sycl::access::address_space::generic_space>(
                     &penal_bits[hrow[i] >> 5], 1u << (hrow[i] & 31));
-        /*
-        DPCT1118: SYCL group functions and algorithms must be encountered in
-        converged control flow. You may need to adjust the code.
-        */
         item_ct1.barrier(sycl::access::fence_space::local_space);
     }
     auto hit_count = [&](int v, uint8_t *dpct_local) -> int {
@@ -890,29 +722,15 @@ sampler_one_block_kernel(const float *__restrict__ logits, int n_vocab,
             if ((s < prev_v || (s == prev_v && v > prev_i)) && s > bv) { bv = s; best = v; }
         }
         for (int off = 16; off > 0; off >>= 1) {
-            /*
-            DPCT1108: '__shfl_down_sync' was migrated with the experimental
-            feature masked sub_group function which may not be supported by all
-            compilers or runtimes. You may need to adjust the code.
-            */
             const float ov = dpct::experimental::shift_sub_group_left(
                 0xFFFFFFFFu, sycl::ext::oneapi::this_work_item::get_sub_group(),
                 bv, off);
-            /*
-            DPCT1108: '__shfl_down_sync' was migrated with the experimental
-            feature masked sub_group function which may not be supported by all
-            compilers or runtimes. You may need to adjust the code.
-            */
             const int oi = dpct::experimental::shift_sub_group_left(
                 0xFFFFFFFFu, sycl::ext::oneapi::this_work_item::get_sub_group(),
                 best, off);
             if (ov > bv || (ov == bv && oi < best)) { bv = ov; best = oi; }
         }
         if (lane == 0) { sv[warp] = bv; si[warp] = best; }
-        /*
-        DPCT1118: SYCL group functions and algorithms must be encountered in
-        converged control flow. You may need to adjust the code.
-        */
         item_ct1.barrier(sycl::access::fence_space::local_space);
         if (warp == 0) {
             const int nw = (int)((item_ct1.get_local_range(2) + 31) >> 5);
@@ -920,22 +738,10 @@ sampler_one_block_kernel(const float *__restrict__ logits, int n_vocab,
                 lane < nw ? sv[lane] : sycl::bit_cast<float, int>(0xff800000);
             int wi = lane < nw ? si[lane] : n_vocab;
             for (int off = 16; off > 0; off >>= 1) {
-                /*
-                DPCT1108: '__shfl_down_sync' was migrated with the
-                experimental feature masked sub_group function which may not be
-                supported by all compilers or runtimes. You may need to adjust
-                the code.
-                */
                 const float ov = dpct::experimental::shift_sub_group_left(
                     0xFFFFFFFFu,
                     sycl::ext::oneapi::this_work_item::get_sub_group(), wv,
                     off);
-                /*
-                DPCT1108: '__shfl_down_sync' was migrated with the
-                experimental feature masked sub_group function which may not be
-                supported by all compilers or runtimes. You may need to adjust
-                the code.
-                */
                 const int oi = dpct::experimental::shift_sub_group_left(
                     0xFFFFFFFFu,
                     sycl::ext::oneapi::this_work_item::get_sub_group(), wi,
@@ -944,10 +750,6 @@ sampler_one_block_kernel(const float *__restrict__ logits, int n_vocab,
             }
             if (lane == 0) { sel_ids[i] = (wi < n_vocab) ? wi : 0; sel_logit[i] = wv; }
         }
-        /*
-        DPCT1118: SYCL group functions and algorithms must be encountered in
-        converged control flow. You may need to adjust the code.
-        */
         item_ct1.barrier(sycl::access::fence_space::local_space);
         // An empty round leaves (-inf, 0): nothing comes after it, as nothing was left untaken.
         prev_v = sel_logit[i];
@@ -1024,13 +826,6 @@ __dpct_inline__ void warp_merge_lists(const sycl::int2 *lists, int nl,
 /// and runs `k` warp-argmax rounds over them with the threshold of `sampler_one_block_kernel` - no shared memory
 /// and no block barrier per round.  Warp 0 then merges the four warp lists into the block's list in `cand`
 /// (row-major: row t, block b, entry i at `(t * n_blocks + b) * k + i`, as (id, value bits)).
-/*
-DPCT1110: The total declared local variable size in device function
-sampler_split_part_kernel exceeds 128 bytes and may cause high register
-pressure. Consult with your hardware vendor to find the total register size
-available and adjust the code, or use smaller sub-group size to avoid high
-register pressure.
-*/
 __dpct_inline__ void
 sampler_split_part_kernel(const float *__restrict__ logits, int n_vocab,
                           const int *__restrict__ history, int history_len,
@@ -1060,10 +855,6 @@ sampler_split_part_kernel(const float *__restrict__ logits, int n_vocab,
 #pragma unroll
         for (int w = item_ct1.get_local_id(2); w < kSplitBlockSpan / 32;
              w += item_ct1.get_local_range(2)) bits[w] = 0u;
-        /*
-        DPCT1118: SYCL group functions and algorithms must be encountered in
-        converged control flow. You may need to adjust the code.
-        */
         item_ct1.barrier(sycl::access::fence_space::local_space);
         for (int i = item_ct1.get_local_id(2); i < hlen;
              i += item_ct1.get_local_range(2)) {
@@ -1073,10 +864,6 @@ sampler_split_part_kernel(const float *__restrict__ logits, int n_vocab,
                     sycl::access::address_space::generic_space>(
                     &bits[(h - blo) >> 5], 1u << ((h - blo) & 31));
         }
-        /*
-        DPCT1118: SYCL group functions and algorithms must be encountered in
-        converged control flow. You may need to adjust the code.
-        */
         item_ct1.barrier(sycl::access::fence_space::local_space);
     }
 
@@ -1214,11 +1001,6 @@ __dpct_inline__ void coupled_penalize_kernel(
 #pragma unroll
     for (int w = item_ct1.get_local_id(2); w < words;
          w += item_ct1.get_local_range(2)) seen[w] = 0u;
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
     for (int i = item_ct1.get_local_id(2); i < h;
          i += item_ct1.get_local_range(2)) {
@@ -1286,492 +1068,8 @@ __dpct_inline__ void coupled_merge_kernel(
     }
 }
 
-// Which sampled path runs, read once: `STRATA_OLD_SAMPLER=1` is `sampler_kernel` (engine 0.1.20),
-// `STRATA_SAMPLER_ONE_BLOCK=1` the one-block kernel; by default the split top_k wherever it applies.
-enum class SampledPath { Split, OneBlock, Old };
-
-bool env_flag(const char* name) {
-    const char* e = std::getenv(name);
-    return e != nullptr && *e != '\0' && std::strcmp(e, "0") != 0;
-}
-
-SampledPath sampled_path() {
-    static const SampledPath path = env_flag("STRATA_OLD_SAMPLER")         ? SampledPath::Old
-                                    : env_flag("STRATA_SAMPLER_ONE_BLOCK") ? SampledPath::OneBlock
-                                                                           : SampledPath::Split;
-    return path;
-}
-
-// A stream being captured into a graph must not reach `split_scratch` (cudaMalloc): it
-// gets the one-block kernel, which needs no memory of its own.  The legacy stream cannot be captured.
-bool stream_capturing(void *stream) try {
-    if (stream == nullptr) return false;
-    sycl::ext::oneapi::experimental::queue_state st =
-        sycl::ext::oneapi::experimental::queue_state::executing;
-    if (DPCT_CHECK_ERROR(
-            (st = strata::q_of(stream)->ext_oneapi_get_state())) != 0) {
-        /*
-        DPCT1010: SYCL uses exceptions to report errors and does not use
-        the error codes. The cudaGetLastError function call was replaced with 0.
-        You need to rewrite this code.
-        */
-        (void)0;
-        return true;
-    }
-    return st != sycl::ext::oneapi::experimental::queue_state::executing;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
-
-// The split's block lists, one buffer per (device, stream): launches on one stream run in order, so a stream reuses
-// its buffer with no sync, and two streams never share one.  Grown on demand (at least doubling, up to the size of
-// `kSplitMaxRows` rows at the widest vocabulary: 2 MB), never shrunk.  A grown-out buffer is retired, not freed: a
-// pointer handed out earlier (to another host thread on the same stream, say) may still be waiting for its launch,
-// and freeing it would need a sync that proves nothing about that thread.  Doubling keeps a slot's retired buffers
-// smaller than its live one, so a slot holds about 4 MB at most (0.5 MB for the engine's <= 16 rows).  nullptr
-// when the memory cannot be had, and the caller falls back to the one-block kernel; a failed grow is remembered, so
-// later calls of that size do not retry cudaMalloc each time.
-sycl::int2 *split_scratch(void *stream, size_t entries) {
-    struct Slot {
-        int device;
-        void* stream;
-        sycl::int2 *ptr;
-        size_t entries;
-        size_t failed;                       // the smallest size cudaMalloc refused (0: none)
-    };
-    static std::mutex mu;
-    static std::vector<Slot> slots;
-    static std::vector<sycl::int2 *> retired;
-    int device = 0;
-    if (DPCT_CHECK_ERROR(device = dpct::get_current_device_id()) != 0) {
-        /*
-        DPCT1010: SYCL uses exceptions to report errors and does not use
-        the error codes. The cudaGetLastError function call was replaced with 0.
-        You need to rewrite this code.
-        */
-        (void)0;
-        return nullptr;
-    }
-    std::lock_guard<std::mutex> lock(mu);
-    Slot* slot = nullptr;
-    for (Slot& s : slots)
-        if (s.device == device && s.stream == stream) slot = &s;
-    if (slot == nullptr) {
-        slots.push_back({device, stream, nullptr, 0, 0});
-        slot = &slots.back();
-    }
-    if (slot->entries >= entries) return slot->ptr;
-    if (slot->failed != 0 && entries >= slot->failed) return nullptr;
-    constexpr size_t kCap = (size_t) kSplitMaxRows * kSplitMaxBlocks * kSelMax;
-    size_t want = 2 * slot->entries < kCap ? 2 * slot->entries : kCap;
-    if (want < entries) want = entries;
-    sycl::int2 *ptr = nullptr;
-    if (DPCT_CHECK_ERROR(ptr = sycl::malloc_device<sycl::int2>(
-                             want, dpct::get_in_order_queue())) != 0) {
-        /*
-        DPCT1010: SYCL uses exceptions to report errors and does not use
-        the error codes. The cudaGetLastError function call was replaced with 0.
-        You need to rewrite this code.
-        */
-        (void)0;
-        want = entries;
-        if (DPCT_CHECK_ERROR(ptr = sycl::malloc_device<sycl::int2>(
-                                 want, dpct::get_in_order_queue())) != 0) {
-            /*
-            DPCT1010: SYCL uses exceptions to report errors and does not
-            use the error codes. The cudaGetLastError function call was replaced
-            with 0. You need to rewrite this code.
-            */
-            (void)0;
-            slot->failed = entries;
-            return nullptr;
-        }
-    }
-    if (slot->ptr != nullptr) retired.push_back(slot->ptr);
-    slot->ptr = ptr;
-    slot->entries = want;
-    return ptr;
-}
-
 }  // namespace
 
-bool sample_greedy_cluster(const float *logits, int n_tokens, int n_vocab,
-                           int *out, void *stream) try {
-#if 1   // SYCL port: no thread-block clusters (sm_90): the caller takes the plain greedy kernel
-    (void) logits; (void) n_tokens; (void) n_vocab; (void) out; (void) stream;
-    return false;
-#else
-    if (n_tokens <= 0 || n_vocab <= 0) return true;
-    if (n_tokens > 65535) return false;
-    // Per device (a layer split runs on several): 1 the cluster kernel runs here, 2 it does not - sm_90+ (the card's,
-    // or STRATA_EMULATE_CC's), code built for it (an older build's PTX holds a trap: the PTX version says which), and
-    // room for one cluster of kAmCtas CTAs.
-    static int ok[64] = {};
-    int dev = 0;
-    /*
-    DPCT1026: The call to cudaGetLastError was removed because this
-    functionality is redundant in SYCL.
-    */
-    if (DPCT_CHECK_ERROR(dev = dpct::get_current_device_id()) != 0 || dev < 0 ||
-        dev >= 64) {
-        ; return false;
-    }
-    cudaLaunchConfig_t cfg{};
-    cudaLaunchAttribute at[1];
-    at[0].id = cudaLaunchAttributeClusterDimension;
-    at[0].val.clusterDim.x = kAmCtas;
-    at[0].val.clusterDim.y = 1;
-    at[0].val.clusterDim.z = 1;
-    cfg.gridDim = dpct::dim3(kAmCtas, 1, 1);
-    cfg.blockDim = dpct::dim3(kAmThreads, 1, 1);
-    cfg.dynamicSmemBytes = 0;
-    cfg.stream = strata::q_of(stream);
-    cfg.attrs = at;
-    cfg.numAttrs = 1;
-    if (ok[dev] == 0) {
-        int major = 0, clusters = 0;
-        dpct::kernel_function_info fa{};
-        const bool runs =
-            DPCT_CHECK_ERROR(
-                major = dpct::get_device(dev).get_major_version()) == 0 &&
-            strata::cc_major_of(major) >= 9 &&
-            DPCT_CHECK_ERROR(dpct::get_kernel_function_info(
-                &fa, (const void *)sampler_greedy_cluster_kernel)) == 0 &&
-            fa.ptxVersion >= 90 && fa.binaryVersion >= 90 &&
-            /*
-            DPCT1007: Migration of cudaOccupancyMaxActiveClusters is not
-            supported.
-            */
-            cudaOccupancyMaxActiveClusters(
-                &clusters, sampler_greedy_cluster_kernel, &cfg) == 0 &&
-            clusters >= 1;
-        /*
-        DPCT1026: The call to cudaGetLastError was removed because this
-        functionality is redundant in SYCL.
-        */
-        ok[dev] = runs ? 1 : 2;
-    }
-    if (ok[dev] != 1) return false;
-    cfg.gridDim = dpct::dim3(kAmCtas, (unsigned)n_tokens, 1);
-    const dpct::err0 e = cudaLaunchKernelEx(&cfg, sampler_greedy_cluster_kernel,
-                                            logits, n_vocab, out);
-
-    return true;
-#endif
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
-
-void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
-                   const SamplerParams& p, int* out, void* stream) {
-    if (n_tokens <= 0 || n_vocab <= 0) return;
-    if (p.penalty_last_n > 0 && (history == nullptr || history_len <= 0)) {
-        std::fprintf(stderr, "sample_tokens: penalty_last_n %d needs a history (got %p, len %d)\n",
-                     p.penalty_last_n, (const void*) history, history_len);
-        std::exit(1);
-    }
-    /*
-    DPCT1083: The size of local memory in the migrated code may be different
-    from the original code. Check that the allocated memory size in the migrated
-    code is correct.
-    */
-    const unsigned shmem =
-        (history != nullptr && history_len > 0 && p.penalty_last_n > 0)
-            ? (unsigned)((n_vocab + 31) / 32) *
-                  sizeof(unsigned) // the penalty bitmap
-            : 0;
-    if (p.greedy || p.temperature <= 0.0f) {
-        // Without penalties (shmem == 0: no window) on sm_90+, a cluster of CTAs per token - the same token; see
-        // `sampler_greedy_cluster_kernel`.  STRATA_ARGMAX_MULTI=0: always the one-block kernel.
-        static const bool multi = [] {
-            const char* v = std::getenv("STRATA_ARGMAX_MULTI");
-            return !v || std::atoi(v) != 0;
-        }();
-        // One block per token, 1,024 threads over the vocabulary.  See `sampler_greedy_kernel`.
-        const int gthreads = 1024;
-        if (!(multi && shmem == 0 && sample_greedy_cluster(logits, n_tokens, n_vocab, out, stream)))
-            /*
-            DPCT1049: The work-group size passed to the SYCL kernel may
-            exceed the limit. To get the device limit, query
-            info::device::max_work_group_size. Adjust the work-group size if
-            needed.
-            */
-        {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
-
-            strata::q_of(stream)
-                ->submit([&](sycl::handler &cgh) {
-                    sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
-                        sycl::range(shmem), cgh);
-
-                    cgh.parallel_for<
-                        dpct_kernel_name<class sampler_greedy_kernel_5b2c3f>>(
-                        sycl::nd_range<3>(
-                            sycl::range(1, 1, (unsigned)n_tokens) *
-                                sycl::range(1, 1, gthreads),
-                            sycl::range(1, 1, gthreads)),
-                        exp_props,
-                        [=](sycl::nd_item<3> item_ct1)
-                            [[sycl::reqd_sub_group_size(32)]] {
-                                sampler_greedy_kernel(
-                                    logits, n_vocab, history, history_len, p,
-                                    p.penalty_last_n, p.penalty_last_n, out,
-                                    dpct_local_acc_ct1
-                                        .get_multi_ptr<
-                                            sycl::access::decorated::no>()
-                                        .get());
-                            });
-                });
-        }
-    } else if (sampled_path() == SampledPath::Old) {
-        // The same block-per-token shape: the selection's k argmax rounds reduce inside the block.  See
-        // `sampler_kernel`'s header for what the old one-thread-per-token launch cost.
-        /*
-        DPCT1049: The work-group size passed to the SYCL kernel may exceed
-        the limit. To get the device limit, query
-        info::device::max_work_group_size. Adjust the work-group size if needed.
-        */
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-        sampler_require_fp64(strata::q_of(stream)->get_device());
-
-        strata::q_of(stream)
-            ->submit([&](sycl::handler &cgh) {
-                sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
-                    sycl::range(shmem), cgh);
-
-                cgh.parallel_for<dpct_kernel_name<class sampler_kernel_ebb5aa>>(
-                    sycl::nd_range<3>(sycl::range(1, 1, (unsigned)n_tokens) *
-                                          sycl::range(1, 1, 1024),
-                                      sycl::range(1, 1, 1024)),
-                    exp_props,
-                    [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(
-                        32)]] {
-                        sampler_kernel(
-                            logits, n_vocab, n_tokens, history, history_len, p,
-                            out,
-                            dpct_local_acc_ct1
-                                .get_multi_ptr<sycl::access::decorated::no>()
-                                .get());
-                    });
-            });
-    } else {
-        // The split top_k by default: stage 1 over (61 blocks x rows) for 248,320 logits, stage 2 one warp per
-        // row.  The one-block kernel when asked for, or when the split cannot run: a wider vocabulary than the merge
-        // holds, more than `kSplitMaxRows` rows (the engine samples at most a verify window), a stream under capture,
-        // no scratch.
-        const int k = sampled_k(p.top_k, n_vocab);
-        const int n_blocks = (n_vocab + kSplitBlockSpan - 1) / kSplitBlockSpan;
-        sycl::int2 *scratch = nullptr;
-        if (sampled_path() == SampledPath::Split && n_blocks <= kSplitMaxBlocks && n_tokens <= kSplitMaxRows &&
-            !stream_capturing(stream))
-            // sized for 16 rows and 64 entries at least, so a verify window or a wider top_k does not regrow it
-            scratch = split_scratch(stream, (size_t) (n_tokens > 16 ? n_tokens : 16) * n_blocks * kSelMax);
-        if (scratch != nullptr) {
-            {
-                auto exp_props = sycl::ext::oneapi::experimental::properties{
-                    sycl::ext::oneapi::experimental::use_root_sync};
-
-                strata::q_of(stream)
-                    ->parallel_for<dpct_kernel_name<
-                        class sampler_split_part_kernel_cc5673>>(
-                        sycl::nd_range<3>(
-                            sycl::range(1, (unsigned)n_tokens,
-                                        (unsigned)n_blocks) *
-                                sycl::range(1, 1, kSplitWarps * 32),
-                            sycl::range(1, 1, kSplitWarps * 32)),
-                        exp_props,
-                        [=](sycl::nd_item<3> item_ct1)
-                            [[sycl::reqd_sub_group_size(32)]] {
-                                sampler_split_part_kernel(
-                                    logits, n_vocab, history, history_len, p, k,
-                                    n_blocks, scratch);
-                            });
-            }
-            {
-                auto exp_props = sycl::ext::oneapi::experimental::properties{
-                    sycl::ext::oneapi::experimental::use_root_sync};
-                sampler_require_fp64(strata::q_of(stream)->get_device());
-
-                strata::q_of(stream)
-                    ->parallel_for<dpct_kernel_name<
-                        class sampler_split_merge_kernel_b17bd4>>(
-                        sycl::nd_range<3>(
-                            sycl::range(1, 1, (unsigned)n_tokens) *
-                                sycl::range(1, 1, 32),
-                            sycl::range(1, 1, 32)),
-                        exp_props,
-                        [=](sycl::nd_item<3> item_ct1)
-                            [[sycl::reqd_sub_group_size(32)]] {
-                                sampler_split_merge_kernel(scratch, n_blocks,
-                                                           n_vocab, p, k, out);
-                            });
-            }
-        } else {
-            /*
-            DPCT1049: The work-group size passed to the SYCL kernel may
-            exceed the limit. To get the device limit, query
-            info::device::max_work_group_size. Adjust the work-group size if
-            needed.
-            */
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
-            sampler_require_fp64(strata::q_of(stream)->get_device());
-
-            strata::q_of(stream)
-                ->submit([&](sycl::handler &cgh) {
-                    sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
-                        sycl::range(shmem), cgh);
-
-                    cgh.parallel_for<dpct_kernel_name<
-                        class sampler_one_block_kernel_79fa88>>(
-                        sycl::nd_range<3>(
-                            sycl::range(1, 1, (unsigned)n_tokens) *
-                                sycl::range(1, 1, 1024),
-                            sycl::range(1, 1, 1024)),
-                        exp_props,
-                        [=](sycl::nd_item<3> item_ct1)
-                            [[sycl::reqd_sub_group_size(32)]] {
-                                sampler_one_block_kernel(
-                                    logits, n_vocab, history, history_len, p,
-                                    out,
-                                    dpct_local_acc_ct1
-                                        .get_multi_ptr<
-                                            sycl::access::decorated::no>()
-                                        .get());
-                            });
-                });
-        }
-    }
-    /*
-    DPCT1010: SYCL uses exceptions to report errors and does not use the
-    error codes. The cudaGetLastError function call was replaced with 0. You
-    need to rewrite this code.
-    */
-    const dpct::err0 e = 0;
-
-    if (stream == nullptr) dpct::get_current_device().queues_wait_and_throw();
-}
-
-namespace {
-int coupled_blocks(int nv) { return (nv + kSplitBlockSpan - 1) / kSplitBlockSpan; }
-int coupled_kpart(int nv) { return nv < kSelMax ? nv : kSelMax; }
-void coupled_check(const char* what) {
-    /*
-    DPCT1010: SYCL uses exceptions to report errors and does not use the
-    error codes. The cudaGetLastError function call was replaced with 0. You
-    need to rewrite this code.
-    */
-    const dpct::err0 e = 0;
-}
-}  // namespace
-
-size_t coupled_draft_scratch_bytes(int nv) {
-    if (nv <= 0 || coupled_blocks(nv) > kSplitMaxBlocks) return 0;
-    return (size_t)coupled_blocks(nv) * (size_t)kSelMax * sizeof(sycl::int2);
-}
-
-void coupled_draft_stage(const SamplerParams* mapped_params, const int32_t* mapped_hist, SamplerParams* params,
-                         int32_t* ring, int cap, void* stream) {
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class coupled_stage_kernel_113245>>(
-                sycl::nd_range<3>(sycl::range(1, 1, 256),
-                                  sycl::range(1, 1, 256)),
-                exp_props, [=](sycl::nd_item<3> item_ct1) {
-                    coupled_stage_kernel(mapped_params, mapped_hist, params,
-                                         ring, cap);
-                });
-    }
-    coupled_check("coupled_draft_stage");
-}
-
-void coupled_draft_sample(float* logits, int nv, const int32_t* sub_to_id, const int32_t* id_to_sub, int id_vocab,
-                          const SamplerParams* params, int32_t* ring, int cap, int j, const int32_t* step_rec,
-                          void* scratch, int32_t* out_id, float* out_prob, void* stream) {
-    const dpct::queue_ptr s = strata::q_of(stream);
-    const int n_blocks = coupled_blocks(nv), kpart = coupled_kpart(nv);
-    if (nv <= 0 || n_blocks > kSplitMaxBlocks || scratch == nullptr) {
-        std::fprintf(stderr, "coupled_draft_sample: %d logits need scratch and at most %d blocks\n", nv, kSplitMaxBlocks);
-        std::exit(1);
-    }
-    /*
-    DPCT1049: The work-group size passed to the SYCL kernel may exceed the
-    limit. To get the device limit, query info::device::max_work_group_size.
-    Adjust the work-group size if needed.
-    */
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        s->submit([&](sycl::handler &cgh) {
-            /*
-            DPCT1083: The size of local memory in the migrated code may be
-            different from the original code. Check that the allocated memory
-            size in the migrated code is correct.
-            */
-            sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
-                sycl::range((unsigned)((nv + 31) / 32) * sizeof(unsigned)),
-                cgh);
-
-            cgh.parallel_for<
-                dpct_kernel_name<class coupled_penalize_kernel_6ca8a2>>(
-                sycl::nd_range<3>(sycl::range(1, 1, 1024),
-                                  sycl::range(1, 1, 1024)),
-                exp_props, [=](sycl::nd_item<3> item_ct1) {
-                    coupled_penalize_kernel(
-                        logits, nv, id_to_sub, id_vocab, params, ring, cap, j,
-                        dpct_local_acc_ct1
-                            .get_multi_ptr<sycl::access::decorated::no>()
-                            .get());
-                });
-        });
-    }
-    coupled_check("coupled_penalize");
-    // the selection of the split sampler, unchanged: every 4,096-logit block's first `kpart` (the widest list,
-    // since the request's top_k is only known on the device), penalties already applied above
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        s->parallel_for<
-            dpct_kernel_name<class sampler_split_part_kernel_cc5674>>(
-            sycl::nd_range<3>(sycl::range(1, 1u, (unsigned)n_blocks) *
-                                  sycl::range(1, 1, kSplitWarps * 32),
-                              sycl::range(1, 1, kSplitWarps * 32)),
-            exp_props,
-            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
-                sampler_split_part_kernel(logits, nv, nullptr, 0,
-                                          SamplerParams{}, kpart, n_blocks,
-                                          (sycl::int2 *)scratch);
-            });
-    }
-    coupled_check("coupled_draft split part");
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-        sampler_require_fp64(s->get_device());
-
-        s->parallel_for<dpct_kernel_name<class coupled_merge_kernel_1fbeb1>>(
-            sycl::nd_range<3>(sycl::range(1, 1, 32), sycl::range(1, 1, 32)),
-            exp_props,
-            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
-                coupled_merge_kernel((const sycl::int2 *)scratch, n_blocks, nv,
-                                     kpart, params, step_rec, sub_to_id, ring,
-                                     cap, j, out_id, out_prob);
-            });
-    }
-    coupled_check("coupled_draft merge");
-}
+#include "sampler.kern.inc"
 
 }  // namespace strata::kernels

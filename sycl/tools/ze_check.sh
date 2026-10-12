@@ -14,10 +14,10 @@ case "${1:-}" in
 dev)
     base=$2
     icpx -fsycl -fsycl-device-only -fsycl-targets=spir64_gen -fsycl-default-sub-group-size=32 -fno-sycl-dead-args-optimization \
-         -O3 -DNDEBUG -fp-model=precise -std=c++20 -Wno-unused-parameter -Wno-unknown-pragmas "${defs[@]}" "${inc[@]}" \
+         -O3 -DNDEBUG -fp-model=precise -std=c++20 -Wno-unused-parameter -Wno-unknown-pragmas -Wno-ignored-attributes "${defs[@]}" "${inc[@]}" \
          -c "$base.dp.cpp" -o "$tmp/d.bc" || exit 1
     python3 "$here/tools/ze_devlink.py" --out "$tmp/d.szeb" --work "$tmp/link" --device bmg-g31 \
-        --ocloc-options=-cl-fp32-correctly-rounded-divide-sqrt --compiler-dir /opt/intel/oneapi/compiler/2026.1/bin/compiler \
+        --ocloc-options="-cl-fp32-correctly-rounded-divide-sqrt ${ZE_OCLOC_EXTRA:-}" --compiler-dir /opt/intel/oneapi/compiler/2026.1/bin/compiler \
         --expect "$base.kern.inc" "$tmp/d.bc" || exit 1
     echo "device OK: $(strings "$tmp/d.szeb" | grep -c '^__sycl_kernel_strata_k_' ) kernel names in the bundle"
     ;;

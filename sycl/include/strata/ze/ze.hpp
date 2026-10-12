@@ -155,6 +155,8 @@ public:
 
     /// Appends kernel `k` with argument pointers `args` (k.nparams() of them, then a pointer to the size_t scratch size).
     void launch(const KernelBase& k, Dim3 grid, Dim3 block, void** args);
+    /// Copies between device memory and Strata host memory are asynchronous. A copy from or to pageable host memory
+    /// (not from malloc_host) goes through a pinned bounce buffer and returns when it is done, as CUDA's does.
     void memcpy(void* dst, const void* src, size_t bytes);
     /// A 2-D copy: `height` rows of `width` bytes, row pitches in bytes.
     void memcpy_2d(void* dst, size_t dpitch, const void* src, size_t spitch, size_t width, size_t height);
@@ -197,12 +199,16 @@ public:
 
 private:
     friend class Event;
+    friend Stream& default_stream(int);
+    friend Stream& copy_stream(int);
     ze_command_list_handle_t target() const { return cap_ ? cap_->list_ : imm_; }
     void after_append();
     int dev_;
     Engine engine_;
     ze_command_list_handle_t imm_ = nullptr;
     Capture* cap_ = nullptr;
+    void* bounce_ = nullptr;
+    bool runtime_owned_ = false;
     std::recursive_mutex mu_;
     std::atomic<uint64_t> appends_{0};
 };

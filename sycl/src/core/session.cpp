@@ -1,8 +1,6 @@
 // src/core/session.cpp - one token through all 48 layers.  See the header for why the graphs are per-layer.
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
-#include "strata/sycl_queue.hpp"
+#include "strata/ze/ze.hpp"
+#include "strata/intel_gpu.hpp"
 #include "strata/core/session.hpp"
 #include "strata/kernels/mrope.hpp"
 #include "strata/core/progress.hpp"
@@ -139,17 +137,11 @@ void session_release(SessionState& s) {
 }
 
 void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, void* stream) {
-    dpct::queue_ptr cs = strata::q_of(stream);
+    strata::ze::Stream* cs = strata::ze::stream_of(stream);
     // the residual: `hc` copies of the one vector a caller hands in.  A real sequence's first token is the
     // embedding broadcast to every stream, which is the reference's own initial condition.
     if (R_init != nullptr) {
         for (int64_t c = 0; c < g.hc; ++c)
-            /*
-            DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy
-            API. While the origin API might be synchronous, it depends on the
-            type of operand memory, so you may need to call wait() on event
-            return by memcpy API to ensure synchronization behavior.
-            */
             cs->memcpy(s.block.R + (size_t)c * g.n_embd, R_init,
                        (size_t)g.n_embd * 4);
     } else {
@@ -202,21 +194,21 @@ bool session_capture(const WeightTable& tables, const ModelGeometry& g, SessionS
     if (layer_hi < 0 || layer_hi > g.n_layers) layer_hi = g.n_layers;
     if (layer_lo < 0) layer_lo = 0;
     gr.execs =
-        new dpct::experimental::command_graph_exec_ptr[(size_t)g.n_layers]();
+        new strata::ze::Graph*[(size_t)g.n_layers]();
     gr.posts =
-        new dpct::experimental::command_graph_exec_ptr[(size_t)g.n_layers]();
+        new strata::ze::Graph*[(size_t)g.n_layers]();
     for (int64_t i = 0; i < g.n_layers; ++i) gr.posts[i] = nullptr;
     if (split) {
         gr.preA =
-            new dpct::experimental::command_graph_exec_ptr[(size_t)
+            new strata::ze::Graph*[(size_t)
                                                                g.n_layers]();
         gr.preB =
-            new dpct::experimental::command_graph_exec_ptr[(size_t)
+            new strata::ze::Graph*[(size_t)
                                                                g.n_layers]();
         for (int64_t i = 0; i < g.n_layers; ++i) { gr.preA[i] = nullptr; gr.preB[i] = nullptr; }
         for (int k = 0; k < 5; ++k) {
             gr.preP[k] =
-                new dpct::experimental::command_graph_exec_ptr[(size_t)g
+                new strata::ze::Graph*[(size_t)g
                                                                    .n_layers]();
             for (int64_t i = 0; i < g.n_layers; ++i) gr.preP[k][i] = nullptr;
         }
@@ -235,20 +227,10 @@ bool session_capture(const WeightTable& tables, const ModelGeometry& g, SessionS
         // them together is what the old single graph could not do, and the reason it could not is that
         // `moe_combine` needs the pool's answer and the pool needs the router's.
         auto capture =
-            [&](bool post, dpct::experimental::command_graph_exec_ptr *out,
+            [&](bool post, strata::ze::Graph* *out,
                 const char *what, int half = 0, int stage_prefix = 0) -> bool {
-            try {
-                           dpct::queue_ptr cs = &dpct::get_in_order_queue();
-            if (DPCT_CHECK_ERROR(
-                    cs = dpct::get_current_device().create_queue(true)) != 0) {
-                err = std::string("session_capture: stream create failed");
-                return false;
-            }
-            if (DPCT_CHECK_ERROR(dpct::experimental::begin_recording(cs)) !=
-                0) {
-                err = "session_capture: begin failed at layer " + std::to_string(l);
-                return false;
-            }
+            strata::ze::Stream* cs = new strata::ze::Stream();
+            cs->begin_capture();
             err.clear();
             // R0.9: `half` is 0 for every mode except the split capture, where it selects a prefix of the
             // stages so the mixer and the FFN-front-plus-router can be timed separately.
@@ -261,48 +243,9 @@ bool session_capture(const WeightTable& tables, const ModelGeometry& g, SessionS
                 err = "session_capture: " + std::string(what) + " layer " + std::to_string(l) + ": " + err;
                 return false;
             }
-            dpct::experimental::command_graph_ptr graph = nullptr;
-            const dpct::err0 ce =
-                DPCT_CHECK_ERROR(dpct::experimental::end_recording(cs, &graph));
-            dpct::get_current_device().destroy_queue(cs);
-            /*
-            DPCT1000: Error handling if-stmt was detected but could not be
-            rewritten.
-            */
-            if (ce != 0) {
-                /*
-                DPCT1001: The statement could not be removed.
-                */
-                err = "session_capture: " + std::string(what) + " layer " +
-                      std::to_string(l) + ": " +
-                      /*
-                      DPCT1009: SYCL reports errors using exceptions and
-                      does not use error codes. Please replace the
-                      "get_error_string_dummy(...)" with a real error-handling
-                      function.
-                      */
-                      dpct::get_error_string_dummy(ce) +
-                      " (a synchronous call in the layer?)";
-                return false;
-            }
-            if (DPCT_CHECK_ERROR(
-                        *out =
-                            new sycl::ext::oneapi::experimental::command_graph<
-                                sycl::ext::oneapi::experimental::graph_state::
-                                    executable>(graph->finalize())) != 0) {
-                err = "session_capture: instantiate failed at layer " + std::to_string(l);
-                return false;
-            }
-            delete (graph);
+            *out = cs->end_capture();
+            delete cs;
             return true;
-        }
-                           catch (sycl::exception const &exc) {
-                             std::cerr
-                                 << exc.what()
-                                 << "Exception caught at file:" << __FILE__
-                                 << ", line:" << __LINE__ << std::endl;
-                             std::exit(1);
-                           }
         };
         if (!capture(/*post=*/false, &gr.execs[l], "pre")) return false;
         if (!capture(/*post=*/true, &gr.posts[l], "post")) return false;
@@ -325,94 +268,30 @@ bool session_capture(const WeightTable& tables, const ModelGeometry& g, SessionS
 
 bool session_replay(const ModelGeometry &g, int64_t pos, int32_t pos_base,
                     SessionState &s, SessionGraphs &gr, void *stream,
-                    std::string &err) try {
+                    std::string &err) {
     if (!gr.captured || gr.n != g.n_layers) { err = "session_replay: not captured"; return false; }
-    dpct::queue_ptr cs = strata::q_of(stream);
+    strata::ze::Stream* cs = strata::ze::stream_of(stream);
     stage_token(g, pos, pos_base, s);
-    for (int64_t l = 0; l < g.n_layers; ++l) {
-        const dpct::err0 e =
-            DPCT_CHECK_ERROR(cs->ext_oneapi_graph(*gr.execs[l]));
-        /*
-        DPCT1000: Error handling if-stmt was detected but could not be
-        rewritten.
-        */
-        if (e != 0) {
-            /*
-            DPCT1009: SYCL reports errors using exceptions and does not use
-            error codes. Please replace the "get_error_string_dummy(...)" with a
-            real error-handling function.
-            */
-            /*
-            DPCT1001: The statement could not be removed.
-            */
-            err = "session_replay: layer " + std::to_string(l) + ": " +
-                  dpct::get_error_string_dummy(e);
-            return false;
-        }
-    }
+    for (int64_t l = 0; l < g.n_layers; ++l) cs->launch(*gr.execs[l]);
     return true;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
 }
 
 bool session_replay_full(const ModelGeometry &g, int64_t pos, int32_t pos_base,
                          SessionState &s, SessionGraphs &gr, void *stream,
-                         std::string &err) try {
+                         std::string &err) {
     if (!gr.captured || gr.n != g.n_layers || gr.posts == nullptr) {
         err = "session_replay_full: not captured with post graphs";
         return false;
     }
-    dpct::queue_ptr cs = strata::q_of(stream);
+    strata::ze::Stream* cs = strata::ze::stream_of(stream);
     stage_token(g, pos, pos_base, s);
     for (int64_t l = 0; l < g.n_layers; ++l) {
         // `pre[l]` then `post[l]`, in the order `session_loop` uses.  The two are ordered on one stream, and
         // `post[l]` reads what `pre[l]` wrote, so they cannot be reordered or run concurrently.
-        dpct::err0 e = DPCT_CHECK_ERROR(cs->ext_oneapi_graph(*gr.execs[l]));
-        /*
-        DPCT1000: Error handling if-stmt was detected but could not be
-        rewritten.
-        */
-        if (e != 0) {
-            /*
-            DPCT1009: SYCL reports errors using exceptions and does not use
-            error codes. Please replace the "get_error_string_dummy(...)" with a
-            real error-handling function.
-            */
-            /*
-            DPCT1001: The statement could not be removed.
-            */
-            err = "session_replay_full: pre[" + std::to_string(l) +
-                  "]: " + dpct::get_error_string_dummy(e);
-            return false;
-        }
-        e = DPCT_CHECK_ERROR(cs->ext_oneapi_graph(*gr.posts[l]));
-        /*
-        DPCT1000: Error handling if-stmt was detected but could not be
-        rewritten.
-        */
-        if (e != 0) {
-            /*
-            DPCT1009: SYCL reports errors using exceptions and does not use
-            error codes. Please replace the "get_error_string_dummy(...)" with a
-            real error-handling function.
-            */
-            /*
-            DPCT1001: The statement could not be removed.
-            */
-            err = "session_replay_full: post[" + std::to_string(l) +
-                  "]: " + dpct::get_error_string_dummy(e);
-            return false;
-        }
+        cs->launch(*gr.execs[l]);
+        cs->launch(*gr.posts[l]);
     }
     return true;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
 }
 
 bool session_replay_stages_per_layer(const ModelGeometry& g, int64_t pos, int32_t pos_base, SessionState& s,
@@ -422,68 +301,37 @@ bool session_replay_stages_per_layer(const ModelGeometry& g, int64_t pos, int32_
         err = "session_replay_stages: not captured with the split";
         return false;
     }
-    dpct::queue_ptr cs = strata::q_of(stream);
+    strata::ze::Stream* cs = strata::ze::stream_of(stream);
     stage_token(g, pos, pos_base, s);
 
     // Four events PER LAYER rather than four reused ones: reusing them would need a synchronisation after
     // every layer to read them before the next launch overwrote them, and a per-layer sync would report the
     // serialised time rather than the graph's.
     const int64_t n = g.n_layers;
-    std::vector<dpct::event_ptr> ev((size_t)(n * 4));
-    for (auto& e : ev) {
-        if (DPCT_CHECK_ERROR(e = new sycl::event()) != 0) {
-            err = "session_replay_stages: event create"; return false;
-        }
-    }
+    std::vector<strata::ze::Event*> ev((size_t)(n * 4));
+    for (auto& e : ev) e = new strata::ze::Event(true);
     struct Free {
-        std::vector<dpct::event_ptr> *v;
-        ~Free() { for (auto &e : *v) DPCT_CHECK_ERROR(dpct::destroy_event(e)); }
+        std::vector<strata::ze::Event*> *v;
+        ~Free() { for (auto &e : *v) delete e; }
     } frees{&ev};
 
     for (int64_t l = 0; l < n; ++l) {
-        dpct::sync_barrier(ev[(size_t)(l * 4 + 0)], cs);
-        if (DPCT_CHECK_ERROR(cs->ext_oneapi_graph(*gr.preA[l])) != 0) {
-            err = "stages: preA"; return false;
-        }
-        dpct::sync_barrier(ev[(size_t)(l * 4 + 1)], cs);
-        if (DPCT_CHECK_ERROR(cs->ext_oneapi_graph(*gr.preB[l])) != 0) {
-            err = "stages: preB"; return false;
-        }
-        dpct::sync_barrier(ev[(size_t)(l * 4 + 2)], cs);
-        if (DPCT_CHECK_ERROR(cs->ext_oneapi_graph(*gr.posts[l])) != 0) {
-            err = "stages: post"; return false;
-        }
-        dpct::sync_barrier(ev[(size_t)(l * 4 + 3)], cs);
+        cs->record(*ev[(size_t)(l * 4 + 0)]);
+        cs->launch(*gr.preA[l]);
+        cs->record(*ev[(size_t)(l * 4 + 1)]);
+        cs->launch(*gr.preB[l]);
+        cs->record(*ev[(size_t)(l * 4 + 2)]);
+        cs->launch(*gr.posts[l]);
+        cs->record(*ev[(size_t)(l * 4 + 3)]);
     }
-    if (DPCT_CHECK_ERROR(cs->wait()) != 0) {
-        err = "stages: final sync"; return false;
-    }
+    cs->sync();
 
     mixer_per_layer.assign((size_t) n, 0.0);
     ms_ffn = 0; ms_post = 0;
     for (int64_t l = 0; l < n; ++l) {
-        float a = 0, b = 0, c = 0;
-        a = (ev[(size_t)(l * 4 + 1)]
-                 ->get_profiling_info<
-                     sycl::info::event_profiling::command_end>() -
-             ev[(size_t)(l * 4 + 0)]
-                 ->get_profiling_info<
-                     sycl::info::event_profiling::command_start>()) /
-            1000000.0f;
-        b = (ev[(size_t)(l * 4 + 2)]
-                 ->get_profiling_info<
-                     sycl::info::event_profiling::command_end>() -
-             ev[(size_t)(l * 4 + 1)]
-                 ->get_profiling_info<
-                     sycl::info::event_profiling::command_start>()) /
-            1000000.0f;
-        c = (ev[(size_t)(l * 4 + 3)]
-                 ->get_profiling_info<
-                     sycl::info::event_profiling::command_end>() -
-             ev[(size_t)(l * 4 + 2)]
-                 ->get_profiling_info<
-                     sycl::info::event_profiling::command_start>()) /
-            1000000.0f;
+        const float a = ev[(size_t)(l * 4 + 1)]->elapsed_ms_since(*ev[(size_t)(l * 4 + 0)]);
+        const float b = ev[(size_t)(l * 4 + 2)]->elapsed_ms_since(*ev[(size_t)(l * 4 + 1)]);
+        const float c = ev[(size_t)(l * 4 + 3)]->elapsed_ms_since(*ev[(size_t)(l * 4 + 2)]);
         mixer_per_layer[(size_t) l] = (double) a;
         ms_ffn += b; ms_post += c;
     }
@@ -503,65 +351,26 @@ bool session_replay_stages(const ModelGeometry& g, int64_t pos, int32_t pos_base
 bool session_replay_stage_sweep(const ModelGeometry &g, int64_t pos,
                                 int32_t pos_base, SessionState &s,
                                 SessionGraphs &gr, void *stream, int k,
-                                double &ms, std::string &err) try {
+                                double &ms, std::string &err) {
     if (!gr.split_captured || gr.preP[0] == nullptr) {
         err = "session_replay_stage_sweep: not captured with the split";
         return false;
     }
     if (k < 1 || k > 5) { err = "session_replay_stage_sweep: k must be 1..5"; return false; }
-    dpct::queue_ptr cs = strata::q_of(stream);
+    strata::ze::Stream* cs = strata::ze::stream_of(stream);
     stage_token(g, pos, pos_base, s);
 
-    dpct::event_ptr a, b;
-    if (DPCT_CHECK_ERROR(a = new sycl::event()) != 0 ||
-        DPCT_CHECK_ERROR(b = new sycl::event()) != 0) {
-        err = "session_replay_stage_sweep: event create";
-        return false;
-    }
-    dpct::sync_barrier(a, cs);
-    for (int64_t l = 0; l < g.n_layers; ++l) {
-        const dpct::err0 e =
-            DPCT_CHECK_ERROR(cs->ext_oneapi_graph(*gr.preP[k - 1][l]));
-        /*
-        DPCT1000: Error handling if-stmt was detected but could not be
-        rewritten.
-        */
-        if (e != 0) {
-            /*
-            DPCT1001: The statement could not be removed.
-            */
-            dpct::destroy_event(a);
-            dpct::destroy_event(b);
-            /*
-            DPCT1009: SYCL reports errors using exceptions and does not use
-            error codes. Please replace the "get_error_string_dummy(...)" with a
-            real error-handling function.
-            */
-            err = std::string("session_replay_stage_sweep: launch: ") +
-                  dpct::get_error_string_dummy(e);
-            return false;
-        }
-    }
-    dpct::sync_barrier(b, cs);
-    if (DPCT_CHECK_ERROR(cs->wait()) != 0) {
-        dpct::destroy_event(a);
-        dpct::destroy_event(b);
-        err = "session_replay_stage_sweep: sync";
-        return false;
-    }
-    float v = 0;
-    v = (b->get_profiling_info<sycl::info::event_profiling::command_end>() -
-         a->get_profiling_info<sycl::info::event_profiling::command_start>()) /
-        1000000.0f;
-    dpct::destroy_event(a);
-    dpct::destroy_event(b);
+    strata::ze::Event* a = new strata::ze::Event(true);
+    strata::ze::Event* b = new strata::ze::Event(true);
+    cs->record(*a);
+    for (int64_t l = 0; l < g.n_layers; ++l) cs->launch(*gr.preP[k - 1][l]);
+    cs->record(*b);
+    cs->sync();
+    const float v = b->elapsed_ms_since(*a);
+    delete a;
+    delete b;
     ms = (double) v;
     return true;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
 }
 
 bool session_replay_stage_prefixes(const ModelGeometry &g, int64_t pos,
@@ -569,39 +378,29 @@ bool session_replay_stage_prefixes(const ModelGeometry &g, int64_t pos,
                                    SessionGraphs &gr, void *stream,
                                    std::vector<double> &stage_ms,
                                    std::vector<double> &mixer_per_layer,
-                                   std::string &err) try {
+                                   std::string &err) {
     if (!gr.split_captured || gr.preP[0] == nullptr) {
         err = "session_replay_stage_prefixes: not captured with the split";
         return false;
     }
-    dpct::queue_ptr cs = strata::q_of(stream);
+    strata::ze::Stream* cs = strata::ze::stream_of(stream);
     stage_token(g, pos, pos_base, s);
     const int64_t n = g.n_layers;
     const size_t r_floats = (size_t) g.hc * (size_t) g.n_embd;
 
-    float* saved = nullptr;
-    if (DPCT_CHECK_ERROR(saved = sycl::malloc_device<float>(
-                             r_floats, dpct::get_in_order_queue())) != 0) {
+    float* saved = (float*) strata::ze::malloc_device(r_floats * sizeof(float));
+    if (saved == nullptr) {
         err = "session_replay_stage_prefixes: could not save the residual";
         return false;
     }
-    std::vector<dpct::event_ptr> ev((size_t)(n * 6));
-    bool ev_ok = true;
-    for (auto &e : ev) if (DPCT_CHECK_ERROR(e = new sycl::event()) != 0) {
-        ev_ok = false; break;
-    }
-    if (!ev_ok) {
-        for (auto &e : ev) DPCT_CHECK_ERROR(dpct::destroy_event(e));
-        sycl::free(saved, dpct::get_in_order_queue());
-        err = "session_replay_stage_prefixes: event create";
-        return false;
-    }
+    std::vector<strata::ze::Event*> ev((size_t)(n * 6));
+    for (auto &e : ev) e = new strata::ze::Event(true);
     struct Cleanup {
-        std::vector<dpct::event_ptr> *v;
+        std::vector<strata::ze::Event*> *v;
         float* p;
         ~Cleanup() {
-            for (auto &e : *v) DPCT_CHECK_ERROR(dpct::destroy_event(e));
-            sycl::free(p, dpct::get_in_order_queue());
+            for (auto &e : *v) delete e;
+            strata::ze::free(p);
         }
     } cleanup{&ev, saved};
 
@@ -609,90 +408,25 @@ bool session_replay_stage_prefixes(const ModelGeometry &g, int64_t pos,
     mixer_per_layer.assign((size_t) n, 0.0);
     for (int64_t l = 0; l < n; ++l) {
         // The residual as this layer receives it, before any prefix has advanced it.
-        /*
-        DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy API.
-        While the origin API might be synchronous, it depends on the type of
-        operand memory, so you may need to call wait() on event return by memcpy
-        API to ensure synchronization behavior.
-        */
         cs->memcpy(saved, s.block.R, r_floats * sizeof(float));
         for (int k = 1; k <= 5; ++k) {
-            /*
-            DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy
-            API. While the origin API might be synchronous, it depends on the
-            type of operand memory, so you may need to call wait() on event
-            return by memcpy API to ensure synchronization behavior.
-            */
             if (k > 1) cs->memcpy(s.block.R, saved, r_floats * sizeof(float));
-            dpct::sync_barrier(ev[(size_t)(l * 6 + k - 1)], cs);
-            const dpct::experimental::command_graph_exec_ptr ge =
+            cs->record(*ev[(size_t)(l * 6 + k - 1)]);
+            strata::ze::Graph* ge =
                 (k == 5) ? gr.execs[l] : gr.preP[k - 1][l];
-            const dpct::err0 e = DPCT_CHECK_ERROR(cs->ext_oneapi_graph(*ge));
-            /*
-            DPCT1000: Error handling if-stmt was detected but could not be
-            rewritten.
-            */
-            if (e != 0) {
-                /*
-                DPCT1001: The statement could not be removed.
-                */
-                err = std::string(
-                          "session_replay_stage_prefixes: launch prefix ") +
-                      std::to_string(k) + ": " +
-                      /*
-                      DPCT1009: SYCL reports errors using exceptions and
-                      does not use error codes. Please replace the
-                      "get_error_string_dummy(...)" with a real error-handling
-                      function.
-                      */
-                      dpct::get_error_string_dummy(e);
-                return false;
-            }
+            cs->launch(*ge);
         }
-        dpct::sync_barrier(ev[(size_t)(l * 6 + 5)], cs);
+        cs->record(*ev[(size_t)(l * 6 + 5)]);
     }
-    if (DPCT_CHECK_ERROR(cs->wait()) != 0) {
-        err = "prefixes: final sync"; return false;
-    }
+    cs->sync();
 
     float t1 = 0, t2 = 0, t3 = 0, t4 = 0, t5 = 0;
     for (int64_t l = 0; l < n; ++l) {
-        float a = 0, b = 0, c = 0, d = 0, e = 0;
-        a = (ev[(size_t)(l * 6 + 1)]
-                 ->get_profiling_info<
-                     sycl::info::event_profiling::command_end>() -
-             ev[(size_t)(l * 6 + 0)]
-                 ->get_profiling_info<
-                     sycl::info::event_profiling::command_start>()) /
-            1000000.0f;
-        b = (ev[(size_t)(l * 6 + 2)]
-                 ->get_profiling_info<
-                     sycl::info::event_profiling::command_end>() -
-             ev[(size_t)(l * 6 + 1)]
-                 ->get_profiling_info<
-                     sycl::info::event_profiling::command_start>()) /
-            1000000.0f;
-        c = (ev[(size_t)(l * 6 + 3)]
-                 ->get_profiling_info<
-                     sycl::info::event_profiling::command_end>() -
-             ev[(size_t)(l * 6 + 2)]
-                 ->get_profiling_info<
-                     sycl::info::event_profiling::command_start>()) /
-            1000000.0f;
-        d = (ev[(size_t)(l * 6 + 4)]
-                 ->get_profiling_info<
-                     sycl::info::event_profiling::command_end>() -
-             ev[(size_t)(l * 6 + 3)]
-                 ->get_profiling_info<
-                     sycl::info::event_profiling::command_start>()) /
-            1000000.0f;
-        e = (ev[(size_t)(l * 6 + 5)]
-                 ->get_profiling_info<
-                     sycl::info::event_profiling::command_end>() -
-             ev[(size_t)(l * 6 + 4)]
-                 ->get_profiling_info<
-                     sycl::info::event_profiling::command_start>()) /
-            1000000.0f;
+        const float a = ev[(size_t)(l * 6 + 1)]->elapsed_ms_since(*ev[(size_t)(l * 6 + 0)]);
+        const float b = ev[(size_t)(l * 6 + 2)]->elapsed_ms_since(*ev[(size_t)(l * 6 + 1)]);
+        const float c = ev[(size_t)(l * 6 + 3)]->elapsed_ms_since(*ev[(size_t)(l * 6 + 2)]);
+        const float d = ev[(size_t)(l * 6 + 4)]->elapsed_ms_since(*ev[(size_t)(l * 6 + 3)]);
+        const float e = ev[(size_t)(l * 6 + 5)]->elapsed_ms_since(*ev[(size_t)(l * 6 + 4)]);
         t1 += a; t2 += b; t3 += c; t4 += d; t5 += e;
         mixer_per_layer[(size_t) l] = (double) c;   // prefix 3 IS the mixer: stages 0..2
     }
@@ -704,13 +438,9 @@ bool session_replay_stage_prefixes(const ModelGeometry &g, int64_t pos,
     stage_ms.assign(t, t + 5);
     return true;
 }
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
 
 void session_graphs_free(SessionGraphs& gr) {
+    if (gr.captured) strata::ze::sync_all();
     if (gr.execs) {
         for (int64_t i = 0; i < gr.n; ++i) delete (gr.execs[i]);
         delete[] gr.execs;
@@ -747,34 +477,19 @@ void session_graphs_free(SessionGraphs& gr) {
     gr.captured = false;
 }
 
-bool SessionLoopScratch::init(size_t parts_bytes_in, std::string &err) try {
+bool SessionLoopScratch::init(size_t parts_bytes_in, std::string &err) {
     if (y_miss != nullptr || probe != nullptr) {
         err = "SessionLoopScratch::init: already initialised";
         return false;
     }
     parts_bytes = parts_bytes_in;
     // MAPPED as well as pinned: the token graph's handoff kernel reads it through its device pointer.
-    /*
-    DPCT1048: The original value cudaHostAllocMapped is not meaningful in the
-    migrated code and was removed or replaced with 0. You may need to check the
-    migrated code.
-    */
-    /*
-    DPCT1048: The original value cudaHostAllocPortable is not meaningful in
-    the migrated code and was removed or replaced with 0. You may need to check
-    the migrated code.
-    */
-    if (DPCT_CHECK_ERROR(y_miss = (float *)strata::host_malloc_polled(
-                             parts_bytes, dpct::get_in_order_queue())) != 0 || y_miss == nullptr) {
+    if ((y_miss = (float *)strata::host_malloc_polled(parts_bytes)) == nullptr) {
         err = "SessionLoopScratch: cudaHostAlloc for the pool's staging failed";
         return false;
     }
     std::memset(y_miss, 0, parts_bytes);
-    if (DPCT_CHECK_ERROR(probe = new sycl::event()) != 0) {
-        err = "SessionLoopScratch: cudaEventCreate failed";
-        free();
-        return false;
-    }
+    probe = new strata::ze::Event();
     // **PIN THE HOST ONCE, NOT ONCE PER TOKEN.**  `ExpertPool` builds its workers from `physical_cores(true)`,
     // which drops the first physical core so the host loop can spin without taking a worker's cycles - and
     // nothing in the pool can pin the host, so if this does not happen the spin is free to land on a worker's
@@ -795,11 +510,6 @@ bool SessionLoopScratch::init(size_t parts_bytes_in, std::string &err) try {
     }
     return true;
 }
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
 
 void SessionLoopScratch::free() {
     // Restores the caller's affinity on every path, including teardown: a library that silently leaves its
@@ -809,9 +519,9 @@ void SessionLoopScratch::free() {
         pinned = false;
         pinned_core = {};
     }
-    if (probe != nullptr) { dpct::destroy_event(probe); probe = nullptr; }
+    if (probe != nullptr) { delete (probe); probe = nullptr; }
     if (y_miss != nullptr) {
-        strata::host_free_polled(y_miss, dpct::get_in_order_queue()); y_miss = nullptr;
+        strata::host_free_polled(y_miss); y_miss = nullptr;
     }
     parts_bytes = 0;
 }
@@ -819,12 +529,12 @@ void SessionLoopScratch::free() {
 bool session_loop(const ModelGeometry &g, int64_t pos, int32_t pos_base,
                   SessionState &s, SessionGraphs &gr, PoolFn pool, HitFn hits,
                   void *user, bool overlap, void *stream, std::string &err,
-                  float *dump_layers, SessionLoopScratch *scratch) try {
+                  float *dump_layers, SessionLoopScratch *scratch) {
     if (!gr.captured || gr.n != g.n_layers) { err = "session_loop: not captured"; return false; }
     if (gr.parts_dev == nullptr) { err = "session_loop: the graphs were captured without a parts buffer"; return false; }
     if (s.db == nullptr) { err = "session_loop: no doorbell; the loop has nothing to poll"; return false; }
 
-    dpct::queue_ptr cs = strata::q_of(stream);
+    strata::ze::Stream* cs = strata::ze::stream_of(stream);
     const int64_t k = s.k;
     const size_t parts_bytes = (size_t) k * g.n_embd * 4;
     ++gr.calls_total;
@@ -878,16 +588,10 @@ bool session_loop(const ModelGeometry &g, int64_t pos, int32_t pos_base,
     // doorbell's `h_x_f` is `cudaHostAlloc(Mapped)` for exactly this reason and this buffer is the same kind of
     // object.
     float* y_miss = scratch->y_miss;
-    dpct::event_ptr probe = scratch->probe;
+    strata::ze::Event* probe = scratch->probe;
 
     // the first layer has no previous layer's experts: `y_miss` starts at zero, which is what "hits are empty
     // in this phase" means once every miss has been computed
-    /*
-    DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy API. While
-    the origin API might be synchronous, it depends on the type of operand
-    memory, so you may need to call wait() on event return by memcpy API to
-    ensure synchronization behavior.
-    */
     cs->memcpy(gr.parts_dev, y_miss, parts_bytes);
     doorbell_reset(*s.db);
     uint32_t expected = 0;
@@ -900,54 +604,12 @@ bool session_loop(const ModelGeometry &g, int64_t pos, int32_t pos_base,
     // "the input to layer 0 is already wrong" from "layer 0 is wrong".
     if (dump_layers != nullptr) {
         const size_t n = (size_t) g.hc * (size_t) g.n_embd;
-        /*
-        DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy API.
-        While the origin API might be synchronous, it depends on the type of
-        operand memory, so you may need to call wait() on event return by memcpy
-        API to ensure synchronization behavior.
-        */
-        const dpct::err0 de =
-            DPCT_CHECK_ERROR(cs->memcpy(dump_layers, s.R, n * sizeof(float)));
-        /*
-        DPCT1000: Error handling if-stmt was detected but could not be
-        rewritten.
-        */
-        if (de != 0) {
-            /*
-            DPCT1009: SYCL reports errors using exceptions and does not use
-            error codes. Please replace the "get_error_string_dummy(...)" with a
-            real error-handling function.
-            */
-            /*
-            DPCT1001: The statement could not be removed.
-            */
-            err = "session_loop: dump the input residual: " +
-                  std::string(dpct::get_error_string_dummy(de));
-            return false;
-        }
+        cs->memcpy(dump_layers, s.R, n * sizeof(float));
     }
     {
         const auto t0 = std::chrono::steady_clock::now();
-        const dpct::err0 le =
-            DPCT_CHECK_ERROR(cs->ext_oneapi_graph(*gr.execs[0]));
-        /*
-        DPCT1000: Error handling if-stmt was detected but could not be
-        rewritten.
-        */
-        if (le != 0) {
-            /*
-            DPCT1009: SYCL reports errors using exceptions and does not use
-            error codes. Please replace the "get_error_string_dummy(...)" with a
-            real error-handling function.
-            */
-            /*
-            DPCT1001: The statement could not be removed.
-            */
-            err = "session_loop: launch pre[0]: " +
-                  std::string(dpct::get_error_string_dummy(le));
-            return false;
-        }
-        dpct::sync_barrier(probe, cs);
+        cs->launch(*gr.execs[0]);
+        cs->record(*probe);
         (void) t0;
     }
 
@@ -971,23 +633,12 @@ bool session_loop(const ModelGeometry &g, int64_t pos, int32_t pos_base,
             // is entered.  The fence and the volatile read are kept because they are correct and cost nothing -
             // without them the ring's ordering against `x_f`/`ids`/`weights` is unstated - but they do not
             // remove the need for the call, and nothing here should be read as claiming they do.
-            const dpct::err0 q = dpct::sycl_event_query(probe);
+            const int q = probe->query() ? 0 : 1;
             if (!rang && *seq >= want) {
                 rang = true;
                 mid_graph = (q != 0);
             }
             if (q == 0) break; // the graph has ended
-            if (q != 1) {
-                /*
-                DPCT1009: SYCL reports errors using exceptions and does not
-                use error codes. Please replace the
-                "get_error_string_dummy(...)" with a real error-handling
-                function.
-                */
-                err = "session_loop: query at layer " + std::to_string(l) +
-                      ": " + dpct::get_error_string_dummy(q);
-                return false;
-            }
             if (rang) break;                             // rung, and the graph is still running: the overlap
             STRATA_SPIN_PAUSE();
         }
@@ -1026,105 +677,31 @@ bool session_loop(const ModelGeometry &g, int64_t pos, int32_t pos_base,
         // `sum_j w_{l+1}[j] * expert_{ids_l,j}(x_l)` - both the selection and the input one layer stale while
         // the weights were current.  It produced finite, fluent, deterministic tokens that were not the
         // model's, and no timing test could see it.
-        /*
-        DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy API.
-        While the origin API might be synchronous, it depends on the type of
-        operand memory, so you may need to call wait() on event return by memcpy
-        API to ensure synchronization behavior.
-        */
         cs->memcpy(gr.parts_dev, y_miss, parts_bytes);
         // ---- **AND THEN THE COMBINE.**  Stream-ordered after the copy above, so `hit_out` is added to misses
         // that are already in `parts`, and before `post[l]`, whose `moe_combine` reads the sum.  A no-op when
         // there is no VRAM tier or nothing is resident, which is every layer until the cache warms.
         if (hits != nullptr) hits(user, cs, HitPhase::Combine, nullptr, 0);
-        {
-            const dpct::err0 pe =
-                DPCT_CHECK_ERROR(cs->ext_oneapi_graph(*gr.posts[l]));
-            /*
-            DPCT1000: Error handling if-stmt was detected but could not be
-            rewritten.
-            */
-            if (pe != 0) {
-                /*
-                DPCT1009: SYCL reports errors using exceptions and does not
-                use error codes. Please replace the
-                "get_error_string_dummy(...)" with a real error-handling
-                function.
-                */
-                /*
-                DPCT1001: The statement could not be removed.
-                */
-                err = "session_loop: launch post[" + std::to_string(l) +
-                      "]: " + dpct::get_error_string_dummy(pe);
-                return false;
-            }
-        }
+        cs->launch(*gr.posts[l]);
         // ---- the C1 oracle.  `s.R` now holds layer `l`'s residual and keeps it until `post[l+1]` writes it, so
         // a copy enqueued HERE - after `post[l]`, before `pre[l+1]` - is ordered correctly by the stream alone.
         // Nothing is synchronised: the loop's existing final sync is what completes these.  See the note on
         // `dump_layers` in session.hpp for why this is an enqueue and not a read.
         if (dump_layers != nullptr) {
             const size_t n = (size_t) g.hc * (size_t) g.n_embd;
-            /*
-            DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy
-            API. While the origin API might be synchronous, it depends on the
-            type of operand memory, so you may need to call wait() on event
-            return by memcpy API to ensure synchronization behavior.
-            */
-            const dpct::err0 de = DPCT_CHECK_ERROR(cs->memcpy(
-                dump_layers + (size_t)(l + 1) * n, s.R, n * sizeof(float)));
-            /*
-            DPCT1000: Error handling if-stmt was detected but could not be
-            rewritten.
-            */
-            if (de != 0) {
-                /*
-                DPCT1009: SYCL reports errors using exceptions and does not
-                use error codes. Please replace the
-                "get_error_string_dummy(...)" with a real error-handling
-                function.
-                */
-                /*
-                DPCT1001: The statement could not be removed.
-                */
-                err = "session_loop: dump layer " + std::to_string(l) + ": " +
-                      dpct::get_error_string_dummy(de);
-                return false;
-            }
+            cs->memcpy(dump_layers + (size_t)(l + 1) * n, s.R, n * sizeof(float));
         }
         if (!overlap) {
             // THE COMPARISON ARM.  The same sequence with the pipeline removed: the CPU does not start until the
             // layer is over, so nothing overlaps and the difference is attributable to the doorbell alone.
-            if (DPCT_CHECK_ERROR(cs->wait()) != 0) {
-                err = "session_loop: sync at layer " + std::to_string(l);
-                return false;
-            }
+            cs->sync();
         }
         // ---- and layer l+1's routing starts.  `pre[l+1]` touches none of the buffers `post[l]` reads, because
         // the two are ordered on one stream and `pre[l+1]`'s first use of `bb.mixed`/`bb.inject` is its own
         // `gr_read`, which comes after `post[l]` has consumed them.
         if (l + 1 < g.n_layers) {
-            const dpct::err0 ne =
-                DPCT_CHECK_ERROR(cs->ext_oneapi_graph(*gr.execs[l + 1]));
-            /*
-            DPCT1000: Error handling if-stmt was detected but could not be
-            rewritten.
-            */
-            if (ne != 0) {
-                /*
-                DPCT1009: SYCL reports errors using exceptions and does not
-                use error codes. Please replace the
-                "get_error_string_dummy(...)" with a real error-handling
-                function.
-                */
-                /*
-                DPCT1001: The statement could not be removed.
-                */
-                err = "session_loop: launch pre[" + std::to_string(l + 1) +
-                      "]: " + dpct::get_error_string_dummy(ne);
-                return false;
-            }
-            dpct::sync_barrier(probe, cs);
+            cs->launch(*gr.execs[l + 1]);
+            cs->record(*probe);
         }
         // ---- **THE SECOND HALF OF THE ROUND TRIP, AND THE HALF NOTHING WAS MEASURING.**
         //
@@ -1137,22 +714,15 @@ bool session_loop(const ModelGeometry &g, int64_t pos, int32_t pos_base,
         // exists to show what the pipeline is worth, and hiding its cost here would defeat the comparison.
         gr.ms_host += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_ring).count();
     }
-    if (DPCT_CHECK_ERROR(cs->wait()) != 0) {
-        err = "session_loop: final sync"; return false;
-    }
+    cs->sync();
     return true;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
 }
 
 bool session_token(const WeightTable &tables, const ModelGeometry &g,
                    int64_t pos, int32_t pos_base, SessionState &s,
                    const float *parts, void *stream, bool sync_every_layer,
-                   std::string &err) try {
-    dpct::queue_ptr cs = strata::q_of(stream);
+                   std::string &err) {
+    strata::ze::Stream* cs = strata::ze::stream_of(stream);
     int64_t qsa_index = 0;
     int64_t gdn_index = 0;
 
@@ -1183,33 +753,10 @@ bool session_token(const WeightTable &tables, const ModelGeometry &g,
             // P2.X3 forbids in the fast path.  It exists to turn an ASYNCHRONOUS error - a kernel reading a
             // buffer a later layer wrote, or an out-of-range launch - into a failure AT THE LAYER THAT CAUSED
             // IT, instead of a wrong number 40 layers later or at the end of the token.
-            const dpct::err0 e = DPCT_CHECK_ERROR(cs->wait());
-            /*
-            DPCT1000: Error handling if-stmt was detected but could not be
-            rewritten.
-            */
-            if (e != 0) {
-                /*
-                DPCT1009: SYCL reports errors using exceptions and does not
-                use error codes. Please replace the
-                "get_error_string_dummy(...)" with a real error-handling
-                function.
-                */
-                /*
-                DPCT1001: The statement could not be removed.
-                */
-                err = "layer " + std::to_string(l) + ": " +
-                      dpct::get_error_string_dummy(e);
-                return false;
-            }
+            cs->sync();
         }
     }
     return true;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
 }
 
 }  // namespace strata::core
@@ -1220,7 +767,7 @@ bool session_capture_token(const WeightTable &tables, const ModelGeometry &g,
                            SessionState &s, float *parts_dev,
                            const float *y_miss_host, size_t parts_bytes,
                            TokenGraph &tg, std::string &err,
-                           const TokenHits *hits) try {
+                           const TokenHits *hits) {
     if (hits != nullptr && !hits->on()) { err = "session_capture_token: incomplete hit configuration"; return false; }
     if (tg.captured) return true;
     if (s.db == nullptr || s.db->d_flag == nullptr || s.db->d_seq == nullptr) {
@@ -1231,23 +778,13 @@ bool session_capture_token(const WeightTable &tables, const ModelGeometry &g,
         err = "session_capture_token: parts buffers are required";
         return false;
     }
-    float* y_dev = nullptr;
-    if (DPCT_CHECK_ERROR(*(void **)&y_dev =
-                             (float *)const_cast<float *>(y_miss_host)) != 0 ||
-        !y_dev) {
+    float* y_dev = const_cast<float*>(y_miss_host);
+    if (strata::ze::kind_of(y_dev) != strata::ze::MemKind::Host) {
         err = "session_capture_token: the parts staging is not mapped pinned memory";
         return false;
     }
-    dpct::queue_ptr cs = &dpct::get_in_order_queue();
-    if (DPCT_CHECK_ERROR(cs = dpct::get_current_device().create_queue(true)) !=
-        0) {
-        err = "session_capture_token: stream create failed"; return false;
-    }
-    if (DPCT_CHECK_ERROR(dpct::experimental::begin_recording(cs)) != 0) {
-        dpct::get_current_device().destroy_queue(cs);
-        err = "session_capture_token: begin capture failed";
-        return false;
-    }
+    strata::ze::Stream* cs = new strata::ze::Stream();
+    cs->begin_capture();
     int64_t qsa_index = 0;
     bool ok = true;
     for (int64_t l = 0; l < g.n_layers && ok; ++l) {
@@ -1276,91 +813,27 @@ bool session_capture_token(const WeightTable &tables, const ModelGeometry &g,
         if (!ok) { err = "session_capture_token: post layer " + std::to_string(l) + ": " + err; break; }
         if (qsa) ++qsa_index;
     }
-    dpct::experimental::command_graph_ptr graph = nullptr;
-    const dpct::err0 ce =
-        DPCT_CHECK_ERROR(dpct::experimental::end_recording(cs, &graph));
-    dpct::get_current_device().destroy_queue(cs);
-    if (!ok) { if (graph) delete (graph); return false; }
-    /*
-    DPCT1000: Error handling if-stmt was detected but could not be
-    rewritten.
-    */
-    if (ce != 0) {
-        /*
-        DPCT1009: SYCL reports errors using exceptions and does not use
-        error codes. Please replace the "get_error_string_dummy(...)" with a
-        real error-handling function.
-        */
-        /*
-        DPCT1001: The statement could not be removed.
-        */
-        err = std::string("session_capture_token: end capture: ") +
-              dpct::get_error_string_dummy(ce);
-        return false;
-    }
-    const dpct::err0 ie = DPCT_CHECK_ERROR(
-        tg.exec = new sycl::ext::oneapi::experimental::command_graph<
-            sycl::ext::oneapi::experimental::graph_state::executable>(
-            graph->finalize()));
-    delete (graph);
-    /*
-    DPCT1000: Error handling if-stmt was detected but could not be
-    rewritten.
-    */
-    if (ie != 0) {
-        /*
-        DPCT1009: SYCL reports errors using exceptions and does not use
-        error codes. Please replace the "get_error_string_dummy(...)" with a
-        real error-handling function.
-        */
-        /*
-        DPCT1001: The statement could not be removed.
-        */
-        err = std::string("session_capture_token: instantiate: ") +
-              dpct::get_error_string_dummy(ie);
-        return false;
-    }
+    strata::ze::Graph* graph = cs->end_capture();
+    delete cs;
+    if (!ok) { delete graph; return false; }
+    tg.exec = graph;
     tg.captured = true;
     tg.n_layers = g.n_layers;
     tg.y_src = y_miss_host;
     tg.parts_bytes = parts_bytes;
     return true;
 }
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
 
 bool session_run_token(const ModelGeometry &g, int64_t pos, int32_t pos_base,
                        SessionState &s, TokenGraph &tg, PoolFn pool, void *user,
-                       float *y_miss_host, void *stream, std::string &err) try {
+                       float *y_miss_host, void *stream, std::string &err) {
     if (!tg.captured) { err = "session_run_token: not captured"; return false; }
     if (y_miss_host != tg.y_src) { err = "session_run_token: the staging buffer is not the captured one"; return false; }
-    dpct::queue_ptr cs = strata::q_of(stream);
+    strata::ze::Stream* cs = strata::ze::stream_of(stream);
     ++tg.calls;
     stage_token(g, pos, pos_base, s);
     doorbell_reset(*s.db);
-    const dpct::err0 le = DPCT_CHECK_ERROR(cs->ext_oneapi_graph(*tg.exec));
-    /*
-    DPCT1009: SYCL reports errors using exceptions and does not use error
-    codes. Please replace the "get_error_string_dummy(...)" with a real
-    error-handling function.
-    */
-    /*
-    DPCT1001: The statement could not be removed.
-    */
-    /*
-    DPCT1000: Error handling if-stmt was detected but could not be
-    rewritten.
-    */
-    if (le != 0) {
-        err = std::string("session_run_token: launch: ") +
-              dpct::get_error_string_dummy(le);
-        return false;
-    }
-    (void)DPCT_CHECK_ERROR(
-        (cs->ext_oneapi_empty())); // one flush, so WDDM submits the graph now
+    cs->launch(*tg.exec);
     static const int flush_us = [] {
         const char* e = std::getenv("STRATA_TG_FLUSH_US");
         return e ? std::atoi(e) : 2000;   // 24 Sep: 0 flushes run as fast as 5 us ones; this only notices faults
@@ -1382,23 +855,9 @@ bool session_run_token(const ModelGeometry &g, int64_t pos, int32_t pos_base,
                 // A slow ring: flush the submission queue once more, and notice a fault or a finished graph.
                 last_flush = now;
                 ++tg.flushes;
-                // SYCL port fix: cudaStreamQuery's answer (0 finished, 1 still running) was lost in the migration
-                // (DPCT_CHECK_ERROR of ext_oneapi_empty() is always 0), so ANY wait over 2 ms was reported as
-                // "graph finished". Layers whose GPU time exceeds 2 ms (host-mirrored experts read over PCIe) failed that way.
-                const dpct::err0 q = cs->ext_oneapi_empty() ? 0 : 1;
+                const int q = cs->idle() ? 0 : 1;
                 if (q != 1 && *seq < want) {
-                    err = "session_run_token: layer " + std::to_string(l) +
-                          " never rang (" +
-                          /*
-                          DPCT1009: SYCL reports errors using exceptions and
-                          does not use error codes. Please replace the
-                          "get_error_string_dummy(...)" with a real
-                          error-handling function.
-                          */
-                          (q == 0
-                               ? std::string("graph finished")
-                               : std::string(dpct::get_error_string_dummy(q))) +
-                          ")";
+                    err = "session_run_token: layer " + std::to_string(l) + " never rang (graph finished)";
                     return false;
                 }
             }
@@ -1418,36 +877,17 @@ bool session_run_token(const ModelGeometry &g, int64_t pos, int32_t pos_base,
         tg.ms_pool += std::chrono::duration<double, std::milli>(t2 - t1).count();
     }
     progress_at("token: waiting for the GPU to finish the token");
-    const dpct::err0 se = DPCT_CHECK_ERROR(cs->wait());
-    /*
-    DPCT1009: SYCL reports errors using exceptions and does not use error
-    codes. Please replace the "get_error_string_dummy(...)" with a real
-    error-handling function.
-    */
-    /*
-    DPCT1001: The statement could not be removed.
-    */
-    /*
-    DPCT1000: Error handling if-stmt was detected but could not be
-    rewritten.
-    */
-    if (se != 0) {
-        err = std::string("session_run_token: ") +
-              dpct::get_error_string_dummy(se);
-        return false;
-    }
+    cs->sync();
     progress_at("decode");
     progress_beat();
     return true;
 }
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
 
 void token_graph_free(TokenGraph& tg) {
-    if (tg.exec) delete (tg.exec);
+    if (tg.exec) {
+        strata::ze::device_sync(tg.exec->device());
+        delete tg.exec;
+    }
     tg = TokenGraph{};
 }
 

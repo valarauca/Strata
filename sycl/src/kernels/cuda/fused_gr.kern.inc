@@ -1,0 +1,22 @@
+// fused_gr.kern.inc - entry points of fused_gr.dp.cpp (strata/ze/kernel_abi.hpp).
+STRATA_KERNEL(fused_gr_down, (FusedGrArgs a), gr_down_kernel(a))
+STRATA_KERNEL(fused_gr_up, (FusedGrArgs a), gr_up_kernel(a))
+STRATA_KERNEL(fused_gr_norm_multi, (GrMulti m), gr_norm_multi_kernel(m))
+STRATA_KERNEL(fused_gr_norm_split_port, (GrMulti m), gr_norm_split_port_kernel(m))
+STRATA_KERNEL(fused_gr_down_multi_1280, (GrMulti m), gr_down_multi_kernel<1280>(m, strata_slm<uint8_t>()))
+STRATA_KERNEL(fused_gr_down_multi_1280_max4, (GrMulti m), gr_down_multi_kernel<1280, 4>(m, strata_slm<uint8_t>()))
+STRATA_KERNEL(fused_gr_down_multi_2560, (GrMulti m), gr_down_multi_kernel<2560>(m, strata_slm<uint8_t>()))
+STRATA_KERNEL(fused_gr_down_multi_2560_max4, (GrMulti m), gr_down_multi_kernel<2560, 4>(m, strata_slm<uint8_t>()))
+STRATA_KERNEL(fused_gr_down_multi_direct, (GrMulti m), gr_down_multi_direct_kernel(m))
+STRATA_KERNEL(fused_gr_down_sliced, (GrMulti m), gr_down_sliced_kernel(m, strata_slm<float>()))
+STRATA_KERNEL(fused_gr_down_reduce, (GrMulti m), gr_down_reduce_kernel(m))
+STRATA_KERNEL(fused_gr_up_multi, (GrMulti m), gr_up_multi_kernel(m))
+STRATA_KERNEL(fused_gr_down_v3_s1, (GrMulti m, float* part, float* ssg),
+              gr_down_v3_kernel<1>(m, part, ssg, strata_slm<uint8_t>()))
+STRATA_KERNEL(fused_gr_down_v3_s2, (GrMulti m, float* part, float* ssg),
+              gr_down_v3_kernel<2>(m, part, ssg, strata_slm<uint8_t>()))
+STRATA_KERNEL(fused_gr_up_v3_s1, (GrMulti m, const float* part, const float* ssg), gr_up_v3_kernel<1>(m, part, ssg))
+STRATA_KERNEL(fused_gr_up_v3_s2, (GrMulti m, const float* part, const float* ssg), gr_up_v3_kernel<2>(m, part, ssg))
+STRATA_KERNEL(fused_gr_norm_split, (GrMulti m), gr_norm_split_kernel(m))
+STRATA_KERNEL(fused_gr_down_staged, (GrMulti m), gr_down_staged_kernel(m, strata_slm<uint8_t>()))
+STRATA_KERNEL(fused_gr_down_staged_max4, (GrMulti m), gr_down_staged_kernel<4>(m, strata_slm<uint8_t>()))
