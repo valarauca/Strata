@@ -235,6 +235,9 @@ int main(int argc, char** argv) {
         {"q4 expert gate/up, 420 rows", 420, 1280, 2560, false},
         {"q4 expert down, 161 rows", 161, 2560, 640, false},
         {"q4 expert down, 420 rows", 420, 2560, 640, false},
+        {"q4 expert gate/up, 1000 rows", 1000, 1280, 2560, false},
+        {"q4 expert gate/up, 2048 rows", 2048, 1280, 2560, false},
+        {"q4 expert down, 2048 rows", 2048, 2560, 640, false},
         {"q4 gate/up interleaved, 80 rows", 80, 1280, 2560, true},
     };
     for (const Q4Case& c : q4cases) {

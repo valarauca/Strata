@@ -3,6 +3,21 @@
 // gemm/jit/walk_orders.hpp at the vendored commit), cut down to what Strata asks for: one launch per product (no
 // m/n/k blocking), alpha 1, beta 0 or 1, no post-ops, no batch, and no kernel that needs atomics, a temporary C or a
 // zeroed status buffer (the selection is made deterministic, so those are never chosen).
+//
+// What gemmstone and nGEN borrow, and what keeps it alive:
+//   - the kernel catalog: kcatalog::Catalog and every Entry pointer select() returns point into the static array of
+//     catalog.cpp (static storage, never freed); Built keeps copies, never an Entry pointer;
+//   - MatchParams: its precision, layout and tag strings point into its own buffer or at string literals, and a copy
+//     re-points them at the copy's buffer, so patterns are copied, never referenced, while the vector holding them
+//     grows; select() borrows that vector only for the call;
+//   - GEMMProblem, GEMMStrategy, EvaluateParams, the hardware description: plain values, copied into Built;
+//   - the interface handler: Generator::gemm copies it, and the handler is declared before the generator so it outlives
+//     the generator in any case; the generator lives only inside build() and returns its binary by value;
+//   - GPU objects: none are ever passed in. ze::load_native copies the binary into a module the runtime owns, with its
+//     kernel, until the process exits; the static cache only holds those handles, never destroys them;
+//   - a launch: the argument values are copied into the command list by the append, so the locals they point at only
+//     need to live through the call; the buffers they name must stay allocated until the GPU has run the launch
+//     (strata/gemmstone.hpp).
 #include "strata/gemmstone.hpp"
 #include "strata/ze/ze.hpp"
 
@@ -146,6 +161,7 @@ gm::GEMMProblem make_problem(const Key& key, const Hardware& hw) {
 std::vector<gm::MatchParams> match_params(const gm::GEMMProblem& problem, const Key& key, const Hardware& hw, std::string& tags) {
     using namespace gm::kcatalog;
     std::vector<gm::MatchParams> mp;
+    mp.reserve(16);
     gm::MatchParams base(hw.hw, true, hw.product, problem);
     base.precisionCExt = '\0';
     base.sizes.m = key.m;
@@ -162,7 +178,7 @@ std::vector<gm::MatchParams> match_params(const gm::GEMMProblem& problem, const 
     *t = '\0';
     tags = base.tags;
     mp.push_back(base);
-    auto add = [&](const gm::MatchParams& start, const char* (*m)(Type)) {
+    auto add = [&](const gm::MatchParams start, const char* (*m)(Type)) {
         if (m(problem.Ta_ext)) {
             mp.push_back(start);
             mp.back().selector.precisions[0] = m(problem.Ta_ext);
