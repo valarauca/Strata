@@ -407,6 +407,11 @@ private:
     float* dbgR_ = nullptr;   ///< SYCL port debug: R (token 0) after every layer, n_layers x n_embd
     float* dbgL_ = nullptr;   ///< STRATA_DUMP_SPEC_LAYERS: [n_layers][residual max_t x hc*N | mixer max_t x N | moe max_t x N]
     float* dbgM_ = nullptr;   ///< SYCL port debug: mixed_ (token 0) after every layer
+    float* dumpL_ = nullptr;  ///< STRATA_DUMP_WINDOWS: token 0 after every layer: residual (hc*N), block output (N),
+                              ///< expert ids (K, int32 bits), routing weights (K), shared expert (N), expert outputs (K*N),
+                              ///< the layer's residency row (n_expert slots, int32 bits);
+                              ///< then the stage's input row (the embedding, or a later stage's hand-off)
+    int64_t dump_seq_ = 0;    ///< this verifier's windows so far (the file sequence)
     float* dbgRt_ = nullptr;  ///< STRATA_DUMP_SPEC_ROUTE: [n_layers][logits max_t x NE | ids max_t x K | weights max_t x K]
     strata::ze::Stream* sh_cs_ = &strata::ze::default_stream();
     strata::ze::Event* ev_fork_ = nullptr, *ev_join_ = nullptr;
@@ -444,6 +449,9 @@ private:
     /// Raises flag B to `want` behind this window's DMA host functions still queued on copy_ (flag B only rises, so a
     /// direct raise would release a group whose copies have not landed); directly when copy_ is idle.
     void raise_b(uint32_t want);
+    /// STRATA_DUMP_WINDOWS=<dir>: writes this window's dumpL_ rows for the stage's layers to
+    /// <dir>/w<seq>_l<lb>-<le>.bin (the first STRATA_DUMP_WINDOWS_MAX windows, default 64).
+    void dump_window(int T, const int32_t* tokens, int64_t pos0);
     int32_t* h_plan_ = nullptr;  int32_t* m_plan_ = nullptr;     // counts | start | dst | tok | ptr (as int32 pairs)
     int64_t plan_i32_ = 0;                                        // int32 words in the plan block
     GpuPlanSink sink_;

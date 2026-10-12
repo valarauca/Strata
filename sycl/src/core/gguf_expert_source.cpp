@@ -115,12 +115,13 @@ const uint8_t* GgufExpertSource::blob(int64_t layer, int64_t expert) {
 }
 
 int64_t GgufExpertSource::mirror(const std::vector<std::pair<int64_t, int64_t>>& pairs, uint64_t cap, int threads,
-                                 std::string& err) {
+                                 std::string& err, bool append) {
     const auto& lay = strata::kernels::cpu::expert_layout();
     std::vector<std::pair<int64_t, int64_t>> take;
     uint64_t total = 0;
     for (const auto& [l, e] : pairs) {
         if (l < 0 || l >= n_layers_ || e < 0 || e >= n_expert_) continue;
+        if (append && pinned(l, e)) continue;
         const uint64_t b = (lay.bytes[(size_t) l] + 255) / 256 * 256;
         if (total + b > cap) break;
         take.push_back({l, e});
@@ -180,12 +181,19 @@ int64_t GgufExpertSource::mirror(const std::vector<std::pair<int64_t, int64_t>>&
         err = "mirror: reading an expert from the GGUF failed";
         return -1;
     }
-    for (uint8_t* c : mirror_chunks_) if (c) strata::ze::free(c);
-    mirror_chunks_ = std::move(chunks);
+    if (append) {
+        mirror_chunks_.insert(mirror_chunks_.end(), chunks.begin(), chunks.end());
+        mirror_bytes_ += total;
+    } else {
+        for (uint8_t* c : mirror_chunks_) if (c) strata::ze::free(c);
+        mirror_chunks_ = std::move(chunks);
+        mirror_bytes_ = total;
+        mirror_ptr_.clear();
+        layer_first_.clear();
+    }
     cleanup.armed = false;                                  // the chunks now belong to the object
-    mirror_bytes_ = total;
-    mirror_ptr_.assign((size_t) (n_layers_ * n_expert_), nullptr);
-    layer_first_.assign((size_t) n_layers_, nullptr);
+    if (mirror_ptr_.empty()) mirror_ptr_.assign((size_t) (n_layers_ * n_expert_), nullptr);
+    if (layer_first_.empty()) layer_first_.assign((size_t) n_layers_, nullptr);
     for (size_t j = 0; j < take.size(); ++j) {
         const auto [l, e] = take[j];
         mirror_ptr_[(size_t) (l * n_expert_ + e)] = ptrs[j];

@@ -952,6 +952,7 @@ struct GpuStage {
     strata::core::ExpertCache cache;
     std::vector<std::pair<int32_t, int32_t>> profile;   ///< its layers' share of the profile, hottest first
     int32_t* d_res = nullptr;                            ///< the residency table on its device
+    unsigned long long* mirror_d = nullptr;              ///< the device plan's mirror table on its device (null: none)
     strata::core::Verifier ver;
     strata::core::Verifier ver_b;                        ///< --pipeline-windows: the odd windows' verifier
     strata::prefill::Prefill sp;
@@ -3524,7 +3525,7 @@ int main(int argc, char **argv) {
         }
     }
     std::vector<std::vector<std::unique_ptr<strata::core::SessionState>>> bslot_ss;
-    std::vector<std::vector<void*>> bslot_buf;   // each slot session's carved device memory, beside it
+    std::vector<std::vector<void*>> bslot_buf;
     if (o.batch != 0) {
         const int cap = strata::kernels::kVerifyMaxT;
         const char* off = !o.serve ? "it needs --serve" : o.batch < 2 ? "it needs 2 or more slots"
@@ -3583,7 +3584,7 @@ int main(int argc, char **argv) {
             std::fprintf(stderr, "strata generate: --batch: %d slot sessions on CUDA%d (%.2f GiB each); %.2f GiB free\n",
                          (int) bslot_ss[k].size(), dev, (double) bytes / 1073741824.0, (double) fb / 1073741824.0);
         }
-        auto drop_slots = [&](int keep) {   // the same count on every stage; a dropped slot gives back all it holds
+        auto drop_slots = [&](int keep) {
             for (size_t k = 0; k < bslot_ss.size(); ++k) {
                 const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
                 strata::ze::device_sync();
@@ -4505,6 +4506,81 @@ int main(int argc, char **argv) {
     }
     if (multi_gpu)
         std::fprintf(stderr, "strata generate: layer split: CUDA0 runs layers 0-%lld\n", (long long) (split_at[0] - 1));
+    if (multi_gpu && o.stream_experts && srcp == &gguf_src && o.expert_cache > 0) {
+        std::vector<std::pair<int64_t, int64_t>> miss;
+        std::vector<char> seen((size_t) (g.n_layers * g.n_expert), 0);
+        auto add = [&](int64_t l, int64_t e) {
+            char& s = seen[(size_t) (l * g.n_expert + e)];
+            if (s == 0) { s = 1; miss.push_back({l, e}); }
+        };
+        for (auto& stp : stages) {
+            const GpuStage& st = *stp;
+            for (const auto& pr : st.profile)
+                if (st.cache.slot_of(pr.first, pr.second) == strata::core::kNotResident && !gguf_src.pinned(pr.first, pr.second))
+                    add(pr.first, pr.second);
+            for (int64_t l = st.lb; l < st.le; ++l)
+                for (int64_t e = 0; e < g.n_expert; ++e)
+                    if (st.cache.slot_of(l, e) == strata::core::kNotResident && !gguf_src.pinned(l, e)) add(l, e);
+        }
+        uint64_t avail = 0;
+        if (FILE* f = std::fopen("/proc/meminfo", "r")) {
+            char key[64]; unsigned long long kb = 0;
+            while (std::fscanf(f, "%63s %llu kB", key, &kb) == 2)
+                if (std::strcmp(key, "MemAvailable:") == 0) { avail = kb << 10; break; }
+            std::fclose(f);
+        }
+        const char* mv = std::getenv("STRATA_MIRROR_MIB");
+        const uint64_t have = gguf_src.mirrored_bytes(), env_cap = mv ? (uint64_t) std::atoll(mv) << 20 : 0;
+        const uint64_t cap = mv ? (env_cap > have ? env_cap - have : 0) : (avail > (4ull << 30) ? avail - (4ull << 30) : 0);
+        if (!miss.empty() && cap > 0) {
+            const auto tm = Clock::now();
+            const int64_t got = gguf_src.mirror(miss, cap, 8, err, true);
+            if (got < 0) {
+                std::fprintf(stderr, "strata generate: layer split: mirroring the later GPUs' missing experts: %s\n", err.c_str());
+                err.clear();
+            } else {
+                std::fprintf(stderr, "strata generate: layer split: %lld of %zu experts the later GPUs miss mirrored in pinned "
+                                     "host memory (%.2f GiB mirrored in all, %.1f s)\n", (long long) got, miss.size(),
+                             (double) gguf_src.mirrored_bytes() / 1073741824.0,
+                             std::chrono::duration<double>(Clock::now() - tm).count());
+            }
+        }
+        for (auto& stp : stages) {
+            GpuStage& st = *stp;
+            std::vector<unsigned long long> tab((size_t) (g.n_layers * g.n_expert), 0ull);
+            bool any = false;
+            for (int64_t l = st.lb; l < st.le; ++l)
+                for (int64_t e = 0; e < g.n_expert; ++e)
+                    if (gguf_src.pinned(l, e)) {
+                        tab[(size_t) (l * g.n_expert + e)] = (unsigned long long) gguf_src.device_alias(l, e);
+                        any = true;
+                    }
+            if (!any) continue;
+            const strata::core::OnDevice on(st.dev);
+            st.mirror_d = (unsigned long long*) strata::ze::malloc_device(tab.size() * sizeof(unsigned long long));
+            if (st.mirror_d == nullptr) {
+                std::fprintf(stderr, "strata generate: layer split: CUDA%d has no room for its mirror table\n", st.dev);
+                return 1;
+            }
+            strata::ze::copy_sync(st.mirror_d, tab.data(), tab.size() * sizeof(unsigned long long));
+        }
+    }
+    if (multi_gpu) {
+        const bool no_host = [] { const char* v = std::getenv("STRATA_VERIFY_NO_HOST"); return v && *v && std::strcmp(v, "0") != 0; }();
+        int64_t unplanned = 0;
+        for (auto& stp : stages)
+            for (int64_t l = stp->lb; l < stp->le; ++l)
+                for (int64_t e = 0; e < g.n_expert; ++e)
+                    if (stp->cache.slot_of(l, e) == strata::core::kNotResident && !(stp->mirror_d && srcp->pinned(l, e)))
+                        ++unplanned;
+        if (no_host && unplanned > 0) {
+            std::fprintf(stderr, "strata generate: REFUSED: %lld experts of the later GPUs' layers are neither in their VRAM "
+                                 "nor mirrored; with STRATA_VERIFY_NO_HOST the device plan cannot run them - raise "
+                                 "STRATA_MIRROR_MIB or the free RAM, or run without STRATA_VERIFY_NO_HOST\n",
+                         (long long) unplanned);
+            return 2;
+        }
+    }
 
     std::array<strata::core::RemoteExperts, 3> remote_experts;
     std::unique_ptr<strata::core::RemoteExpertOpt> remote_opt;
@@ -6274,6 +6350,8 @@ int main(int argc, char **argv) {
         strata::core::VerifyHits vh;
         vh.d_res = thits.d_res;
         if (mirror_table_d) strata::kernels::resident_plan_set_mirror(thits.d_res, g.n_layers * g.n_expert, mirror_table_d);
+        for (auto& st : stages)
+            if (st->mirror_d && st->d_res) strata::kernels::resident_plan_set_mirror(st->d_res, g.n_layers * g.n_expert, st->mirror_d);
         vh.h_res = host_res.empty() ? nullptr : host_res.data();
         vh.cache_base = thits.cache_base;
         vh.blob = thits.blob;

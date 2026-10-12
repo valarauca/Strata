@@ -705,6 +705,10 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
         dbgR_ = (float*) strata::ze::malloc_device((size_t) g.n_layers * g.n_embd * 4);
         dbgM_ = (float*) strata::ze::malloc_device((size_t) g.n_layers * g.n_embd * 4);
     }
+    if (const char* d = std::getenv("STRATA_DUMP_WINDOWS"); d != nullptr && *d)
+        dumpL_ = (float*) strata::ze::malloc_device((size_t) (g.n_layers + 1) *
+                                                    (size_t) (g.hc * g.n_embd + 2 * g.n_embd + 2 * ss.k + ss.k * g.n_embd +
+                                                              g.n_expert) * 4);
     if (std::getenv("STRATA_DUMP_SPEC_LAYERS") != nullptr && lb_ == 0 && le_ == g.n_layers)
         dbgL_ = (float*) strata::ze::malloc_device((size_t) g.n_layers * (size_t) max_t * (size_t) (g.hc * g.n_embd + 2 * g.n_embd) * 4);
     if (std::getenv("STRATA_DUMP_SPEC_ROUTE") != nullptr && lb_ == 0 && le_ == g.n_layers)
@@ -808,6 +812,11 @@ bool Verifier::record_window(int T, strata::ze::Stream* cs, std::string &err) {
         embedding_gather_dev(codes, scales, offsets, tok_, T, w->ne0, w->code_bits, w->code_bias, w->group_elems,
                              row_codes, row_groups, emb_, cs);
         broadcast_streams(emb_, R_, N, (int) HC, T, cs);
+    }
+    const size_t DW = (size_t) (HC * N + 2 * N + 2 * K + K * N + NE);
+    if (dumpL_) {
+        cs->memcpy(dumpL_ + (size_t) g.n_layers * DW, Rt(0), (size_t) HC * N * 4);
+        cs->memcpy(dumpL_ + (size_t) g.n_layers * DW + (size_t) HC * N, bo_, (size_t) N * 4);
     }
 
     // per-layer state indices (GDN and QSA layers are numbered separately)
@@ -1456,6 +1465,16 @@ bool Verifier::record_window(int T, strata::ze::Stream* cs, std::string &err) {
                 cs->memcpy(lay + (size_t) MT * NE + (size_t) tb * K, ids_ + (size_t) tb * K, (size_t) n * K * 4);
                 cs->memcpy(lay + (size_t) MT * (NE + K) + (size_t) tb * K, w_ + (size_t) tb * K, (size_t) n * K * 4);
             }
+            if (dumpL_ && grp == 0) {
+                float* row = dumpL_ + (size_t) l * DW;
+                cs->memcpy(row, Rt(0), (size_t) HC * N * 4);
+                cs->memcpy(row + (size_t) HC * N, bo_, (size_t) N * 4);
+                cs->memcpy(row + (size_t) (HC + 1) * N, ids_, (size_t) K * 4);
+                cs->memcpy(row + (size_t) (HC + 1) * N + K, w_, (size_t) K * 4);
+                cs->memcpy(row + (size_t) (HC + 1) * N + 2 * K, shared_, (size_t) N * 4);
+                cs->memcpy(row + (size_t) (HC + 2) * N + 2 * K, parts_, (size_t) K * N * 4);
+                if (hits_.d_res) cs->memcpy(row + (size_t) (HC + 2 + K) * N + 2 * K, hits_.d_res + l * NE, (size_t) NE * 4);
+            }
             if (dbgR_ && grp == 0) {   // recorded into the window graph as memcpy nodes
                 cs->memcpy(dbgR_ + (size_t) l * N, Rt(0), (size_t) N * 4);
                 cs->memcpy(dbgM_ + (size_t) l * N, mixed_, (size_t) N * 4);
@@ -2103,6 +2122,7 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
                      std::chrono::duration<double, std::milli>(t_done - t_launch).count());
     }
     t_prev_end = t_done;
+    if (dumpL_) dump_window(T, tokens, pos0);
     if (no_host && std::getenv("STRATA_VERIFY_DEBUG") != nullptr) {   // what the window left behind
         const int Gd = groups_[T] > 0 ? groups_[T] : 1;
         std::vector<uint32_t> sk((size_t) Gd, 0);
@@ -2276,6 +2296,33 @@ void Verifier::fetch_dma(void *ctx, const uint8_t *const *src, int n,
     fs.flag = v->h_flagB_;
     fs.value = want;
     strata::ze::host_func(*v->copy_, [](void* p) { raise_flag(((FlagSet*) p)->flag, ((FlagSet*) p)->value); }, &fs);
+}
+
+void Verifier::dump_window(int T, const int32_t* tokens, int64_t pos0) {
+    static const char* dir = std::getenv("STRATA_DUMP_WINDOWS");
+    static const int64_t max_w = [] { const char* v = std::getenv("STRATA_DUMP_WINDOWS_MAX"); return v ? std::atoll(v) : 64; }();
+    const int64_t seq = dump_seq_++;
+    if (seq >= max_w) return;
+    const ModelGeometry& g = *g_;
+    const int64_t K = ss_->k;
+    const size_t DW = (size_t) (g.hc * g.n_embd + 2 * g.n_embd + 2 * K + K * g.n_embd + g.n_expert);
+    std::vector<float> h((size_t) (g.n_layers + 1) * DW);
+    cs_->memcpy(h.data(), dumpL_, h.size() * 4);
+    cs_->sync();
+    char path[1024];
+    std::snprintf(path, sizeof path, "%s/w%04lld_l%02lld-%02lld.bin", dir, (long long) seq, (long long) lb_, (long long) le_);
+    std::FILE* f = std::fopen(path, "wb");
+    if (f == nullptr) {
+        std::fprintf(stderr, "strata verify: STRATA_DUMP_WINDOWS: cannot write %s\n", path);
+        return;
+    }
+    const int32_t hdr[10] = {0x32574453, (int32_t) lb_, (int32_t) le_, (int32_t) g.n_layers, (int32_t) g.hc,
+                             (int32_t) g.n_embd, T, (int32_t) pos0, (int32_t) K, (int32_t) g.n_expert};
+    std::fwrite(hdr, sizeof hdr, 1, f);
+    std::fwrite(tokens, 4, (size_t) T, f);
+    for (int64_t l = lb_; l < le_; ++l) std::fwrite(h.data() + (size_t) l * DW, 4, DW, f);
+    std::fwrite(h.data() + (size_t) g.n_layers * DW, 4, DW, f);
+    std::fclose(f);
 }
 
 void Verifier::raise_b(uint32_t want) {
