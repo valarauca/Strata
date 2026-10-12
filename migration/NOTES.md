@@ -112,4 +112,5 @@ Numerics, kl-a/b/c pooled (768 rows): KLD mean 8.7e-3, 18 top-1 flips, layer 0 b
 Corpus top-1 0.7734 (SYCL) / 0.7747 (L0), NLL 0.9710 / 0.9661. The gap is GEMM-order sensitivity, not a bug: two L0
 builds that differ only in the prompt GEMM (gemmstone vs the XMX kernel) differ from each other by KLD mean 3.4e-3 on
 kl-a, the same layer profile as either against SYCL (5.1e-3, 6.0e-3). oneMKL's summation order cannot be reproduced,
-so ng-compare's T0-T2 tiers (written for unchanged GEMMs) cannot pass; the tolerance for this cutover is open.
+so ng-compare's T0-T2 tiers (written for unchanged GEMMs) cannot pass. Accepted by the user on 2026-10-11 as the
+cutover's numerics (corpus top-1 and NLL no worse than SYCL); closing the KLD gap is follow-up work.
