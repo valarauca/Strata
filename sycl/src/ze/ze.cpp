@@ -684,6 +684,20 @@ NativeKernel load_native(int ordinal, const std::vector<uint8_t>& binary, const 
     return k;
 }
 
+bool check_devices() {
+    static const bool on = env_on("STRATA_ZE_CHECK_DEVICES", false);
+    return on;
+}
+
+void check_launch_ptr(const char* name, int index, const void* p, int dev) {
+    int owner = -1;
+    if (kind_of(p, &owner) != MemKind::Device || owner == dev) return;
+    std::fprintf(stderr, "strata ze: kernel %s argument %d (%p) is GPU %d memory, launched on GPU %d\n", name, index, p,
+                 owner, dev);
+    std::fflush(nullptr);
+    std::abort();
+}
+
 void check_geometry(const KernelBase& k, Dim3 grid, Dim3 block) {
     const uint64_t g = (uint64_t) block.x * block.y * block.z;
     if (g == 0 || g > 1024) {
@@ -768,6 +782,16 @@ void Stream::launch(const NativeKernel& k, Dim3 grid, Dim3 block, void** args) {
 }
 
 void Stream::append_launch(ze_kernel_handle_t h, const char* name, int dev, Dim3 grid, Dim3 block, void** args) {
+    if (check_devices() && current_device() != dev) {
+        static std::mutex mu;
+        static std::unordered_map<std::string, bool> said;
+        std::lock_guard<std::mutex> lk(mu);
+        if (!said[name]) {
+            said[name] = true;
+            std::fprintf(stderr, "strata ze: kernel %s appended to a GPU %d stream by a thread whose current GPU is %d\n",
+                         name, dev, current_device());
+        }
+    }
     if (rt().trace)
         std::fprintf(stderr, "strata ze trace: stream %p launch %s grid %ux%ux%u block %ux%ux%u\n", (void*) this, name, grid.x,
                      grid.y, grid.z, block.x, block.y, block.z);

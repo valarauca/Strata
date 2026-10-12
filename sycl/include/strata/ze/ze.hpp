@@ -319,12 +319,27 @@ void report(const char* when);
 /// dimension launches nothing (as in SYCL and CUDA).
 void check_geometry(const KernelBase& k, Dim3 grid, Dim3 block);
 
+/// STRATA_ZE_CHECK_DEVICES=1: every launch is checked against the GPU it runs on (see check_launch_ptr), and a launch
+/// from a thread whose current GPU is another one is reported.
+bool check_devices();
+/// Exits with a message when `p` is a device allocation of a GPU other than `dev`: argument `index` of kernel `name`
+/// would read or write memory that GPU never mapped.
+void check_launch_ptr(const char* name, int index, const void* p, int dev);
+
 template <class... P>
 template <class... A>
 void Kernel<void(P...)>::operator()(Stream* s, Dim3 grid, Dim3 block, size_t slm, A&&... a) const {
     static_assert(sizeof...(A) == sizeof...(P), "kernel launch: argument count differs from the declared signature");
     if (s == nullptr) s = &default_stream();
     std::tuple<std::remove_cv_t<P>...> v{static_cast<std::remove_cv_t<P>>(std::forward<A>(a))...};
+    if (check_devices()) {
+        int i = 0;
+        auto one = [&](const auto& e) {
+            if constexpr (std::is_pointer_v<std::decay_t<decltype(e)>>) check_launch_ptr(name(), i, (const void*) e, s->device());
+            ++i;
+        };
+        std::apply([&](const auto&... e) { (one(e), ...); }, v);
+    }
     void* argv[sizeof...(P) + 1];
     std::apply([&](auto&... e) {
         size_t i = 0;
