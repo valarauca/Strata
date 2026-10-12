@@ -114,3 +114,27 @@ builds that differ only in the prompt GEMM (gemmstone vs the XMX kernel) differ 
 kl-a, the same layer profile as either against SYCL (5.1e-3, 6.0e-3). oneMKL's summation order cannot be reproduced,
 so ng-compare's T0-T2 tiers (written for unchanged GEMMs) cannot pass. Accepted by the user on 2026-10-11 as the
 cutover's numerics (corpus top-1 and NLL no worse than SYCL); closing the KLD gap is follow-up work.
+
+Serve (`$REF/scripts/serve-ref.py`, warmed, 3 rounds, `$REF/data/l0-serve-1gpu`; engine started through
+`sg-engine-l0.sh`, without oneAPI's environment), medians against the SYCL baseline:
+
+| request | decode tok/s (SYCL / L0) | prompt tok/s (SYCL / L0) |
+|---|---|---|
+| chat0 / chat1 / chat2 | 23.5 / 23.6, 18.1 / 18.2, 19.9 / 19.9 | |
+| long (6,345 tokens) | 23.7 / 24.2 | 886.9 / 1,379.3 |
+| long16k (15,796 tokens) | 24.4 / 23.6 (96.7%) | 1,011.1 / 1,558.0 |
+
+Every request's text is identical across the three rounds (repeated inference). The CLI captures exit 0.
+
+| pool | VRAM (SYCL / L0) | pinned host GTT (SYCL / L0) | RSS (SYCL / L0) |
+|---|---|---|---|
+| auto | 32.29 / 32.14 GB | 45.80 / 46.04 GB | 2.06 / 1.97 GiB |
+| 4,096 slots | 20.55 / 20.61 GB | 57.56 / 57.57 GB | 2.05 / 1.97 GiB |
+
+RSS does not move with the device pool, so there is no proportional host mirror; GTT is the intentional pinned expert
+mirror, as on SYCL. The 128 GiB PROT_NONE reservation of the SYCL process is gone.
+
+Process audit (`r*-maps.txt`): the engine maps libze_loader, the Level Zero GPU driver (libze_intel_gpu, its
+libigdgmm/libigdml, and IGC's libigc/libigdfcl/libopencl-clang2, which the driver loads to build its own copy and
+fill kernels) and the C/C++ runtime. No libsycl, libur_*, libOpenCL, libumf or libmkl_* (all mapped by the SYCL
+process). `strata` NEEDs libze_loader, libstdc++, libm, libgcc_s and libc only.
