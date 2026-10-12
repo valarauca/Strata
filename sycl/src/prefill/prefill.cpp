@@ -31,6 +31,8 @@
 #include "strata/kernels/qsa_prompt_attn.hpp"
 #include "strata/kernels/qsa_select.hpp"
 #include "strata/prefill/gemm.hpp"
+#include "strata/prefill/q4pack.hpp"
+#include "strata/gemmstone.hpp"
 #include "strata/prefill/moe_fused.hpp"
 #include "strata/prefill/moe_fused_iq.hpp"
 #include "strata/prefill/moe_mmq.hpp"
@@ -818,6 +820,31 @@ constexpr int MMQ_GROUP = 16;                  // experts per MMQ launch (the ga
 // product: 640 values).  Those bytes meet zero activations, which is harmless only if they decode to finite numbers -
 // llama.cpp zero-pads after every tensor, and so does a group buffer: this many zeroed bytes follow its last expert.
 constexpr size_t MMQ_TAIL = 4096;
+// Q4_0 expert layers run on gemmstone straight from repacked blocks (strata/gemmstone.hpp, strata/prefill/q4pack.hpp)
+// instead of dequantize + fp16 GEMM; STRATA_PF_GS_Q4=0 keeps the dequantize path for them too.
+bool gs_q4_layer(const strata::kernels::cpu::NativeFmt& f) {
+    static const bool on = [] { const char* v = std::getenv("STRATA_PF_GS_Q4"); return !(v && v[0] == '0'); }();
+    return on && f.gu_type == 2 && f.d_type == 2 && f.n_embd % 32 == 0 && f.n_ff % 32 == 0 &&
+           f.gu_row == (size_t) (f.n_embd / 32 * 18) && f.d_row == (size_t) (f.n_ff / 32 * 18);
+}
+
+// The fp16 scales of `rows` x `K` repacked Q4_0 weights at the start of a dequant slot: after the 4-bit rows, 64-byte
+// aligned.
+uint16_t* gs_scales(uint16_t* slot, int64_t rows, int64_t K) {
+    return (uint16_t*) ((uint8_t*) slot + ((rows * K / 2 + 63) & ~(int64_t) 63));
+}
+
+// Y[T, rows] = X[T, K] . W^T for a repacked Q4_0 matrix in a dequant slot; a missing kernel ends the run.
+void gs_q4_gemm(const uint16_t* X, int64_t ldx, uint16_t* slot, int64_t rows, int64_t K, float* Y, int64_t ldy, int64_t T,
+                void* stream) {
+    if (!strata::gs::gemm(strata::gs::Weights::Q4, X, ldx, slot, K, gs_scales(slot, rows, K), Y, ldy, T, rows, K, false,
+                          stream)) {
+        std::fprintf(stderr, "strata: no gemmstone kernel for a Q4_0 expert product (%lld x %lld x %lld); "
+                             "STRATA_PF_GS_Q4=0 runs the dequantize path\n", (long long) T, (long long) rows, (long long) K);
+        std::exit(1);
+    }
+}
+
 struct MmqPlan {
     bool any = false, fallback = true;
     std::vector<char> layer;                   // per layer: MMQ
@@ -3292,12 +3319,21 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                             }
                             const bool xmx_on = strata::prefill::xmx::mode() == 1;
                             const int q = (int) (j % (size_t) dq_slots());
+                            const bool q4gs = lay.native && !xmx_on && gs_q4_layer(lay.fmt[(size_t) l]);
                             if (lay.native) {
                                 // plan v0.3 P6: a native pack's layer, dequantized by llama.cpp's own formulas
                                 const auto& f = lay.fmt[(size_t) l];
                                 // 0.1.43: both matrices in one launch (the same values; STRATA_PF_DQ_FUSED=0: two launches)
                                 static const bool dq_one = [] { const char* v = std::getenv("STRATA_PF_DQ_FUSED"); return !(v && v[0] == '0'); }();
-                                if (dq_one) {
+                                if (q4gs) {
+                                    uint16_t* sg = gs_scales(m.dq_gu[q], 2 * f.n_ff, f.n_embd);
+                                    strata::prefill::q4_repack(blob_dev, f.n_ff, f.n_embd, (uint8_t*) m.dq_gu[q], sg, 2 * f.n_ff, 2,
+                                                               0, m.cs);
+                                    strata::prefill::q4_repack(blob_dev + f.up_off, f.n_ff, f.n_embd, (uint8_t*) m.dq_gu[q], sg,
+                                                               2 * f.n_ff, 2, 1, m.cs);
+                                    strata::prefill::q4_repack(blob_dev + f.down_off, f.n_embd, f.n_ff, (uint8_t*) m.dq_d[q],
+                                                               gs_scales(m.dq_d[q], f.n_embd, f.n_ff), f.n_embd, 1, 0, m.cs);
+                                } else if (dq_one) {
                                     strata::kernels::iq_dequant_expert_f16(f.gu_type, f.d_type, blob_dev, blob_dev + f.up_off,
                                                                            blob_dev + f.down_off, f.n_ff, f.n_embd, m.dq_gu[q],
                                                                            m.dq_d[q], m.cs);
@@ -3352,10 +3388,12 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                             }
                             const int64_t o0 = m.off[(size_t) e], ne = m.cnt[(size_t) e];
                             pt.mark(kPfGemmGU, cs);
-                            m.gemm.f16(m.Xs + o0 * N, m.dq_gu[q], m.GU + o0 * 1280, ne, 1280, N);
+                            if (q4gs) gs_q4_gemm(m.Xs + o0 * N, N, m.dq_gu[q], 1280, N, m.GU + o0 * 1280, 1280, ne, m.cs);
+                            else m.gemm.f16(m.Xs + o0 * N, m.dq_gu[q], m.GU + o0 * 1280, ne, 1280, N);
                             swiglu_interleaved(m.GU + o0 * 1280, m.Hh + o0 * 640, ne, m.cs);
                             pt.mark(kPfGemmD, cs);
-                            m.gemm.f16(m.Hh + o0 * 640, m.dq_d[q], m.Dm + o0 * N, ne, N, 640);
+                            if (q4gs) gs_q4_gemm(m.Hh + o0 * 640, 640, m.dq_d[q], N, 640, m.Dm + o0 * N, N, ne, m.cs);
+                            else m.gemm.f16(m.Hh + o0 * 640, m.dq_d[q], m.Dm + o0 * N, ne, N, 640);
                             return true;
                         };
                         if (!stream_all) {

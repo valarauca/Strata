@@ -81,8 +81,9 @@ int pow2_align(uint64_t v) {
 }
 
 int n_class(int64_t T) {
-    for (int c : {8, 32, 128, 512}) if (T <= c) return c;
-    return 4096;
+    int c = 1;
+    while (c < T && c < 8192) c *= 2;
+    return c;
 }
 
 uint32_t reciprocal(uint32_t x) {

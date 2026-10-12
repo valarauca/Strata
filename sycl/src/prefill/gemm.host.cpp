@@ -1,5 +1,7 @@
-// src/prefill/gemm.host.cpp - see include/strata/prefill/gemm.hpp: the Intel engine's dense products, on the XMX GEMM of
-// gemm.dp.cpp (no BLAS library).
+// src/prefill/gemm.host.cpp - see include/strata/prefill/gemm.hpp: the Intel engine's dense products, on gemmstone's
+// generated kernels (strata/gemmstone.hpp), else the XMX GEMM of gemm.dp.cpp (no BLAS library). STRATA_XGEMM=xmx keeps
+// every product on the XMX GEMM.
+#include "strata/gemmstone.hpp"
 #include "strata/prefill/gemm.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/ze/kernel_abi.hpp"
@@ -46,6 +48,9 @@ void run(bool bf, const uint16_t* X, int64_t ldx, const uint16_t* W, int64_t ldw
         std::exit(1);
     }
     const int acc = beta != 0.0f ? 1 : 0;
+    static const bool xmx_only = [] { const char* v = std::getenv("STRATA_XGEMM"); return v && std::strcmp(v, "xmx") == 0; }();
+    if (!xmx_only && gs::gemm(bf ? gs::Weights::BF16 : gs::Weights::F16, X, ldx, W, ldw, nullptr, Y, ldy, M, N, K, acc != 0, stream))
+        return;
     ze::Stream* s = ze::stream_of(stream);
     const bool blockable = ldx % 4 == 0 && ldw % 4 == 0 && K % 2 == 0 && ldy % 2 == 0 && ((uintptr_t) X & 3) == 0 &&
                            ((uintptr_t) W & 3) == 0 && ((uintptr_t) Y & 3) == 0;

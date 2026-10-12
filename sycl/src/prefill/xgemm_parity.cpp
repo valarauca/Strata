@@ -1,9 +1,11 @@
 // src/prefill/xgemm_parity.cpp - the prompt path's GEMMs against a double-precision CPU product, at the shapes the
-// model's prompt path runs, and their speed there: the XMX GEMM of gemm.dp.cpp and the gemmstone kernels
-// (strata/gemmstone.hpp) on the same fp16 / bf16 cases, and gemmstone on Q4_0 weights repacked by q4_repack.
+// model's prompt path runs, and their speed there: prefill::Gemm ("gemm": gemmstone, else the XMX GEMM of gemm.dp.cpp;
+// STRATA_XGEMM=xmx makes it the XMX GEMM alone) and gemmstone called directly ("gs") on the same fp16 / bf16 cases, and
+// gemmstone on Q4_0 weights repacked by q4_repack.
 //
 //   xgemm_parity            check every shape (exit 1 on a miss)
 //   xgemm_parity --bench    also time every shape (TFLOP/s, weight GB/s)
+//   ... --only TEXT          only the cases whose name contains TEXT
 //
 // A product of K terms in fp32 is held to |y - ref| <= 4 K 2^-24 sum_k |x_k w_k| + 1e-30 (the fp32 accumulation bound
 // with room for any summation order); inputs are rounded to fp16 / bf16 first, so the reference sees the same operands.
@@ -118,7 +120,12 @@ double time_us(strata::ze::Stream& s, int reps, F&& f) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    const bool bench = argc > 1 && std::strcmp(argv[1], "--bench") == 0;
+    bool bench = false;
+    std::string only;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--bench") == 0) bench = true;
+        else if (std::strcmp(argv[i], "--only") == 0 && i + 1 < argc) only = argv[++i];
+    }
     const Case cases[] = {
         {"expert gate/up, 1 row", false, 1, 1280, 2560, 2560, 1280, 0.0f},
         {"expert gate/up, 8 rows", false, 8, 1280, 2560, 2560, 1280, 0.0f},
@@ -150,6 +157,7 @@ int main(int argc, char** argv) {
     std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
     int bad_cases = 0, n_checks = 0;
     for (const Case& c : cases) {
+        if (!only.empty() && std::string(c.what).find(only) == std::string::npos) continue;
         std::vector<uint16_t> X((size_t) c.M * c.ldx, 0), W((size_t) c.N * c.K);
         std::vector<float> Y0((size_t) c.M * c.ldy, 0.0f);
         for (int64_t m = 0; m < c.M; ++m)
@@ -206,7 +214,7 @@ int main(int argc, char** argv) {
                 }
             bad_cases += !ck.ok();
             ++n_checks;
-            report(c.what, path == 0 ? "xmx" : "gs", c.M, c.N, c.K, ck);
+            report(c.what, path == 0 ? "gemm" : "gs", c.M, c.N, c.K, ck);
             if (!ran) std::printf("  no gemmstone kernel");
             if (bench && ran) {
                 const int reps = c.M * c.N * c.K < 100000000ll ? 200 : 20;
@@ -230,6 +238,7 @@ int main(int argc, char** argv) {
         {"q4 gate/up interleaved, 80 rows", 80, 1280, 2560, true},
     };
     for (const Q4Case& c : q4cases) {
+        if (!only.empty() && std::string(c.what).find(only) == std::string::npos) continue;
         const int64_t nb = c.K / 32, rows_src = c.interleave ? c.N / 2 : c.N, nsrc = c.interleave ? 2 : 1;
         std::vector<std::vector<uint8_t>> B(nsrc, std::vector<uint8_t>((size_t) rows_src * nb * 18));
         for (auto& blk : B)
