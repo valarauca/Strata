@@ -20,11 +20,11 @@ constexpr int kDevices = 64;
 struct DevTables { float* dir = nullptr; float* s = nullptr; int* on = nullptr; };
 DevTables g_dev[kDevices];
 std::vector<float> g_dir_host, g_s_host;
-int cur_device() {
-    int d = ze::current_device();
+int dev_slot(int d) {
     if (d < 0 || d >= kDevices) d = 0;
     return d;
 }
+int cur_device() { return dev_slot(ze::current_device()); }
 bool upload_here(std::string &err) {
     DevTables& t = g_dev[cur_device()];
     if (t.dir != nullptr) return true;
@@ -113,7 +113,7 @@ void cvec_apply(float *R, int64_t layer, int64_t T, int64_t r_ld,
                 const float *bo, int64_t bo_ld, const float *inj,
                 int64_t inj_ld, bool write, void *stream) {
     if (!g_cvec.loaded() || T < 1) return;
-    const DevTables& t = g_dev[cur_device()];
+    const DevTables& t = g_dev[dev_slot(ze::stream_of(stream)->device())];
     if (t.dir == nullptr) throw std::runtime_error("cvec_apply: the control vector is not on this device (cvec_replicate)");
     const ze::Dim3 grid{(unsigned)g_cvec.hc, (unsigned)T, 1};
     k_cvec_apply(ze::stream_of(stream), grid, {THREADS, 1, 1}, 0, R, t.dir, t.s, t.on, g_cvec.mode, layer,

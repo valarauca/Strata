@@ -70,8 +70,8 @@ void rope_neox_apply(const float* x, float* out, int64_t rows, int head_dim, int
     const int threads = 128;
     const unsigned grid = (unsigned) ((rows + threads - 1) / threads);
     k_rope_neox(ze::stream_of(stream), {grid, 1, 1}, {threads, 1, 1}, 0, x, out, rows, head_dim, n_rot, cos_tab, sin_tab,
-                pos, mrope_table());
-    if (stream == nullptr) ze::device_sync();
+                pos, mrope_table(ze::stream_of(stream)->device()));
+    if (stream == nullptr) ze::default_stream().sync();
 }
 
 }  // namespace strata::kernels

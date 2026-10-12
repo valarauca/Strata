@@ -3,19 +3,12 @@
 #include "strata/kernels/kv_stream.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/kv_q8.hpp"
+#include "kv_stream_shared.hpp"
 
 namespace strata::kernels {
 namespace {
 
 constexpr int RT = 1024;   // the resolve block
-
-// The per-block byte runs of the (up to four) pool arrays: block b of array i is bytes [b * len, (b + 1) * len).
-struct Runs {
-    const uint8_t* src[4];
-    uint8_t* dst[4];
-    int len[4];
-    int n;
-};
 
 // Block-wide exclusive prefix sum of one int per thread (RT threads); `total` is the sum over the block.
 inline int block_scan(int v, int *warp_sums, int &total) {

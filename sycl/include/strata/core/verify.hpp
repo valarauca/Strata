@@ -403,6 +403,7 @@ private:
     int32_t last_tokens_[8] = {};
     int64_t n_vocab_ = 0;
     strata::ze::Stream* cs_ = &strata::ze::default_stream();
+    bool owns_streams_ = false;   ///< init created copy_, sh_cs_ and (without set_stream) cs_; before it they are the runtime's
     float* dbgR_ = nullptr;   ///< SYCL port debug: R (token 0) after every layer, n_layers x n_embd
     float* dbgL_ = nullptr;   ///< STRATA_DUMP_SPEC_LAYERS: [n_layers][residual max_t x hc*N | mixer max_t x N | moe max_t x N]
     float* dbgM_ = nullptr;   ///< SYCL port debug: mixed_ (token 0) after every layer

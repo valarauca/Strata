@@ -3,6 +3,7 @@
 #include "strata/kernels/qsa_prompt_attn.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "qsa_prompt_attn_shared.hpp"
 
 #include <cmath>
 #include <type_traits>
@@ -10,14 +11,10 @@
 namespace strata::kernels {
 namespace {
 
-constexpr int HD = 256;           // head_dim
-constexpr int G = 12;             // query heads per KV head
-#ifndef D1_CH
-#define D1_CH 32
-#endif
-constexpr int CH = D1_CH;         // cells per chunk
-constexpr int THREADS = 128;      // 4 warps: scores by cell (8 each), p.v by dimension (64 each = one int8 scale group)
-constexpr int QS = HD + 8;        // q row stride in halves (bank-conflict-free fragment loads)
+template <int KV_MODE>
+using Smem = SmemT<KV_MODE, sycl::half>;
+static_assert(sizeof(sycl::half) == sizeof(uint16_t) && alignof(sycl::half) == alignof(uint16_t),
+              "the host sizes Smem with uint16_t halves");
 
 // The MMA below needs sm_75 or newer (Turing runs it as two k=8 steps); cp.async needs sm_80. Builds for pre-sm_75
 // cards compile the MMA to a trap; qsa_prompt_attn_batch refuses such a device at run time, so the old kernel runs
@@ -95,28 +92,6 @@ __dpct_inline__ uint32_t pack_h2(float lo_k,
 // KV_MODE 4 (Q4_0 K and V, `--kv q4_0`): mode 1 with a scale per 32 values - each q4_0 block's codes enter as exact
 // int8 (code - 8) and its fp16 scale is applied in FP32, as mode 1's are; the caller rotates q and un-rotates the
 // output (kv_q4.hpp).
-template <int KV_MODE>
-struct Smem {
-    using KElem =
-        typename std::conditional<KV_MODE == 0, sycl::half, int8_t>::type;
-    using VElem = typename std::conditional<KV_MODE == 1 || KV_MODE == 4,
-                                            int8_t, sycl::half>::type;
-    static constexpr int KROW = KV_MODE == 0 ? HD + 8 : HD + 16;   // elements; 16-byte aligned rows, banks spread
-    static constexpr int VROW = (KV_MODE == 1 || KV_MODE == 4) ? HD + 16 : HD + 8;
-    static constexpr int NG = KV_MODE == 4 ? HD / QK4_0 : 4;      // scale groups per row (q4_0: 8 of 32, else 4 of 64)
-    sycl::half qh[16][QS];
-    sycl::half ql[16][QS];
-    KElem k[CH][KROW];
-    VElem v[CH][VROW];
-    float ks[CH][NG];
-    float vs[CH][NG];
-    float s[16][CH + 1];
-    float qmax[THREADS / 32];
-    float alpha[16];
-    float lsum[16];
-    float mrow[16];
-    long long row[CH];
-};
 
 template <int KV_MODE>
 __dpct_inline__ void
@@ -548,18 +523,6 @@ prompt_attn_kernel(const float *__restrict__ q, QsaAttnPools p,
 // warp needs only its own 64-byte slice of each K and V row: it gathers it itself with cp.async into its own
 // double-buffered stage while it computes the previous chunk, and q stays in registers. Only the q.k partial sums
 // (one per dim group) cross warps, and they are added in a fixed order: the result is deterministic.
-constexpr int CH2 = 32;
-
-struct Smem2 {
-    int8_t kv[2][4][2][CH2][64];   // stage, warp, K/V, cell, 64 dims in 16-byte pieces XOR-swizzled by the cell
-    float sc[2][4][2][CH2];        // stage, warp, K/V scale of the cell for the warp's group
-    float part[4][16][CH2 + 1];    // q.k per dim group
-    float p[16][CH2 + 1];
-    float qmax[4];
-    float alpha[16];
-    float lsum[16];
-    float mrow[16];
-};
 
 __dpct_inline__ int
 swz(int cell, int byte) { // byte offset of (cell, byte) in a stage slice

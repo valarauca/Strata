@@ -23,6 +23,7 @@ inline void* host_malloc_polled(size_t bytes) {
     static const bool on = [] { const char* v = std::getenv("STRATA_HOST_UNCACHED"); return !(v && v[0] == '0'); }();
     return on ? ze::malloc_host_uncached(bytes) : ze::malloc_host(bytes);
 }
+/// Releases memory from host_malloc_polled.
 inline void host_free_polled(void* p) { ze::free(p); }
 
 /// STRATA_ARENA_ALIAS_CHECK (default on): large device arenas are checked for the xe aliasing fault (ze::malloc_device_guarded).

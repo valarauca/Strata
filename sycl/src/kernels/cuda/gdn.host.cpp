@@ -29,7 +29,7 @@ void gdn_step(float *state, const float *q, const float *k, const float *v,
     const ze::Dim3 grid{(unsigned)((s.S + JTHREADS - 1) / JTHREADS), (unsigned)((s.h_v + MAX_H - 1) / MAX_H), 1};
     k_gdn_step(ze::stream_of(stream), grid, {JTHREADS, 1, 1}, 0, state, q, k, v, gate, beta, o, (int)s.S, (int)s.h_k,
                (int)s.h_v);
-    if (stream == nullptr) ze::device_sync();
+    if (stream == nullptr) ze::default_stream().sync();
 }
 
 void gdn_conv_step(float *conv_state, const float *x, const float *kW,
@@ -39,7 +39,7 @@ void gdn_conv_step(float *conv_state, const float *x, const float *kW,
     const int blocks = (int) ((channels + 255) / 256);
     k_gdn_conv(ze::stream_of(stream), {(unsigned)blocks, 1, 1}, {256, 1, 1}, 0, conv_state, x, kW, out, (int)channels,
                (int)d_conv);
-    if (stream == nullptr) ze::device_sync();
+    if (stream == nullptr) ze::default_stream().sync();
 }
 
 void gdn_l2_norm(float *x, int64_t rows, int64_t cols, float eps,
@@ -50,14 +50,14 @@ void gdn_l2_norm(float *x, int64_t rows, int64_t cols, float eps,
         std::exit(1);
     }
     k_gdn_l2(ze::stream_of(stream), {(unsigned)rows, 1, 1}, {32, 1, 1}, 0, x, (int)cols, eps);
-    if (stream == nullptr) ze::device_sync();
+    if (stream == nullptr) ze::default_stream().sync();
 }
 
 void gdn_beta_gate(float *beta, int64_t h_v, void *stream) {
     if (beta == nullptr || h_v <= 0) return;
     const int n = (int) h_v;
     k_gdn_beta_gate(ze::stream_of(stream), {(unsigned)((n + 127) / 128), 1, 1}, {128, 1, 1}, 0, beta, n);
-    if (stream == nullptr) ze::device_sync();
+    if (stream == nullptr) ze::default_stream().sync();
 }
 
 void gdn_out_norm(const float *o, const float *z, const float *ssm_norm,
@@ -65,7 +65,7 @@ void gdn_out_norm(const float *o, const float *z, const float *ssm_norm,
                   void *stream) {
     if (h_v <= 0 || S <= 0) return;
     k_gdn_out_norm(ze::stream_of(stream), {(unsigned)h_v, 1, 1}, {32, 1, 1}, 0, o, z, ssm_norm, y, (int)S, eps);
-    if (stream == nullptr) ze::device_sync();
+    if (stream == nullptr) ze::default_stream().sync();
 }
 
 }  // namespace strata::kernels

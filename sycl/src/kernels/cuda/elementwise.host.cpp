@@ -2,6 +2,7 @@
 #include "strata/sycl_doorbell.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/ze/kernel_abi.hpp"
+#include "elementwise_shared.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -11,10 +12,6 @@
 #include <chrono>
 
 namespace strata::kernels {
-
-struct MappedCopies {
-    MappedCopy c[8];
-};
 
 #include "elementwise.kern.inc"
 
@@ -27,7 +24,7 @@ inline unsigned grid_for(int64_t n) { return (unsigned) ((n + THREADS - 1) / THR
 
 void sync_if_needed(void *stream, const char *what) {
     if (stream != nullptr) return;
-    ze::device_sync();
+    ze::default_stream().sync();
 }
 
 bool check_launch(const char* what) {

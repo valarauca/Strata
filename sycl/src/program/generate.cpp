@@ -3559,8 +3559,10 @@ int main(int argc, char **argv) {
                 if (buf == nullptr ||
                     strata::core::session_init(g, o.max_context, K, buf, *u, lo,
                                                hi) == 0) {
-                    if (buf != nullptr)
+                    if (buf != nullptr) {
+                        strata::core::session_release(*u);
                         strata::ze::free(buf);
+                    }
                     size_t fb = 0, tb = 0;
                     strata::ze::mem_get_info(strata::ze::current_device(), &fb, &tb);
                     std::fprintf(stderr, "strata generate: WARNING: --batch %d: slot %d's session does not fit on CUDA%d "
@@ -6254,7 +6256,7 @@ int main(int argc, char **argv) {
         strata::core::Verifier ver;
         strata::core::VerifyHits vh;
         vh.d_res = thits.d_res;
-        if (mirror_table_d) strata::kernels::resident_plan_set_mirror(thits.d_res, mirror_table_d);
+        if (mirror_table_d) strata::kernels::resident_plan_set_mirror(thits.d_res, g.n_layers * g.n_expert, mirror_table_d);
         vh.h_res = host_res.empty() ? nullptr : host_res.data();
         vh.cache_base = thits.cache_base;
         vh.blob = thits.blob;
@@ -10766,7 +10768,7 @@ int main(int argc, char **argv) {
             strata::ze::default_stream().memset(usage_dev, 0, (size_t) (g.n_layers * g.n_expert) * 4);
             strata::ze::default_stream().sync();
         }
-        if (mirror_table_d) strata::kernels::resident_plan_set_mirror(thits.d_res, mirror_table_d, usage_dev);
+        if (mirror_table_d) strata::kernels::resident_plan_set_mirror(thits.d_res, g.n_layers * g.n_expert, mirror_table_d, usage_dev);
         vh.h_res = host_res.empty() ? nullptr : host_res.data();
         vh.cache_base = thits.cache_base;
         vh.blob = thits.blob;

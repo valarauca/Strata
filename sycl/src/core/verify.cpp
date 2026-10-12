@@ -429,9 +429,11 @@ Verifier::~Verifier() try {
     if (arena_b_) strata::ze::free(arena_b_);
     if (h_commitb_) strata::ze::free(h_commitb_);
     if (qcnt_) strata::ze::free(qcnt_);
-    if (cs_ && cs_ != ext_stream_) delete cs_; // set_stream: the stage's stream, shared, not ours
-    if (sh_cs_) delete sh_cs_;
-    if (copy_) { copy_->sync(); delete copy_; }
+    if (owns_streams_) {
+        if (cs_ && cs_ != ext_stream_) delete cs_;
+        if (sh_cs_) delete sh_cs_;
+        if (copy_) { copy_->sync(); delete copy_; }
+    }
     if (commit_done_) delete (commit_done_);
     if (ev_done_) delete (ev_done_);
     if (ev_commit_) delete (ev_commit_);
@@ -643,6 +645,7 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
                                                                      : strata::ze::Stream::Engine::Compute);
     cs_ = ext_stream_ != nullptr ? ext_stream_ : new strata::ze::Stream();
     sh_cs_ = new strata::ze::Stream();
+    owns_streams_ = true;
     commit_done_ = new strata::ze::Event();
     ev_fork_ = new strata::ze::Event();
     ev_join_ = new strata::ze::Event();

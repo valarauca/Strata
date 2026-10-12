@@ -3,6 +3,7 @@
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/ze/kernel_abi.hpp"
+#include "kv_stream_shared.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -16,14 +17,6 @@ void check(const char* what) {
 }
 
 constexpr int RT = 1024;   // the resolve block
-
-// The per-block byte runs of the (up to four) pool arrays: block b of array i is bytes [b * len, (b + 1) * len).
-struct Runs {
-    const uint8_t* src[4];
-    uint8_t* dst[4];
-    int len[4];
-    int n;
-};
 
 #include "kv_stream.kern.inc"
 

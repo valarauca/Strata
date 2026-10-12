@@ -50,7 +50,7 @@ def run(cmd: list[str], cwd: str | None = None) -> None:
 
 def declared(kern_files: list[str]) -> set[str]:
     names = set()
-    pat = re.compile(r"^\s*STRATA_KERNEL(?:_SG)?\s*\(\s*(?:\d+\s*,\s*)?([A-Za-z_][A-Za-z0-9_]*)\s*,", re.M)
+    pat = re.compile(r"^\s*(?:STRATA_KERNEL_SG\s*\(\s*[^,()]+,|STRATA_KERNEL\s*\()\s*([A-Za-z_][A-Za-z0-9_]*)\s*,", re.M)
     for f in kern_files:
         text = open(f).read()
         text = re.sub(r"^\s*#\s*define.*?(?<!\\)$", "", text, flags=re.M | re.S)

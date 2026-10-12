@@ -321,16 +321,16 @@ void rope(float* x, int64_t T, int64_t heads, int64_t dim, int64_t ld, int64_t p
     }
     const float theta_scale = powf((float) scaling.freq_base, -2.0f / 64.0f);
     const strata::kernels::RopeKernelArgs k = scaling.kernel_args(64);   // none: the identity constants
-    const strata::kernels::RopeTab rt = strata::kernels::rope_table_for(scaling);
+    const strata::kernels::RopeTab rt = strata::kernels::rope_table_for(scaling, strata::ze::stream_of(stream)->device());
     if (rt.cos != nullptr)
     {
         k_kernels_rope_true(strata::ze::stream_of(stream), {(unsigned)(T * heads), 1, 1}, {32, 1, 1}, 0, x, heads, dim,
                             ld, pos0, theta_scale, k.freq_scale, k.corr_low, k.corr_high, k.ext_factor, k.attn_factor,
-                            strata::kernels::mrope_table(), rt);
+                            strata::kernels::mrope_table(strata::ze::stream_of(stream)->device()), rt);
     } else {
         k_kernels_rope_false(strata::ze::stream_of(stream), {(unsigned)(T * heads), 1, 1}, {32, 1, 1}, 0, x, heads, dim,
                              ld, pos0, theta_scale, k.freq_scale, k.corr_low, k.corr_high, k.ext_factor, k.attn_factor,
-                             strata::kernels::mrope_table(), rt);
+                             strata::kernels::mrope_table(strata::ze::stream_of(stream)->device()), rt);
     }
 }
 void split_q(const float* q_full, float* q, int64_t T, void* stream) {

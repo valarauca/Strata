@@ -49,14 +49,14 @@ bool overlaps(const void* a, size_t an, const void* b, size_t bn) {
 namespace {
 constexpr int kMropeDevices = 64;
 std::atomic<const int32_t*> mrope_tab[kMropeDevices] = {};
-int mrope_dev() {
-    int d = ze::current_device();
+int mrope_dev(int d) {
     if (d < 0 || d >= kMropeDevices) d = 0;
     return d;
 }
+int mrope_dev() { return mrope_dev(ze::current_device()); }
 }  // namespace
 void mrope_table_set(const int32_t* device_table) { mrope_tab[mrope_dev()].store(device_table, std::memory_order_relaxed); }
-const int32_t* mrope_table() { return mrope_tab[mrope_dev()].load(std::memory_order_relaxed); }
+const int32_t* mrope_table(int dev) { return mrope_tab[mrope_dev(dev)].load(std::memory_order_relaxed); }
 namespace {
 // #280: the float64 angle table of each device, set at session init (before any graph is captured)
 struct RopeReg {
@@ -86,9 +86,9 @@ void rope_table_release(const float* cos_tab) {
     for (RopeReg& r : rope_tab)
         if (cos_tab != nullptr && r.tab.cos == cos_tab) r = RopeReg{};
 }
-RopeTab rope_table_for(const RopeScaling& scaling) {
+RopeTab rope_table_for(const RopeScaling& scaling, int dev) {
     if (!rope_table_enabled()) return {};
-    const RopeReg& r = rope_tab[mrope_dev()];
+    const RopeReg& r = rope_tab[mrope_dev(dev)];
     return r.tab.cos != nullptr && same_scaling(r.scaling, scaling) ? r.tab : RopeTab{};
 }
 void native_rope_set_enabled(bool value) { enabled.store(value, std::memory_order_relaxed); }
@@ -125,17 +125,17 @@ void native_rope_apply(const float* x, float* out, int rows, int head_dim,
     // Match pinned host-side float powf before device fast powf/trigonometry.
     const float theta_scale = powf((float) scaling.freq_base, -2.0f / n_rot);
     const RopeKernelArgs k = scaling.kernel_args(n_rot);   // none: the identity constants
-    const RopeTab rt = rope_table_for(scaling);
+    const RopeTab rt = rope_table_for(scaling, ze::stream_of(stream)->device());
     const unsigned threads = (x == out && n_rot == 64 && native_norm_rope_usable(head_dim, n_rot)) ? 32u : 128u;
     const ze::Dim3 grid{threads == 32u ? 1u : unsigned((head_dim / 2 + 127) / 128), unsigned(rows), 1};
     if (rt.cos != nullptr)
         k_native_rope_apply_tab(ze::stream_of(stream), grid, {threads, 1, 1}, 0, x, out, rows, head_dim, n_rot,
                                 theta_scale, k.freq_scale, k.corr_low, k.corr_high, k.ext_factor, k.attn_factor,
-                                positions, mrope_table(), rt);
+                                positions, mrope_table(ze::stream_of(stream)->device()), rt);
     else
         k_native_rope_apply(ze::stream_of(stream), grid, {threads, 1, 1}, 0, x, out, rows, head_dim, n_rot,
                             theta_scale, k.freq_scale, k.corr_low, k.corr_high, k.ext_factor, k.attn_factor,
-                            positions, mrope_table(), rt);
+                            positions, mrope_table(ze::stream_of(stream)->device()), rt);
 }
 
 void native_qsa_rms_norm_rope(const float* x, int in_stride, const float* gamma, float* out,
@@ -151,14 +151,14 @@ void native_qsa_rms_norm_rope(const float* x, int in_stride, const float* gamma,
     }
     const float theta_scale = powf((float) scaling.freq_base, -2.0f / n_rot);
     const RopeKernelArgs k = scaling.kernel_args(n_rot);
-    const RopeTab rt = rope_table_for(scaling);
+    const RopeTab rt = rope_table_for(scaling, ze::stream_of(stream)->device());
     if (rt.cos != nullptr)
         k_native_rope_norm_rope_tab(ze::stream_of(stream), {unsigned(rows), 1, 1}, {256, 1, 1}, 0, x, in_stride, gamma,
                                     out, head_dim, n_rot, epsilon, theta_scale, k.freq_scale, k.corr_low, k.corr_high,
-                                    k.ext_factor, k.attn_factor, positions, mrope_table(), rt);
+                                    k.ext_factor, k.attn_factor, positions, mrope_table(ze::stream_of(stream)->device()), rt);
     else
         k_native_rope_norm_rope(ze::stream_of(stream), {unsigned(rows), 1, 1}, {256, 1, 1}, 0, x, in_stride, gamma,
                                 out, head_dim, n_rot, epsilon, theta_scale, k.freq_scale, k.corr_low, k.corr_high,
-                                k.ext_factor, k.attn_factor, positions, mrope_table(), rt);
+                                k.ext_factor, k.attn_factor, positions, mrope_table(ze::stream_of(stream)->device()), rt);
 }
 }

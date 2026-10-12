@@ -7,6 +7,7 @@
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "qsa_prompt_attn_shared.hpp"
 #include "strata/ze/kernel_abi.hpp"
 
 #include <cmath>
@@ -22,50 +23,8 @@ namespace strata::kernels {
 
 namespace {
 
-constexpr int HD = 256;           // head_dim
-constexpr int G = 12;             // query heads per KV head
-#ifndef D1_CH
-#define D1_CH 32
-#endif
-constexpr int CH = D1_CH;         // cells per chunk
-constexpr int THREADS = 128;      // 4 warps: scores by cell (8 each), p.v by dimension (64 each = one int8 scale group)
-constexpr int QS = HD + 8;        // q row stride in halves (bank-conflict-free fragment loads)
-
-// The work-group local memory of prompt_attn_kernel (Smem) and prompt_attn_i8_kernel (Smem2) in qsa_prompt_attn.dp.cpp,
-// for the launch size: the same members, with each half stored as uint16_t (same size and alignment).
 template <int KV_MODE>
-struct Smem {
-    using KElem = typename std::conditional<KV_MODE == 0, uint16_t, int8_t>::type;
-    using VElem = typename std::conditional<KV_MODE == 1 || KV_MODE == 4, int8_t, uint16_t>::type;
-    static constexpr int KROW = KV_MODE == 0 ? HD + 8 : HD + 16;   // elements; 16-byte aligned rows, banks spread
-    static constexpr int VROW = (KV_MODE == 1 || KV_MODE == 4) ? HD + 16 : HD + 8;
-    static constexpr int NG = KV_MODE == 4 ? HD / QK4_0 : 4;      // scale groups per row (q4_0: 8 of 32, else 4 of 64)
-    uint16_t qh[16][QS];
-    uint16_t ql[16][QS];
-    KElem k[CH][KROW];
-    VElem v[CH][VROW];
-    float ks[CH][NG];
-    float vs[CH][NG];
-    float s[16][CH + 1];
-    float qmax[THREADS / 32];
-    float alpha[16];
-    float lsum[16];
-    float mrow[16];
-    long long row[CH];
-};
-
-constexpr int CH2 = 32;
-
-struct Smem2 {
-    int8_t kv[2][4][2][CH2][64];   // stage, warp, K/V, cell, 64 dims in 16-byte pieces XOR-swizzled by the cell
-    float sc[2][4][2][CH2];        // stage, warp, K/V scale of the cell for the warp's group
-    float part[4][16][CH2 + 1];    // q.k per dim group
-    float p[16][CH2 + 1];
-    float qmax[4];
-    float alpha[16];
-    float lsum[16];
-    float mrow[16];
-};
+using Smem = SmemT<KV_MODE, uint16_t>;
 
 bool launch_i8(const float *q, const QsaAttnPools &pools, const int32_t *ids,
                const int32_t *steps, int64_t cap, const QsaShapes &s,

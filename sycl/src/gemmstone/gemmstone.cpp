@@ -678,6 +678,12 @@ bool gemm(Weights w, const uint16_t* X, int64_t ldx, const void* W, int64_t ldw,
     }
     const ze::Dim3 block{(uint32_t) lws[0], (uint32_t) lws[1], (uint32_t) lws[2]};
     const ze::Dim3 grid{(uint32_t) (gws[0] / lws[0]), (uint32_t) (gws[1] / lws[1]), (uint32_t) (gws[2] / lws[2])};
+    if (ze::check_devices()) {
+        ze::check_launch_ptr(b->kernel.name(), 0, W, s->device());
+        ze::check_launch_ptr(b->kernel.name(), 1, X, s->device());
+        ze::check_launch_ptr(b->kernel.name(), 2, Y, s->device());
+        ze::check_launch_ptr(b->kernel.name(), 3, scales, s->device());
+    }
     s->launch(b->kernel, grid, block, args.data());
     return true;
 }

@@ -6,6 +6,7 @@
 
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/f16_bits.hpp"
+#include "elementwise_shared.hpp"
 
 namespace strata::kernels {
 namespace {
@@ -402,10 +403,6 @@ __dpct_inline__ void copy_i32_from_mapped_kernel(int32_t *__restrict__ dst,
 }
 
 #if !defined(__HIPCC__)
-struct MappedCopies {
-    MappedCopy c[8];
-};
-
 __dpct_inline__ void copy_from_mapped_multi_kernel(MappedCopies a) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const MappedCopy c = a.c[item_ct1.get_group(1)];

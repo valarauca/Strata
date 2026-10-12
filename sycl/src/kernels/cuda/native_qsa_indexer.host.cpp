@@ -48,18 +48,18 @@ void native_qsa_indexer_append_steps(const float* raw, const int32_t* relative_p
         if (overlaps(spans[i], spans[j])) throw std::invalid_argument("native QSA indexer buffers overlap");
     const float theta_scale = powf((float) scaling.freq_base, -2.0f / ROT);
     const RopeKernelArgs k = scaling.kernel_args(ROT);   // none: the identity constants
-    const RopeTab rt = rope_table_for(scaling);
+    const RopeTab rt = rope_table_for(scaling, ze::stream_of(stream)->device());
     if (rt.cos != nullptr)
     {
         k_native_qsa_indexer_append_tab(ze::stream_of(stream), {1, 1, 1}, {THREADS, 1, 1}, 0, raw, relative_pos_device,
                                         pos_stride, n_steps, pos_base, gamma, epsilon, b.tail, b.dead, b.pooled,
                                         b.block_pos, int(max_cells), theta_scale, k.freq_scale, k.corr_low, k.corr_high,
-                                        k.ext_factor, k.attn_factor, mrope_table(), rt);
+                                        k.ext_factor, k.attn_factor, mrope_table(ze::stream_of(stream)->device()), rt);
     } else {
         k_native_qsa_indexer_append_plain(ze::stream_of(stream), {1, 1, 1}, {THREADS, 1, 1}, 0, raw, relative_pos_device,
                                           pos_stride, n_steps, pos_base, gamma, epsilon, b.tail, b.dead, b.pooled,
                                           b.block_pos, int(max_cells), theta_scale, k.freq_scale, k.corr_low,
-                                          k.corr_high, k.ext_factor, k.attn_factor, mrope_table(), rt);
+                                          k.corr_high, k.ext_factor, k.attn_factor, mrope_table(ze::stream_of(stream)->device()), rt);
     }
 }
 
@@ -80,8 +80,8 @@ void native_qsa_indexer_append_batch(const float* raw, int64_t n, int64_t p0, in
     const RopeKernelArgs k = scaling.kernel_args(ROT);   // none: the identity constants
     const float fsf = k.freq_scale, cl = k.corr_low, ch = k.corr_high, ef = k.ext_factor, ms = k.attn_factor;
     ze::Stream* const st = ze::stream_of(stream);
-    const int32_t* mtab = mrope_table();
-    const RopeTab rt = rope_table_for(scaling);
+    const int32_t* mtab = mrope_table(ze::stream_of(stream)->device());
+    const RopeTab rt = rope_table_for(scaling, ze::stream_of(stream)->device());
     if (p0 == 0) {
         if (rt.cos != nullptr)
         {

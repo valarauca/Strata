@@ -27,7 +27,7 @@ void s2_gemv_q8(const uint8_t* act, const uint8_t* codes, const float* scales, f
     k_s2_gemv_q8(ze::stream_of(stream), {(unsigned) n_out, 1, 1}, {(unsigned) threads_per_row, 1, 1}, smem, act, codes,
                  scales, y, n_in, n_out, threads_per_row);
 
-    if (stream == nullptr) ze::device_sync();
+    if (stream == nullptr) ze::default_stream().sync();
 }
 
 }  // namespace strata::kernels

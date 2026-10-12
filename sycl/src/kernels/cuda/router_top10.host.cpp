@@ -148,7 +148,7 @@ void router_top10(const float *logits, int n_tokens, int n_expert, int k,
     k_router_top10(ze::stream_of(stream), {(unsigned) n_tokens, 1, 1}, {(unsigned) threads, 1, 1}, smem, logits, n_tokens,
                    n_expert, k, ids, weights);
 
-    if (stream == nullptr) ze::device_sync();
+    if (stream == nullptr) ze::default_stream().sync();
 }
 
 }  // namespace strata::kernels

@@ -22,6 +22,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <tuple>
@@ -130,7 +131,9 @@ class Graph;
 class KernelBase {
 public:
     constexpr KernelBase(const char* name, uint32_t nparams) : name_(name), nparams_(nparams) {}
+    /// The kernel's name in the modules.
     const char* name() const { return name_; }
+    /// The declared argument count.
     uint32_t nparams() const { return nparams_; }
     /// The kernel's handle on GPU `ordinal`; exits with a message when the modules do not have it or its argument
     /// count is not the declared one.
@@ -148,10 +151,15 @@ private:
 class NativeKernel {
 public:
     NativeKernel() = default;
+    /// The kernel's name in its binary.
     const char* name() const { return name_; }
+    /// The GPU whose module holds the kernel; it launches only on that GPU's streams.
     int device() const { return dev_; }
+    /// The kernel's argument count, as the driver reports it.
     uint32_t nparams() const { return nparams_; }
+    /// The Level Zero kernel handle.
     ze_kernel_handle_t handle() const { return h_; }
+    /// True when the binary loaded.
     explicit operator bool() const { return h_ != nullptr; }
 
 private:
@@ -187,7 +195,9 @@ public:
     Stream(const Stream&) = delete;
     Stream& operator=(const Stream&) = delete;
 
+    /// The GPU this stream appends to.
     int device() const { return dev_; }
+    /// The engine this stream appends to (Compute when the GPU has no copy-only queue group).
     Engine engine() const { return engine_; }
 
     /// Appends kernel `k` with argument pointers `args` (k.nparams() of them, then a pointer to the size_t scratch size).
@@ -223,12 +233,14 @@ public:
     void begin_capture();
     /// Closes the capture into a Graph (nodes() == 0 when nothing was recorded). Streams that joined leave it.
     Graph* end_capture();
+    /// True between begin_capture and end_capture, and for a stream that joined a capture until it ends.
     bool capturing() const { return cap_ != nullptr; }
     /// Appends a recorded graph.
     void launch(Graph& g);
 
     /// Number of commands this stream appended (a counter for STRATA_ZE_REPORT).
     uint64_t appends() const { return appends_.load(std::memory_order_relaxed); }
+    /// The Level Zero immediate command list behind the stream.
     ze_command_list_handle_t immediate_list() const { return imm_; }
 
     /// The open recording of begin_capture, shared by the streams that joined it, then owned by its Graph.
@@ -255,6 +267,7 @@ private:
     void check_operand(const void* p, const char* what) const;
     void host_func_done();
     void wait_host_funcs();
+    std::shared_ptr<Event> fence_locked();
     static constexpr int kBounce = 4;
     int dev_;
     Engine engine_;
@@ -266,6 +279,8 @@ private:
     bool runtime_owned_ = false;
     std::recursive_mutex mu_;
     std::atomic<uint64_t> appends_{0};
+    std::shared_ptr<Event> fence_;
+    uint64_t fence_at_ = ~0ull;
     std::mutex hf_mu_;
     std::condition_variable hf_cv_;
     int hf_pending_ = 0;
@@ -328,7 +343,9 @@ public:
     ~Graph();
     Graph(const Graph&) = delete;
     Graph& operator=(const Graph&) = delete;
+    /// Commands recorded into the graph.
     size_t nodes() const { return nodes_; }
+    /// The GPU the graph was recorded for; it launches only on that GPU's streams.
     int device() const { return dev_; }
 
 private:
@@ -337,6 +354,7 @@ private:
     ze_command_list_handle_t list_ = nullptr;
     size_t nodes_ = 0;
     int dev_ = 0;
+    bool launched_ = false;
     Stream::Capture* cap_ = nullptr;
 };
 
@@ -359,9 +377,13 @@ void check_geometry(const KernelBase& k, Dim3 grid, Dim3 block);
 /// STRATA_ZE_CHECK_DEVICES=1: every launch is checked against the GPU it runs on (see check_launch_ptr), and a launch
 /// from a thread whose current GPU is another one is reported.
 bool check_devices();
-/// Exits with a message when `p` is a device allocation of a GPU other than `dev`: argument `index` of kernel `name`
-/// would read or write memory that GPU never mapped.
+/// Exits with a message when `p` is a device allocation of a GPU other than `dev`, or a non-null address in no live
+/// Strata allocation (pageable or freed memory): argument `index` of kernel `name` would read or write memory that GPU
+/// never mapped.
 void check_launch_ptr(const char* name, int index, const void* p, int dev);
+/// check_launch_ptr for the pointers a by-value struct argument holds: exits with a message when an aligned 8-byte word
+/// of `data` lies in a device allocation of a GPU other than `dev` (other words are taken as plain data).
+void check_launch_struct(const char* name, int index, const void* data, size_t bytes, int dev);
 
 template <class... P>
 template <class... A>
@@ -372,7 +394,9 @@ void Kernel<void(P...)>::operator()(Stream* s, Dim3 grid, Dim3 block, size_t slm
     if (check_devices()) {
         int i = 0;
         auto one = [&](const auto& e) {
-            if constexpr (std::is_pointer_v<std::decay_t<decltype(e)>>) check_launch_ptr(name(), i, (const void*) e, s->device());
+            using E = std::decay_t<decltype(e)>;
+            if constexpr (std::is_pointer_v<E>) check_launch_ptr(name(), i, (const void*) e, s->device());
+            else if constexpr (std::is_class_v<E>) check_launch_struct(name(), i, &e, sizeof(E), s->device());
             ++i;
         };
         std::apply([&](const auto&... e) { (one(e), ...); }, v);

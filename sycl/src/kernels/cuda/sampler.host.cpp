@@ -73,7 +73,7 @@ int32_t *split_scratch(void *stream, size_t entries) {
     static std::mutex mu;
     static std::vector<Slot> slots;
     static std::vector<int32_t *> retired;
-    const int device = ze::current_device();
+    const int device = ze::stream_of(stream)->device();
     std::lock_guard<std::mutex> lock(mu);
     Slot* slot = nullptr;
     for (Slot& s : slots)
@@ -87,10 +87,10 @@ int32_t *split_scratch(void *stream, size_t entries) {
     constexpr size_t kCap = (size_t) kSplitMaxRows * kSplitMaxBlocks * kSelMax;
     size_t want = 2 * slot->entries < kCap ? 2 * slot->entries : kCap;
     if (want < entries) want = entries;
-    int32_t *ptr = (int32_t *) ze::malloc_device(want * 2 * sizeof(int32_t));
+    int32_t *ptr = (int32_t *) ze::malloc_device(want * 2 * sizeof(int32_t), device);
     if (ptr == nullptr) {
         want = entries;
-        ptr = (int32_t *) ze::malloc_device(want * 2 * sizeof(int32_t));
+        ptr = (int32_t *) ze::malloc_device(want * 2 * sizeof(int32_t), device);
         if (ptr == nullptr) {
             slot->failed = entries;
             return nullptr;
@@ -164,7 +164,7 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
         }
     }
 
-    if (stream == nullptr) ze::device_sync();
+    if (stream == nullptr) ze::default_stream().sync();
 }
 
 namespace {

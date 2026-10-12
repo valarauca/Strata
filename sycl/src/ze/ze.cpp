@@ -90,7 +90,7 @@ public:
     struct Deferred {
         void* p = nullptr;
         Alloc a;
-        std::vector<std::unique_ptr<Event>> fences;
+        std::vector<std::shared_ptr<Event>> fences;
     };
     std::mutex defer_mu;
     std::vector<Deferred> deferred;
@@ -667,11 +667,7 @@ void free(void* p) {
         for (Stream* s : st.streams) {
             std::lock_guard<std::recursive_mutex> sl(s->mu_);
             if (zeCommandListHostSynchronize(s->imm_, 0) == ZE_RESULT_SUCCESS) continue;
-            auto f = std::make_unique<Event>();
-            STRATA_ZE_CHECK(zeCommandListAppendBarrier(s->imm_, f->ev_, 0, nullptr));
-            f->recorded_ = true;
-            f->dev_ = s->dev_;
-            d.fences.push_back(std::move(f));
+            d.fences.push_back(s->fence_locked());
         }
     }
     {
@@ -831,12 +827,33 @@ bool check_devices() {
 }
 
 void check_launch_ptr(const char* name, int index, const void* p, int dev) {
+    if (p == nullptr) return;
     int owner = -1;
-    if (kind_of(p, &owner) != MemKind::Device || owner == dev) return;
+    const MemKind k = kind_of(p, &owner);
+    if (k == MemKind::Unknown) {
+        std::fprintf(stderr, "strata ze: kernel %s argument %d (%p) is in no live Strata allocation (pageable or freed memory), "
+                             "launched on GPU %d\n", name, index, p, dev);
+        std::fflush(nullptr);
+        std::abort();
+    }
+    if (k != MemKind::Device || owner == dev) return;
     std::fprintf(stderr, "strata ze: kernel %s argument %d (%p) is GPU %d memory, launched on GPU %d\n", name, index, p,
                  owner, dev);
     std::fflush(nullptr);
     std::abort();
+}
+
+void check_launch_struct(const char* name, int index, const void* data, size_t bytes, int dev) {
+    for (size_t o = 0; o + sizeof(uintptr_t) <= bytes; o += sizeof(uintptr_t)) {
+        uintptr_t w = 0;
+        std::memcpy(&w, (const uint8_t*) data + o, sizeof w);
+        int owner = -1;
+        if (w == 0 || kind_of((const void*) w, &owner) != MemKind::Device || owner == dev) continue;
+        std::fprintf(stderr, "strata ze: kernel %s argument %d holds GPU %d memory (%p at byte %zu), launched on GPU %d\n",
+                     name, index, owner, (const void*) w, o, dev);
+        std::fflush(nullptr);
+        std::abort();
+    }
 }
 
 void check_geometry(const KernelBase& k, Dim3 grid, Dim3 block) {
@@ -869,16 +886,14 @@ Stream::~Stream() {
         std::fflush(stderr);
         std::abort();
     }
+    if (imm_) zeCommandListHostSynchronize(imm_, UINT64_MAX);
+    wait_host_funcs();
     {
         DeviceState& st = dev_state(dev_);
         std::lock_guard<std::mutex> lk(st.streams_mu);
         st.streams.erase(std::remove(st.streams.begin(), st.streams.end(), this), st.streams.end());
     }
-    if (imm_) {
-        zeCommandListHostSynchronize(imm_, UINT64_MAX);
-        zeCommandListDestroy(imm_);
-    }
-    wait_host_funcs();
+    if (imm_) zeCommandListDestroy(imm_);
     for (int i = 0; i < kBounce; ++i) {
         delete bounce_ev_[i];
         if (bounce_[i]) free(bounce_[i]);
@@ -904,6 +919,17 @@ void Stream::check_operand(const void* p, const char* what) const {
                  what, dev_, owner, p, dev_);
     std::fflush(nullptr);
     std::abort();
+}
+
+std::shared_ptr<Event> Stream::fence_locked() {
+    const uint64_t at = appends_.load(std::memory_order_relaxed);
+    if (fence_ && fence_at_ == at) return fence_;
+    if (!fence_) fence_ = std::make_shared<Event>();
+    STRATA_ZE_CHECK(zeCommandListAppendBarrier(imm_, fence_->ev_, 0, nullptr));
+    fence_->recorded_ = true;
+    fence_->dev_ = dev_;
+    fence_at_ = at;
+    return fence_;
 }
 
 void Stream::after_append() {
@@ -1088,6 +1114,7 @@ void Stream::write_timestamp(uint64_t* dst) {
 
 void Stream::record(Event& e) {
     std::lock_guard<std::recursive_mutex> lk(mu_);
+    if (cap_ && e.recorded_ && (e.captured_in_ == nullptr || e.replayed_)) e.sync();
     {
         std::lock_guard<std::mutex> cl(rt().cap_mu);
         if (e.captured_in_ != nullptr && e.captured_in_ != cap_) {
@@ -1139,6 +1166,15 @@ void Stream::wait(Event& e) {
     }
     if (cap_) {
         g_count.dropped_waits.fetch_add(1, std::memory_order_relaxed);
+        static std::atomic<bool> said{false};
+        if (check_devices() || !said.exchange(true)) {
+            std::fprintf(stderr, "strata ze: a capture on GPU %d waited on an event recorded outside it (last signaled on GPU %d): "
+                                 "the graph does not wait on it\n", dev_, e.dev_);
+            if (check_devices()) {
+                std::fflush(nullptr);
+                std::abort();
+            }
+        }
         return;
     }
     if (e.dev_ >= 0 && e.dev_ != dev_) {
@@ -1151,14 +1187,16 @@ void Stream::wait(Event& e) {
 }
 
 void Stream::sync() {
+    std::shared_ptr<Event> f;
     {
         std::lock_guard<std::recursive_mutex> lk(mu_);
         g_count.host_waits.fetch_add(1, std::memory_order_relaxed);
         if (rt().trace) std::fprintf(stderr, "strata ze trace: stream %p sync\n", (void*) this);
-        const ze_result_t r = zeCommandListHostSynchronize(imm_, UINT64_MAX);
-        if (r != ZE_RESULT_SUCCESS) fatal("zeCommandListHostSynchronize", r, __FILE__, __LINE__);
-        if (rt().trace) std::fprintf(stderr, "strata ze trace: stream %p sync done\n", (void*) this);
+        f = fence_locked();
     }
+    const ze_result_t r = zeEventHostSynchronize(f->ev_, UINT64_MAX);
+    if (r != ZE_RESULT_SUCCESS) fatal("zeEventHostSynchronize (stream sync)", r, __FILE__, __LINE__);
+    if (rt().trace) std::fprintf(stderr, "strata ze trace: stream %p sync done\n", (void*) this);
     wait_host_funcs();
 }
 
@@ -1242,6 +1280,7 @@ void Stream::launch(Graph& g) {
         std::exit(1);
     }
     STRATA_ZE_CHECK(zeCommandListImmediateAppendCommandListsExp(imm_, 1, &g.list_, nullptr, 0, nullptr));
+    g.launched_ = true;
     if (g.cap_ != nullptr) {
         std::lock_guard<std::mutex> cl(rt().cap_mu);
         for (Event* e : g.cap_->events) {
@@ -1255,6 +1294,7 @@ void Stream::launch(Graph& g) {
 }
 
 Graph::~Graph() {
+    if (launched_) device_sync(dev_);
     if (cap_ != nullptr) {
         std::lock_guard<std::mutex> cl(rt().cap_mu);
         for (Event* e : cap_->events) {

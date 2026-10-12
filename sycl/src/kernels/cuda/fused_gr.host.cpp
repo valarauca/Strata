@@ -1,6 +1,6 @@
 // src/kernels/cuda/fused_gr.host.cpp - the host side of fused_gr.dp.cpp: the launchers and the variants' self-test.
 #include <mutex>
-#include <unordered_map>
+#include <map>
 #include "strata/core/emulate.hpp"
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/bf16_bits.hpp"
@@ -31,15 +31,19 @@ bool gr_down_sliced() {   // default (gr_bench: GR read 108.6 -> 76.5 us at 6 to
     static const bool v = std::getenv("STRATA_GR_DOWN_SLICED") == nullptr || std::atoi(std::getenv("STRATA_GR_DOWN_SLICED")) != 0;
     return v;
 }
+// The scratch of stream `q`, keyed by its GPU as well as its address: a deleted capture stream's address can come
+// back as a stream of another GPU, which must not inherit the first GPU's buffer.
+float* stream_scratch(std::map<std::pair<int, strata::ze::Stream*>, float*>& bufs, std::mutex& mu, strata::ze::Stream* q,
+                      size_t floats) {
+    std::lock_guard<std::mutex> lk(mu);
+    float*& p = bufs[{q->device(), q}];
+    if (p == nullptr) p = (float*) strata::ze::malloc_device(floats * sizeof(float), q->device());
+    return p;
+}
 float* slice_partials(strata::ze::Stream* q) {
     static std::mutex mu;
-    static std::unordered_map<strata::ze::Stream*, float*> bufs;
-    std::lock_guard<std::mutex> lk(mu);
-    auto it = bufs.find(q);
-    if (it != bufs.end()) return it->second;
-    float* p = (float*) strata::ze::malloc_device((size_t) GRS_SLICES * kFusedGrMaxT * GRS_ROWS * sizeof(float), q->device());
-    bufs[q] = p;
-    return p;
+    static std::map<std::pair<int, strata::ze::Stream*>, float*> bufs;
+    return stream_scratch(bufs, mu, q, (size_t) GRS_SLICES * kFusedGrMaxT * GRS_ROWS);
 }
 bool gr_down_direct() {   // default; STRATA_GR_DOWN_DIRECT=0: the tiled kernel (gr_bench: 13-19% slower at 3-6 tokens)
     static const bool v = std::getenv("STRATA_GR_DOWN_DIRECT") == nullptr || std::atoi(std::getenv("STRATA_GR_DOWN_DIRECT")) != 0;
@@ -175,13 +179,8 @@ std::atomic<int> g_variant[64];
 // launches are ordered, and a graph capture records the pointer)
 static float* down_partials(strata::ze::Stream* q) {
     static std::mutex mu;
-    static std::unordered_map<strata::ze::Stream*, float*> bufs;
-    std::lock_guard<std::mutex> lk(mu);
-    auto it = bufs.find(q);
-    if (it != bufs.end()) return it->second;
-    float* p = (float*) strata::ze::malloc_device((size_t) DOWN_SPLIT * kFusedGrMaxT * LR * sizeof(float), q->device());
-    bufs[q] = p;
-    return p;
+    static std::map<std::pair<int, strata::ze::Stream*>, float*> bufs;
+    return stream_scratch(bufs, mu, q, (size_t) DOWN_SPLIT * kFusedGrMaxT * LR);
 }
 
 bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream, unsigned long long* stamp_buf,
@@ -314,15 +313,8 @@ void fused_gr_read(const FusedGrArgs& a, void* stream) {
     // of one token (each token's sums run in the same order whatever the window size).
     if (gr_down_sliced() || gr_norm_split() || gr_down_direct()) {
         static std::mutex mu;
-        static std::unordered_map<strata::ze::Stream*, float*> xn;
-        float* scratch;
-        {
-            std::lock_guard<std::mutex> lk(mu);
-            float*& p = xn[st];
-            if (!p) p = (float*) strata::ze::malloc_device((size_t) D * sizeof(float), st->device());
-            scratch = p;
-        }
-        fused_gr_read_multi(&a, 1, scratch, stream);
+        static std::map<std::pair<int, strata::ze::Stream*>, float*> xn;
+        fused_gr_read_multi(&a, 1, stream_scratch(xn, mu, st, (size_t) D), stream);
         return;
     }
     k_fused_gr_down(st, {DOWN_BLOCKS + 1, 1, 1}, {THREADS, 1, 1}, 0, a);

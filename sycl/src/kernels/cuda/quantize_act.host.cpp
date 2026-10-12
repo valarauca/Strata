@@ -27,7 +27,7 @@ void quantize_q8_0(const float* x, uint8_t* blocks, int64_t n, void* stream) {
     const int threads = 128;
     const unsigned grid = (unsigned) ((nb + threads - 1) / threads);
     k_quantize_act_q8_0(ze::stream_of(stream), {grid, 1, 1}, {threads, 1, 1}, 0, x, blocks, nb);
-    if (stream == nullptr) ze::device_sync();
+    if (stream == nullptr) ze::default_stream().sync();
 }
 
 /// See `quantize_q8_0_scaled_kernel`.  Writes the same 34-byte `block_q8_0` layout as `quantize_q8_0`, plus
@@ -51,7 +51,7 @@ void quantize_q8_0_scaled(const float* x, uint8_t* blocks, float* scales, int64_
     const unsigned grid = (unsigned) ((nb + threads / 32 - 1) / (threads / 32));   // a warp a block
 #endif
     k_quantize_act_q8_0_scaled(ze::stream_of(stream), {grid, 1, 1}, {threads, 1, 1}, 0, x, blocks, scales, nb);
-    if (stream == nullptr) ze::device_sync();
+    if (stream == nullptr) ze::default_stream().sync();
 }
 
 void dequant_q8_0(const uint8_t* blocks, float* x, int64_t n, void* stream) {
@@ -60,7 +60,7 @@ void dequant_q8_0(const uint8_t* blocks, float* x, int64_t n, void* stream) {
     const int threads = 128;
     const unsigned grid = (unsigned) ((nb + threads - 1) / threads);
     k_quantize_act_dequant_q8_0(ze::stream_of(stream), {grid, 1, 1}, {threads, 1, 1}, 0, blocks, x, nb);
-    if (stream == nullptr) ze::device_sync();
+    if (stream == nullptr) ze::default_stream().sync();
 }
 
 void quantize_q8_K(const float* x, uint8_t* blocks, int64_t n, void* stream) {
@@ -73,7 +73,7 @@ void quantize_q8_K(const float* x, uint8_t* blocks, int64_t n, void* stream) {
     const int threads = 64;                       // one block per thread, and a block is 256 elements
     const unsigned grid = (unsigned) ((nb + threads - 1) / threads);
     k_quantize_act_q8_K(ze::stream_of(stream), {grid, 1, 1}, {threads, 1, 1}, 0, x, blocks, nb);
-    if (stream == nullptr) ze::device_sync();
+    if (stream == nullptr) ze::default_stream().sync();
 }
 
 void dequant_q8_K(const uint8_t* blocks, float* x, int64_t n, void* stream) {
@@ -82,7 +82,7 @@ void dequant_q8_K(const uint8_t* blocks, float* x, int64_t n, void* stream) {
     const int threads = 64;
     const unsigned grid = (unsigned) ((nb + threads - 1) / threads);
     k_quantize_act_dequant_q8_K(ze::stream_of(stream), {grid, 1, 1}, {threads, 1, 1}, 0, blocks, x, nb);
-    if (stream == nullptr) ze::device_sync();
+    if (stream == nullptr) ze::default_stream().sync();
 }
 
 }  // namespace strata::kernels

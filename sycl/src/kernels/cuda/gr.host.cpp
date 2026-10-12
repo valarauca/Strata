@@ -124,7 +124,7 @@ void gr_read(const float *R, const float *w_norm, const uint16_t *w_down,
             k_gr_inject_bf16(st, {1, 1, 1}, {(uint32_t) nthreads, 1, 1}, 0, ws.xq, w_inject, hc_dim, hc, inject);
     }
 
-    if (stream == nullptr) strata::ze::device_sync();
+    if (stream == nullptr) strata::ze::default_stream().sync();
 }
 
 static bool no_multi_gr() {
@@ -154,7 +154,7 @@ void gr_read_multi(const float *R, const float *w_norm, const uint16_t *w_down,
         if (w_inject != nullptr)
             bf16_gemv_fp32_mmvf_multi(xn_multi, hc_dim, w_inject, inject, hc, hc_dim, hc, n_tok, stream);
 
-        if (stream == nullptr) strata::ze::device_sync();
+        if (stream == nullptr) strata::ze::default_stream().sync();
         return;
     }
     const size_t hc_dim = (size_t) s.hc * (size_t) s.n_embd;
@@ -174,7 +174,7 @@ void gr_write(const float *R, const float *block_out, const float *inject,
     else
         k_gr_write(strata::ze::stream_of(stream), {(uint32_t) blocks, 1, 1}, {THREADS, 1, 1},
                    (size_t) s.hc * sizeof(float), R, block_out, inject, (int) s.n_embd, (int) s.hc, R_out);
-    if (stream == nullptr) strata::ze::device_sync();
+    if (stream == nullptr) strata::ze::default_stream().sync();
 }
 
 void gr_write_multi(const float *R, const float *block_out, const float *inject,
@@ -183,7 +183,7 @@ void gr_write_multi(const float *R, const float *block_out, const float *inject,
     if (n_tok <= 0 || s.n_embd <= 0 || s.hc <= 0) return;
     if (!no_multi_gr() && native_mmvf && n_tok > 1) {
         native_gr_post_multi(R, block_out, inject, R_out, (int) s.n_embd, (int) s.hc, n_tok, stream);
-        if (stream == nullptr) strata::ze::device_sync();
+        if (stream == nullptr) strata::ze::default_stream().sync();
         return;
     }
     const size_t hc_dim = (size_t) s.hc * (size_t) s.n_embd;

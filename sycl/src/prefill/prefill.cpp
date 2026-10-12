@@ -3519,7 +3519,10 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                 const int* cv_on = nullptr;
                 const bool cv_fused = steered && cvec_fuse() && !gr_unfused() && nl < LE && !(nl == 1 && ple_on) &&
                                       strata::kernels::cvec().n_embd == N && strata::kernels::cvec().hc == HC &&
-                                      strata::kernels::cvec_tables(&cv_dir, &cv_s, &cv_on);
+                                      [&] {
+                                          const core::OnDevice on_cs(m.cs->device());
+                                          return strata::kernels::cvec_tables(&cv_dir, &cv_s, &cv_on);
+                                      }();
                 const bool fuse = !gr_unfused() && nl < LE && !(half == 1 && nl == 1 && ple_on) && (!steered || cv_fused);
                 const core::WeightRef* wnn = nullptr;
                 if (fuse) {

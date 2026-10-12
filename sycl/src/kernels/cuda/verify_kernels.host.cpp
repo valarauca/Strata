@@ -255,12 +255,15 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
 
 namespace {
 const int32_t* g_mirror_res = nullptr;
+int64_t g_mirror_n = 0;
 const unsigned long long* g_mirror_table = nullptr;
 int32_t* g_usage = nullptr;
 }
-void resident_plan_set_mirror(const int32_t* d_res, const unsigned long long* mirror_table, int32_t* usage) {
+void resident_plan_set_mirror(const int32_t* d_res, int64_t entries, const unsigned long long* mirror_table,
+                              int32_t* usage) {
     g_usage = usage;
     g_mirror_res = d_res;
+    g_mirror_n = entries;
     g_mirror_table = mirror_table;
 }
 void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_layer, int n_expert,
@@ -268,9 +271,11 @@ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_
                    long long capx, uint32_t* skip, uint32_t ring, void* stream, uint32_t* plan_err) {
     const unsigned long long* mir = nullptr;   // SYCL port: the layer's slice of the host-mirror table, if any
     int32_t* use = nullptr;                    // the layer's slice of the device routing counts, if on
-    if (g_mirror_table != nullptr && g_mirror_res != nullptr && res_layer >= g_mirror_res)
-        mir = g_mirror_table + (res_layer - g_mirror_res);
-    if (g_usage != nullptr && g_mirror_res != nullptr && res_layer >= g_mirror_res) use = g_usage + (res_layer - g_mirror_res);
+    const uintptr_t r0 = (uintptr_t) g_mirror_res, r = (uintptr_t) res_layer;
+    const int64_t at = r >= r0 ? (int64_t) ((r - r0) / sizeof(int32_t)) : -1;
+    const bool in_table = g_mirror_res != nullptr && at >= 0 && at + n_expert <= g_mirror_n;
+    if (in_table && g_mirror_table != nullptr) mir = g_mirror_table + at;
+    if (in_table && g_usage != nullptr) use = g_usage + at;
     k_verify_kernels_resident_plan(strata::ze::stream_of(stream), {1, 1, 1}, {kResidentPlanMax, 1, 1}, 0, ids,
                                    n_entries, k, res_layer, n_expert, cache_base, slot_off, blob, plan, capx, skip, ring,
                                    mir, plan_err, use);

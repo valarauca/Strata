@@ -233,7 +233,7 @@ void shared_expert(const uint8_t *x_q8_0, const uint8_t *x_q8k,
         k_shared_expert_scale(ze::stream_of(stream), {g_embd, 1, 1}, {THREADS, 1, 1}, 0, out, g, (int) n_embd);
     }
 
-    if (stream == nullptr) ze::device_sync();
+    if (stream == nullptr) ze::default_stream().sync();
 }
 
 void moe_combine(const float *parts, const float *weights, const float *shared,
@@ -248,7 +248,7 @@ void moe_combine(const float *parts, const float *weights, const float *shared,
     const unsigned grid = (unsigned) ((n_embd + THREADS - 1) / THREADS);
     k_shared_expert_moe_combine(ze::stream_of(stream), {grid, 1, 1}, {THREADS, 1, 1}, 0, parts, weights, shared, y,
                                 (int) n_embd, (int) k, shared != nullptr);
-    if (stream == nullptr) ze::device_sync();
+    if (stream == nullptr) ze::default_stream().sync();
 }
 
 }  // namespace strata::kernels
