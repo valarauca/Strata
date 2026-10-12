@@ -94,6 +94,7 @@ public:
     };
     std::mutex defer_mu;
     std::vector<Deferred> deferred;
+    std::mutex retire_mu;
     std::vector<std::shared_ptr<Event>> retired;   ///< streams' replaced fences, dropped once they have passed
 
     std::mutex cap_mu;              // Capture::events and Event::captured_in_
@@ -554,25 +555,24 @@ namespace {
 
 void retire_fence(std::shared_ptr<Event> f) {
     Runtime& r = rt();
-    std::lock_guard<std::mutex> lk(r.defer_mu);
+    std::vector<std::shared_ptr<Event>> passed;
+    std::lock_guard<std::mutex> lk(r.retire_mu);
     r.retired.push_back(std::move(f));
+    for (auto it = r.retired.begin(); it != r.retired.end();) {
+        if ((*it)->query()) {
+            passed.push_back(std::move(*it));
+            it = r.retired.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 void reap(bool block) {
     Runtime& r = rt();
     std::vector<Runtime::Deferred> done;
-    std::vector<std::shared_ptr<Event>> passed_fences;
     {
         std::lock_guard<std::mutex> lk(r.defer_mu);
-        for (auto it = r.retired.begin(); it != r.retired.end();) {
-            if (block) (*it)->sync();
-            if (block || (*it)->query()) {
-                passed_fences.push_back(std::move(*it));
-                it = r.retired.erase(it);
-            } else {
-                ++it;
-            }
-        }
         for (auto it = r.deferred.begin(); it != r.deferred.end();) {
             bool passed = true;
             for (auto& f : it->fences) {
@@ -1175,13 +1175,9 @@ void Stream::record(Event& e) {
 void Stream::wait(Event& e) {
     std::unique_lock<std::recursive_mutex> lk(mu_);
     if (!e.recorded_) return;
-    Capture* c = nullptr;
-    bool replayed = false;
-    {
-        std::lock_guard<std::mutex> cl(rt().cap_mu);
-        c = e.captured_in_;
-        replayed = e.replayed_;
-    }
+    std::unique_lock<std::mutex> cl(rt().cap_mu);
+    Capture* c = e.captured_in_;
+    const bool replayed = e.replayed_;
     if (c != nullptr && !replayed) {
         if (cap_ == c) return;
         if (cap_ == nullptr && c->list_ != nullptr) {
@@ -1197,6 +1193,7 @@ void Stream::wait(Event& e) {
         std::fprintf(stderr, "strata ze: a stream in one capture waited on an event of another capture\n");
         std::exit(1);
     }
+    cl.unlock();
     if (cap_) {
         g_count.dropped_waits.fetch_add(1, std::memory_order_relaxed);
         static std::atomic<bool> said{false};
@@ -1294,6 +1291,7 @@ Graph* Stream::end_capture() {
     }
     STRATA_ZE_CHECK(zeCommandListClose(c->list_));
     Graph* g = new Graph();
+    std::lock_guard<std::mutex> cl(rt().cap_mu);
     g->list_ = c->list_;
     g->nodes_ = c->nodes;
     g->dev_ = c->dev;

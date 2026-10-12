@@ -11,6 +11,7 @@ inc=(-I"$here/include" -I"$root/include" -I"$root/third_party/ggml" -I"$root/src
 defs=(-DSTRATA_VERSION=\"check\" -DSTRATA_INTEL_ZE=1 -DSTRATA_XMX_SG16=1)
 mkdir -p "${ZE_CHECK_TMP:-/tmp}"
 tmp=$(mktemp -d "${ZE_CHECK_TMP:-/tmp}/ze_check.XXXXXX") || exit 1
+trap 'rm -rf "$tmp"' EXIT
 case "${1:-}" in
 dev)
     base=$2
@@ -30,4 +31,3 @@ host)
 *)
     echo "usage: ze_check.sh dev <dir>/<family> | host <file.cpp>"; exit 2 ;;
 esac
-rm -rf "$tmp"
