@@ -12,6 +12,7 @@
 #include <fstream>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 
 // Loader fix: `fseek`/`ftell` are 32-bit on Windows by default (and the pack is 42.9 GB), and the 64-bit
 // spelling is not the same on the two platforms the engine builds for.
@@ -37,6 +38,34 @@
 namespace strata::core {
 
 namespace {
+
+std::mutex g_import_mu;
+std::unordered_map<const PinnedArena*, std::vector<void*>> g_imports;
+
+// Maps the arena's bytes [lo, hi) for every GPU (ze::import_host), page-rounded so that slices never overlap: a slice
+// owns the pages that start inside it, the last one runs to the end of its page.
+bool import_pages(const PinnedArena* arena, uint8_t* base, uint64_t lo, uint64_t hi, uint64_t total) {
+    const uint64_t pg = (uint64_t) sysconf(_SC_PAGESIZE);
+    const uint64_t a = lo / pg * pg;
+    const uint64_t b = hi >= total ? (total + pg - 1) / pg * pg : hi / pg * pg;
+    if (b <= a) return true;
+    if (!ze::import_host(base + a, (size_t) (b - a))) return false;
+    std::lock_guard<std::mutex> lk(g_import_mu);
+    g_imports[arena].push_back(base + a);
+    return true;
+}
+
+void release_imports(const PinnedArena* arena) {
+    std::vector<void*> v;
+    {
+        std::lock_guard<std::mutex> lk(g_import_mu);
+        auto it = g_imports.find(arena);
+        if (it == g_imports.end()) return;
+        v = std::move(it->second);
+        g_imports.erase(it);
+    }
+    for (void* p : v) ze::free(p);
+}
 
 constexpr uint64_t kSharedArenaHeaderBytes = 4096;
 constexpr char kSharedArenaMagic[16] = "STRATA-ARENA-V1";
@@ -374,10 +403,8 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t> &bounds,
             cap_why = "by STRATA_ARENA_PIN_GIB";
         }
         const bool capped = cap > 0 && cap < bytes && bounds.size() >= 2;
-        const int e =
-            capped ? 0 :
-                0;
-        if (!capped && e == 0) {
+        const bool whole = !capped && import_pages(this, (uint8_t*) base, 0, bytes, bytes);
+        if (whole) {
             note = "cudaHostRegister PORTABLE ok; " + note;
             registered_bytes = bytes;
         } else if (bounds.size() >= 2 && (capped || clear_error())) {
@@ -396,10 +423,7 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t> &bounds,
             for (size_t i = 0; i + 1 < bounds.size(); ++i) {
                 const uint64_t off = bounds[i], n = bounds[i + 1] - bounds[i];
                 if (limited && (off > limit || n > limit - off)) break;
-                if (0 != 0) {
-                    (void)0;
-                    break;
-                }
+                if (!import_pages(this, (uint8_t*) base, off, off + n, bounds.back())) break;
                 slice_starts.push_back(off);
                 registered_bytes = off + n;
                 ++registered_slices;
@@ -481,10 +505,7 @@ void PinnedArena::register_slices(std::atomic<int> &ready) {
     int i = 0;
     for (; base != nullptr && i < n; ++i) {
         const uint64_t off = bounds_[(size_t) i], len = bounds_[(size_t) i + 1] - off;
-        if (0 != 0) {
-            (void)0;
-            break;
-        }
+        if (!import_pages(this, (uint8_t*) base, off, off + len, bounds_.back())) break;
         slice_starts.push_back(off);
         registered_bytes = off + len;
         ++registered_slices;
@@ -509,10 +530,7 @@ void PinnedArena::register_slices(std::atomic<int> &ready) {
 PinnedArena::~PinnedArena() {
     if (base) {
         if (locked_bytes) strata::platform::unlock_resident((uint8_t*) base + (slice_bytes ? registered_bytes : 0), locked_bytes);
-        if (slice_bytes) {
-            for (uint64_t off : slice_starts) (void) off;
-        } else {
-        }
+        release_imports(this);
         release(mapping_base ? mapping_base : base, mapping_bytes ? mapping_bytes : capacity);
         base = nullptr;
         mapping_base = nullptr;

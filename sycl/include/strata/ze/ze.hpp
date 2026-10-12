@@ -19,6 +19,7 @@
 #include <level_zero/ze_api.h>
 
 #include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
@@ -96,7 +97,13 @@ void* malloc_device_guarded(size_t bytes, int ordinal, const char* what);
 void* malloc_host(size_t bytes);
 /// Pinned host memory with the uncached bias, for flags a running kernel polls (the doorbell).
 void* malloc_host_uncached(size_t bytes);
-/// Releases a Strata allocation after the work of the devices that can reach it has finished.
+/// Maps existing page-aligned system memory [p, p + bytes) for every GPU of the context (ZE_extension_external_memmap_sysmem),
+/// keeping its address, so kernels and copies may use it like malloc_host memory. False when the driver refuses; free(p)
+/// releases the mapping, not the memory. Mapped ranges must not overlap.
+bool import_host(void* p, size_t bytes);
+/// Releases a Strata allocation. It returns at once: the memory goes back to the driver once every stream of every GPU
+/// has passed the point where free was called (a fence on each), and an allocation that finds no room first waits for
+/// the pending ones.
 void free(void* p);
 /// The kind and owning GPU of `p` (dev = -1 for host memory or unknown pointers).
 MemKind kind_of(const void* p, int* dev = nullptr);
@@ -188,6 +195,7 @@ public:
     void memcpy(void* dst, const void* src, size_t bytes);
     /// A 2-D copy: `height` rows of `width` bytes, row pitches in bytes.
     void memcpy_2d(void* dst, size_t dpitch, const void* src, size_t spitch, size_t width, size_t height);
+    /// Sets `bytes` bytes at `dst` to `value` (a fill with a one-byte pattern).
     void memset(void* dst, int value, size_t bytes);
     /// Fills `bytes` with a repeated pattern of 1, 2, 4, 8, 16, 32, 64 or 128 bytes.
     void fill(void* dst, const void* pattern, size_t pattern_bytes, size_t bytes);
@@ -195,13 +203,15 @@ public:
     void write_timestamp(uint64_t* dst);
     /// `e` completes when everything appended to this stream before it has.
     void record(Event& e);
-    /// Work appended to this stream after this call starts after `e`'s last record.
+    /// Work appended to this stream after this call starts after `e`'s last record. When that record is on another GPU
+    /// the host waits for it here: a GPU may only wait on a counter-based event of a peer it has access to, and the
+    /// event's counter lives with the GPU that signaled it.
     void wait(Event& e);
-    /// Host wait for everything appended so far. Exits on DEVICE_LOST.
+    /// Host wait for everything appended so far, host functions included. Exits on DEVICE_LOST.
     void sync();
     /// Host wait with a bound; false when `timeout_ms` passed first.
     bool sync_for(uint64_t timeout_ms);
-    /// True when everything appended so far has finished (no wait).
+    /// True when everything appended so far has finished, host functions included (no wait).
     bool idle();
 
     /// From here until end_capture, appends go to a new regular command list instead of the GPU. A stream that waits
@@ -217,29 +227,44 @@ public:
     uint64_t appends() const { return appends_.load(std::memory_order_relaxed); }
     ze_command_list_handle_t immediate_list() const { return imm_; }
 
-    /// The open recording of begin_capture, shared by the streams that joined it.
+    /// The open recording of begin_capture, shared by the streams that joined it, then owned by its Graph.
     struct Capture {
         ze_command_list_handle_t list_ = nullptr;
         int dev = 0;
         size_t nodes = 0;
         std::vector<Stream*> members;
+        std::vector<Event*> events;   ///< recorded inside: signaled again at the end of each replay
     };
 
 private:
     friend class Event;
     friend Stream& default_stream(int);
     friend Stream& copy_stream(int);
+    friend void host_func(Stream& s, void (*fn)(void*), void* arg);
+    /// The runtime's host-function worker reports a finished callback of `s` (strata/ze/ze_util.cpp).
+    friend void host_func_finished(Stream& s);
+    friend void free(void* p);
+    friend void device_sync(int ordinal);
     ze_command_list_handle_t target() const { return cap_ ? cap_->list_ : imm_; }
     void after_append();
     void append_launch(ze_kernel_handle_t h, const char* name, int dev, Dim3 grid, Dim3 block, void** args);
+    void check_operand(const void* p, const char* what) const;
+    void host_func_done();
+    void wait_host_funcs();
+    static constexpr int kBounce = 4;
     int dev_;
     Engine engine_;
     ze_command_list_handle_t imm_ = nullptr;
     Capture* cap_ = nullptr;
-    void* bounce_ = nullptr;
+    void* bounce_[kBounce] = {};
+    Event* bounce_ev_[kBounce] = {};
+    int bounce_next_ = 0;
     bool runtime_owned_ = false;
     std::recursive_mutex mu_;
     std::atomic<uint64_t> appends_{0};
+    std::mutex hf_mu_;
+    std::condition_variable hf_cv_;
+    int hf_pending_ = 0;
 };
 
 /// The current GPU's default compute stream (ordinal -1), shared by every thread of the process.
@@ -276,6 +301,8 @@ public:
 
 private:
     friend class Stream;
+    friend class Graph;
+    friend void free(void* p);
     ze_event_handle_t ev_ = nullptr;
     void* pool_ = nullptr;
     uint32_t index_ = 0;
@@ -283,7 +310,9 @@ private:
     bool timing_ = false;
     uint64_t* stamp_ = nullptr;
     int stamp_dev_ = 0;
+    int dev_ = -1;                       ///< GPU of the last signal (a stream record or a graph replay)
     Stream::Capture* captured_in_ = nullptr;
+    bool replayed_ = false;              ///< recorded in a capture whose graph has been launched since
 };
 
 /// A recorded command list, replayed with Stream::launch(Graph&).
@@ -301,6 +330,7 @@ private:
     ze_command_list_handle_t list_ = nullptr;
     size_t nodes_ = 0;
     int dev_ = 0;
+    Stream::Capture* cap_ = nullptr;
 };
 
 /// Zeroes a large device range with compute kernels of at most `chunk` bytes, the host waiting after each: on the

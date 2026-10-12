@@ -2,6 +2,7 @@
 // zero fill and host functions.
 #include "strata/ze/ze.hpp"
 #include "strata/ze/kernel_abi.hpp"
+#include "strata/intel_gpu.hpp"
 
 #include <condition_variable>
 #include <cstdio>
@@ -19,11 +20,6 @@ namespace device {
 }  // namespace device
 
 namespace {
-
-bool alias_guard_enabled() {
-    static const bool on = [] { const char* v = std::getenv("STRATA_ARENA_ALIAS_CHECK"); return v == nullptr || v[0] != '0'; }();
-    return on;
-}
 
 uint64_t alias_check(int dev, void* base, size_t bytes, size_t* first_bad) {
     constexpr unsigned long long kBlock = 64 << 10;
@@ -59,7 +55,7 @@ uint64_t alias_check(int dev, void* base, size_t bytes, size_t* first_bad) {
 void* malloc_device_guarded(size_t bytes, int ordinal, const char* what) {
     if (ordinal < 0) ordinal = current_device();
     void* p = malloc_device(bytes, ordinal);
-    if (p == nullptr || bytes < ((size_t) 32 << 20) || !alias_guard_enabled()) return p;
+    if (p == nullptr || bytes < ((size_t) 32 << 20) || !strata::arena_alias_guard_enabled()) return p;
     std::vector<void*> spacers;
     bool clean = false;
     for (int attempt = 0; attempt < 8 && p != nullptr; ++attempt) {
@@ -115,6 +111,7 @@ struct HostFuncWorker {
         std::unique_ptr<Event> ev;
         void (*fn)(void*);
         void* arg;
+        Stream* s;
     };
     std::mutex mu;
     std::condition_variable cv;
@@ -131,17 +128,24 @@ struct HostFuncWorker {
                 }
                 j.ev->sync();
                 j.fn(j.arg);
+                j.ev.reset();
+                host_func_finished(*j.s);
             }
         }).detach();
     }
 };
 
-HostFuncWorker& host_worker() {
-    static HostFuncWorker* w = new HostFuncWorker();
-    return *w;
+HostFuncWorker& host_worker(int dev) {
+    static std::mutex mu;
+    static HostFuncWorker* w[kMaxDevices] = {};
+    std::lock_guard<std::mutex> lk(mu);
+    if (w[dev] == nullptr) w[dev] = new HostFuncWorker();
+    return *w[dev];
 }
 
 }  // namespace
+
+void host_func_finished(Stream& s) { s.host_func_done(); }
 
 void host_func(Stream& s, void (*fn)(void*), void* arg) {
     if (s.capturing()) {
@@ -150,10 +154,14 @@ void host_func(Stream& s, void (*fn)(void*), void* arg) {
     }
     auto ev = std::make_unique<Event>();
     s.record(*ev);
-    HostFuncWorker& w = host_worker();
+    {
+        std::lock_guard<std::mutex> lk(s.hf_mu_);
+        ++s.hf_pending_;
+    }
+    HostFuncWorker& w = host_worker(s.device());
     {
         std::lock_guard<std::mutex> lk(w.mu);
-        w.jobs.push_back({std::move(ev), fn, arg});
+        w.jobs.push_back({std::move(ev), fn, arg, &s});
     }
     w.cv.notify_one();
 }

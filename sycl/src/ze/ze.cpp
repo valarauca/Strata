@@ -87,6 +87,20 @@ public:
     uint64_t* stamps = nullptr;   // timing events' timestamp slots (host memory)
     std::vector<uint32_t> free_stamps;
 
+    struct Deferred {
+        void* p = nullptr;
+        Alloc a;
+        std::vector<std::unique_ptr<Event>> fences;
+    };
+    std::mutex defer_mu;
+    std::vector<Deferred> deferred;
+
+    std::mutex cap_mu;              // Capture::events and Event::captured_in_
+    std::mutex launch_mu[64];       // appends of one kernel handle (WithArguments sets the kernel's arguments)
+
+    std::once_flag memmap_once;
+    bool memmap_ok = false;
+
 private:
     Runtime() { init(); }
     void init();
@@ -477,17 +491,57 @@ bool can_access_peer(int a, int b) {
     return can != 0;
 }
 
+namespace {
+
+void reap(bool block) {
+    Runtime& r = rt();
+    std::vector<Runtime::Deferred> done;
+    {
+        std::lock_guard<std::mutex> lk(r.defer_mu);
+        for (auto it = r.deferred.begin(); it != r.deferred.end();) {
+            bool passed = true;
+            for (auto& f : it->fences) {
+                if (block) f->sync();
+                else if (!f->query()) {
+                    passed = false;
+                    break;
+                }
+            }
+            if (passed) {
+                done.push_back(std::move(*it));
+                it = r.deferred.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    for (auto& d : done) {
+        if (d.a.kind == MemKind::Device) dev_state(d.a.dev).allocated.fetch_sub(d.a.bytes);
+        STRATA_ZE_CHECK(zeMemFree(r.ctx, d.p));
+        g_count.frees.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+bool out_of_memory(ze_result_t r) { return r == ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY || r == ZE_RESULT_ERROR_OUT_OF_HOST_MEMORY; }
+
+}  // namespace
+
 void* malloc_device(size_t bytes, int ordinal) {
     if (bytes == 0) return nullptr;
     if (ordinal < 0) ordinal = t_dev;
     DeviceState& st = dev_state(ordinal);
+    reap(false);
     ze_relaxed_allocation_limits_exp_desc_t rl{ZE_STRUCTURE_TYPE_RELAXED_ALLOCATION_LIMITS_EXP_DESC};
     rl.flags = ZE_RELAXED_ALLOCATION_LIMITS_EXP_FLAG_MAX_SIZE;
     ze_device_mem_alloc_desc_t dd{ZE_STRUCTURE_TYPE_DEVICE_MEM_ALLOC_DESC};
     if (bytes > st.info.max_alloc) dd.pNext = &rl;
     void* p = nullptr;
-    const ze_result_t r = zeMemAllocDevice(rt().ctx, &dd, bytes, 64, st.h, &p);
-    if (r == ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY || r == ZE_RESULT_ERROR_OUT_OF_HOST_MEMORY) return nullptr;
+    ze_result_t r = zeMemAllocDevice(rt().ctx, &dd, bytes, 64, st.h, &p);
+    if (out_of_memory(r)) {
+        reap(true);
+        r = zeMemAllocDevice(rt().ctx, &dd, bytes, 64, st.h, &p);
+    }
+    if (out_of_memory(r)) return nullptr;
     if (r != ZE_RESULT_SUCCESS) fatal("zeMemAllocDevice", r, __FILE__, __LINE__);
     st.allocated.fetch_add(bytes);
     register_alloc(p, bytes, MemKind::Device, ordinal);
@@ -500,9 +554,14 @@ void* malloc_host(size_t bytes) {
     rl.flags = ZE_RELAXED_ALLOCATION_LIMITS_EXP_FLAG_MAX_SIZE;
     ze_host_mem_alloc_desc_t hd{ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC};
     if (bytes > ((size_t) 4 << 30)) hd.pNext = &rl;
+    reap(false);
     void* p = nullptr;
-    const ze_result_t r = zeMemAllocHost(rt().ctx, &hd, bytes, 64, &p);
-    if (r == ZE_RESULT_ERROR_OUT_OF_HOST_MEMORY || r == ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY) return nullptr;
+    ze_result_t r = zeMemAllocHost(rt().ctx, &hd, bytes, 64, &p);
+    if (out_of_memory(r)) {
+        reap(true);
+        r = zeMemAllocHost(rt().ctx, &hd, bytes, 64, &p);
+    }
+    if (out_of_memory(r)) return nullptr;
     if (r != ZE_RESULT_SUCCESS) fatal("zeMemAllocHost", r, __FILE__, __LINE__);
     register_alloc(p, bytes, MemKind::Host, -1);
     return p;
@@ -520,10 +579,37 @@ void* malloc_host_uncached(size_t bytes) {
     return p;
 }
 
+bool import_host(void* p, size_t bytes) {
+    if (p == nullptr || bytes == 0) return false;
+    Runtime& r = rt();
+    std::call_once(r.memmap_once, [&] {
+        uint32_t n = 0;
+        if (zeDriverGetExtensionProperties(r.driver, &n, nullptr) != ZE_RESULT_SUCCESS) return;
+        std::vector<ze_driver_extension_properties_t> ext(n);
+        if (zeDriverGetExtensionProperties(r.driver, &n, ext.data()) != ZE_RESULT_SUCCESS) return;
+        for (const auto& e : ext)
+            if (std::strcmp(e.name, ZE_EXTERNAL_MEMORY_MAPPING_EXT_NAME) == 0) r.memmap_ok = true;
+    });
+    if (!r.memmap_ok) return false;
+    ze_external_memmap_sysmem_ext_desc_t md{ZE_STRUCTURE_TYPE_EXTERNAL_MEMMAP_SYSMEM_EXT_DESC};
+    md.pSystemMemory = p;
+    md.size = bytes;
+    ze_host_mem_alloc_desc_t hd{ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC};
+    hd.pNext = &md;
+    void* q = nullptr;
+    if (zeMemAllocHost(r.ctx, &hd, bytes, 0, &q) != ZE_RESULT_SUCCESS || q != p) {
+        if (q != nullptr) zeMemFree(r.ctx, q);
+        return false;
+    }
+    register_alloc(p, bytes, MemKind::Host, -1);
+    return true;
+}
+
 void free(void* p) {
     if (p == nullptr) return;
     Runtime& r = rt();
-    Alloc a;
+    Runtime::Deferred d;
+    d.p = p;
     {
         std::lock_guard<std::mutex> lk(r.alloc_mu);
         auto it = r.allocs.find((uintptr_t) p);
@@ -532,17 +618,27 @@ void free(void* p) {
             std::fflush(stderr);
             std::abort();
         }
-        a = it->second;
+        d.a = it->second;
+        r.allocs.erase(it);
     }
-    if (a.kind == MemKind::Device) device_sync(a.dev);
-    else sync_all();
+    for (int i = 0; i < device_count(); ++i) {
+        DeviceState& st = dev_state(i);
+        std::lock_guard<std::mutex> lk(st.streams_mu);
+        for (Stream* s : st.streams) {
+            std::lock_guard<std::recursive_mutex> sl(s->mu_);
+            if (zeCommandListHostSynchronize(s->imm_, 0) == ZE_RESULT_SUCCESS) continue;
+            auto f = std::make_unique<Event>();
+            STRATA_ZE_CHECK(zeCommandListAppendBarrier(s->imm_, f->ev_, 0, nullptr));
+            f->recorded_ = true;
+            f->dev_ = s->dev_;
+            d.fences.push_back(std::move(f));
+        }
+    }
     {
-        std::lock_guard<std::mutex> lk(r.alloc_mu);
-        r.allocs.erase((uintptr_t) p);
+        std::lock_guard<std::mutex> lk(r.defer_mu);
+        r.deferred.push_back(std::move(d));
     }
-    if (a.kind == MemKind::Device) dev_state(a.dev).allocated.fetch_sub(a.bytes);
-    STRATA_ZE_CHECK(zeMemFree(r.ctx, p));
-    g_count.frees.fetch_add(1, std::memory_order_relaxed);
+    reap(false);
 }
 
 MemKind kind_of(const void* p, int* dev) {
@@ -737,7 +833,32 @@ Stream::~Stream() {
         zeCommandListHostSynchronize(imm_, UINT64_MAX);
         zeCommandListDestroy(imm_);
     }
-    if (bounce_) free(bounce_);
+    wait_host_funcs();
+    for (int i = 0; i < kBounce; ++i) {
+        delete bounce_ev_[i];
+        if (bounce_[i]) free(bounce_[i]);
+    }
+}
+
+void Stream::host_func_done() {
+    std::lock_guard<std::mutex> lk(hf_mu_);
+    --hf_pending_;
+    hf_cv_.notify_all();
+}
+
+void Stream::wait_host_funcs() {
+    std::unique_lock<std::mutex> lk(hf_mu_);
+    hf_cv_.wait(lk, [&] { return hf_pending_ == 0; });
+}
+
+void Stream::check_operand(const void* p, const char* what) const {
+    if (!check_devices()) return;
+    int owner = -1;
+    if (kind_of(p, &owner) != MemKind::Device || owner == dev_ || can_access_peer(dev_, owner)) return;
+    std::fprintf(stderr, "strata ze: a %s on a GPU %d stream names GPU %d memory (%p), and GPU %d has no peer access to it\n",
+                 what, dev_, owner, p, dev_);
+    std::fflush(nullptr);
+    std::abort();
 }
 
 void Stream::after_append() {
@@ -797,7 +918,11 @@ void Stream::append_launch(ze_kernel_handle_t h, const char* name, int dev, Dim3
                      grid.y, grid.z, block.x, block.y, block.z);
     const ze_group_count_t gc{grid.x, grid.y, grid.z};
     const ze_group_size_t gs{block.x, block.y, block.z};
-    const ze_result_t r = zeCommandListAppendLaunchKernelWithArguments(target(), h, gc, gs, args, nullptr, nullptr, 0, nullptr);
+    ze_result_t r;
+    {
+        std::lock_guard<std::mutex> kl(rt().launch_mu[((uintptr_t) h >> 4) % 64]);
+        r = zeCommandListAppendLaunchKernelWithArguments(target(), h, gc, gs, args, nullptr, nullptr, 0, nullptr);
+    }
     if (r != ZE_RESULT_SUCCESS) {
         std::fprintf(stderr, "strata ze: launch of %s (grid %ux%ux%u block %ux%ux%u) failed: %s%s\n", name, grid.x, grid.y,
                      grid.z, block.x, block.y, block.z, result_name(r), r == ZE_RESULT_ERROR_DEVICE_LOST ? " - DEVICE_LOST" : "");
@@ -814,6 +939,8 @@ void Stream::memcpy(void* dst, const void* src, size_t bytes) {
     std::lock_guard<std::recursive_mutex> lk(mu_);
     const bool src_ok = range_kind(src, bytes, "copy source") != MemKind::Unknown,
                dst_ok = range_kind(dst, bytes, "copy destination") != MemKind::Unknown;
+    check_operand(src, "copy source");
+    check_operand(dst, "copy destination");
     if (src_ok && dst_ok) {
         STRATA_ZE_CHECK(zeCommandListAppendMemoryCopy(target(), dst, src, bytes, nullptr, 0, nullptr));
         g_count.copies.fetch_add(1, std::memory_order_relaxed);
@@ -825,23 +952,35 @@ void Stream::memcpy(void* dst, const void* src, size_t bytes) {
         std::exit(1);
     }
     g_count.pageable.fetch_add(1, std::memory_order_relaxed);
-    sync();
     if (!src_ok && !dst_ok) {
+        sync();
         std::memcpy(dst, src, bytes);
         return;
     }
     constexpr size_t kChunk = (size_t) 8 << 20;
-    if (bounce_ == nullptr) bounce_ = malloc_host(kChunk);
     for (size_t off = 0; off < bytes; off += kChunk) {
         const size_t n = bytes - off < kChunk ? bytes - off : kChunk;
+        const int b = bounce_next_;
+        bounce_next_ = (bounce_next_ + 1) % kBounce;
+        if (bounce_[b] == nullptr) {
+            bounce_[b] = malloc_host(kChunk);
+            bounce_ev_[b] = new Event();
+            if (bounce_[b] == nullptr) fatal("the pageable copy's bounce buffer", ZE_RESULT_ERROR_OUT_OF_HOST_MEMORY, __FILE__, __LINE__);
+        }
+        Event& ev = *bounce_ev_[b];
+        ev.sync();
         if (!src_ok) {
-            std::memcpy(bounce_, (const uint8_t*) src + off, n);
-            STRATA_ZE_CHECK(zeCommandListAppendMemoryCopy(imm_, (uint8_t*) dst + off, bounce_, n, nullptr, 0, nullptr));
-            sync();
+            std::memcpy(bounce_[b], (const uint8_t*) src + off, n);
+            STRATA_ZE_CHECK(zeCommandListAppendMemoryCopy(imm_, (uint8_t*) dst + off, bounce_[b], n, ev.ev_, 0, nullptr));
+            ev.recorded_ = true;
+            ev.dev_ = dev_;
+            after_append();
         } else {
-            STRATA_ZE_CHECK(zeCommandListAppendMemoryCopy(imm_, bounce_, (const uint8_t*) src + off, n, nullptr, 0, nullptr));
-            sync();
-            std::memcpy((uint8_t*) dst + off, bounce_, n);
+            STRATA_ZE_CHECK(zeCommandListAppendMemoryCopy(imm_, bounce_[b], (const uint8_t*) src + off, n, ev.ev_, 0, nullptr));
+            ev.recorded_ = true;
+            ev.dev_ = dev_;
+            ev.sync();
+            std::memcpy((uint8_t*) dst + off, bounce_[b], n);
         }
         g_count.copies.fetch_add(1, std::memory_order_relaxed);
     }
@@ -854,10 +993,14 @@ void Stream::memcpy_2d(void* dst, size_t dpitch, const void* src, size_t spitch,
         return;
     }
     std::lock_guard<std::recursive_mutex> lk(mu_);
-    if (kind_of(dst) == MemKind::Unknown || kind_of(src) == MemKind::Unknown) {
+    const size_t dspan = dpitch * (height - 1) + width, sspan = spitch * (height - 1) + width;
+    if (range_kind(dst, dspan, "2-D copy destination") == MemKind::Unknown ||
+        range_kind(src, sspan, "2-D copy source") == MemKind::Unknown) {
         for (size_t r = 0; r < height; ++r) memcpy((uint8_t*) dst + r * dpitch, (const uint8_t*) src + r * spitch, width);
         return;
     }
+    check_operand(src, "2-D copy source");
+    check_operand(dst, "2-D copy destination");
     const ze_copy_region_t dr{0, 0, 0, (uint32_t) width, (uint32_t) height, 1};
     const ze_copy_region_t sr{0, 0, 0, (uint32_t) width, (uint32_t) height, 1};
     STRATA_ZE_CHECK(zeCommandListAppendMemoryCopyRegion(target(), dst, &dr, (uint32_t) dpitch, 0, src, &sr, (uint32_t) spitch, 0,
@@ -876,6 +1019,7 @@ void Stream::fill(void* dst, const void* pattern, size_t pattern_bytes, size_t b
     if (bytes == 0) return;
     if (rt().trace) std::fprintf(stderr, "strata ze trace: stream %p fill %zu bytes at %p\n", (void*) this, bytes, dst);
     std::lock_guard<std::recursive_mutex> lk(mu_);
+    check_operand(dst, "fill");
     if (range_kind(dst, bytes, "fill") == MemKind::Unknown) {
         if (cap_) {
             std::fprintf(stderr, "strata ze: a fill of pageable host memory inside a capture (%p)\n", dst);
@@ -899,17 +1043,27 @@ void Stream::write_timestamp(uint64_t* dst) {
 
 void Stream::record(Event& e) {
     std::lock_guard<std::recursive_mutex> lk(mu_);
+    {
+        std::lock_guard<std::mutex> cl(rt().cap_mu);
+        if (e.captured_in_ != nullptr && e.captured_in_ != cap_) {
+            auto& v = e.captured_in_->events;
+            v.erase(std::remove(v.begin(), v.end(), &e), v.end());
+            e.captured_in_ = nullptr;
+        }
+        if (cap_ && e.captured_in_ == nullptr) cap_->events.push_back(&e);
+        e.captured_in_ = cap_;
+        e.replayed_ = false;
+    }
     if (cap_) {
         if (e.timing_) {
             STRATA_ZE_CHECK(zeCommandListAppendWriteGlobalTimestamp(cap_->list_, e.stamp_, nullptr, 0, nullptr));
             e.stamp_dev_ = cap_->dev;
             ++cap_->nodes;
         }
-        e.captured_in_ = cap_;
         e.recorded_ = true;
         return;
     }
-    e.captured_in_ = nullptr;
+    e.dev_ = dev_;
     if (e.timing_) {
         STRATA_ZE_CHECK(zeCommandListAppendWriteGlobalTimestamp(imm_, e.stamp_, nullptr, 0, nullptr));
         e.stamp_dev_ = dev_;
@@ -922,7 +1076,7 @@ void Stream::record(Event& e) {
 void Stream::wait(Event& e) {
     std::lock_guard<std::recursive_mutex> lk(mu_);
     if (!e.recorded_) return;
-    if (e.captured_in_ != nullptr) {
+    if (e.captured_in_ != nullptr && !e.replayed_) {
         Capture* c = e.captured_in_;
         if (cap_ == c) return;
         if (cap_ == nullptr && c->list_ != nullptr) {
@@ -934,10 +1088,7 @@ void Stream::wait(Event& e) {
             c->members.push_back(this);
             return;
         }
-        if (c->list_ == nullptr) {
-            std::fprintf(stderr, "strata ze: wait on an event recorded inside a finished capture\n");
-            std::exit(1);
-        }
+        if (c->list_ == nullptr) return;
         std::fprintf(stderr, "strata ze: a stream in one capture waited on an event of another capture\n");
         std::exit(1);
     }
@@ -945,29 +1096,44 @@ void Stream::wait(Event& e) {
         g_count.dropped_waits.fetch_add(1, std::memory_order_relaxed);
         return;
     }
+    if (e.dev_ >= 0 && e.dev_ != dev_) {
+        e.sync();
+        return;
+    }
     STRATA_ZE_CHECK(zeCommandListAppendWaitOnEvents(imm_, 1, &e.ev_));
     after_append();
 }
 
 void Stream::sync() {
-    std::lock_guard<std::recursive_mutex> lk(mu_);
-    g_count.host_waits.fetch_add(1, std::memory_order_relaxed);
-    if (rt().trace) std::fprintf(stderr, "strata ze trace: stream %p sync\n", (void*) this);
-    const ze_result_t r = zeCommandListHostSynchronize(imm_, UINT64_MAX);
-    if (r != ZE_RESULT_SUCCESS) fatal("zeCommandListHostSynchronize", r, __FILE__, __LINE__);
-    if (rt().trace) std::fprintf(stderr, "strata ze trace: stream %p sync done\n", (void*) this);
+    {
+        std::lock_guard<std::recursive_mutex> lk(mu_);
+        g_count.host_waits.fetch_add(1, std::memory_order_relaxed);
+        if (rt().trace) std::fprintf(stderr, "strata ze trace: stream %p sync\n", (void*) this);
+        const ze_result_t r = zeCommandListHostSynchronize(imm_, UINT64_MAX);
+        if (r != ZE_RESULT_SUCCESS) fatal("zeCommandListHostSynchronize", r, __FILE__, __LINE__);
+        if (rt().trace) std::fprintf(stderr, "strata ze trace: stream %p sync done\n", (void*) this);
+    }
+    wait_host_funcs();
 }
 
 bool Stream::sync_for(uint64_t timeout_ms) {
-    std::lock_guard<std::recursive_mutex> lk(mu_);
-    g_count.host_waits.fetch_add(1, std::memory_order_relaxed);
-    const ze_result_t r = zeCommandListHostSynchronize(imm_, timeout_ms * 1000000ull);
-    if (r == ZE_RESULT_NOT_READY) return false;
-    if (r != ZE_RESULT_SUCCESS) fatal("zeCommandListHostSynchronize", r, __FILE__, __LINE__);
-    return true;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    {
+        std::lock_guard<std::recursive_mutex> lk(mu_);
+        g_count.host_waits.fetch_add(1, std::memory_order_relaxed);
+        const ze_result_t r = zeCommandListHostSynchronize(imm_, timeout_ms * 1000000ull);
+        if (r == ZE_RESULT_NOT_READY) return false;
+        if (r != ZE_RESULT_SUCCESS) fatal("zeCommandListHostSynchronize", r, __FILE__, __LINE__);
+    }
+    std::unique_lock<std::mutex> hl(hf_mu_);
+    return hf_cv_.wait_until(hl, deadline, [&] { return hf_pending_ == 0; });
 }
 
 bool Stream::idle() {
+    {
+        std::lock_guard<std::mutex> hl(hf_mu_);
+        if (hf_pending_ > 0) return false;
+    }
     std::lock_guard<std::recursive_mutex> lk(mu_);
     const ze_result_t r = zeCommandListHostSynchronize(imm_, 0);
     if (r == ZE_RESULT_NOT_READY) return false;
@@ -1000,12 +1166,20 @@ Graph* Stream::end_capture() {
         std::fprintf(stderr, "strata ze: end_capture on a stream that is not capturing\n");
         std::exit(1);
     }
-    for (Stream* s : c->members) s->cap_ = nullptr;
+    for (Stream* s : c->members) {
+        if (s == this) {
+            cap_ = nullptr;
+            continue;
+        }
+        std::lock_guard<std::recursive_mutex> ml(s->mu_);
+        s->cap_ = nullptr;
+    }
     STRATA_ZE_CHECK(zeCommandListClose(c->list_));
     Graph* g = new Graph();
     g->list_ = c->list_;
     g->nodes_ = c->nodes;
     g->dev_ = c->dev;
+    g->cap_ = c;
     c->list_ = nullptr;
     c->members.clear();
     return g;
@@ -1022,11 +1196,28 @@ void Stream::launch(Graph& g) {
         std::exit(1);
     }
     STRATA_ZE_CHECK(zeCommandListImmediateAppendCommandListsExp(imm_, 1, &g.list_, nullptr, 0, nullptr));
+    if (g.cap_ != nullptr) {
+        std::lock_guard<std::mutex> cl(rt().cap_mu);
+        for (Event* e : g.cap_->events) {
+            STRATA_ZE_CHECK(zeCommandListAppendBarrier(imm_, e->ev_, 0, nullptr));
+            e->replayed_ = true;
+            e->dev_ = dev_;
+        }
+    }
     g_count.graph_launches.fetch_add(1, std::memory_order_relaxed);
     after_append();
 }
 
 Graph::~Graph() {
+    if (cap_ != nullptr) {
+        std::lock_guard<std::mutex> cl(rt().cap_mu);
+        for (Event* e : cap_->events) {
+            e->captured_in_ = nullptr;
+            if (!e->replayed_) e->recorded_ = false;
+            e->replayed_ = false;
+        }
+        delete cap_;
+    }
     if (list_) zeCommandListDestroy(list_);
 }
 
@@ -1059,12 +1250,8 @@ bool has_copy_engine(int ordinal) {
 
 void device_sync(int ordinal) {
     DeviceState& st = dev_state(ordinal);
-    std::vector<Stream*> ss;
-    {
-        std::lock_guard<std::mutex> lk(st.streams_mu);
-        ss = st.streams;
-    }
-    for (Stream* s : ss) s->sync();
+    std::lock_guard<std::mutex> lk(st.streams_mu);
+    for (Stream* s : st.streams) s->sync();
 }
 
 void sync_all() {
@@ -1077,6 +1264,17 @@ Event::Event(bool timing) : timing_(timing) {
 }
 
 Event::~Event() {
+    {
+        std::lock_guard<std::mutex> cl(rt().cap_mu);
+        if (captured_in_ != nullptr) {
+            auto& v = captured_in_->events;
+            v.erase(std::remove(v.begin(), v.end(), this), v.end());
+        }
+    }
+    if (ev_ && recorded_ && (captured_in_ == nullptr || replayed_)) {
+        const ze_result_t r = zeEventHostSynchronize(ev_, UINT64_MAX);
+        if (r == ZE_RESULT_ERROR_DEVICE_LOST) fatal("zeEventHostSynchronize (event destroyed)", r, __FILE__, __LINE__);
+    }
     if (ev_) {
         zeEventDestroy(ev_);
         Runtime& r = rt();
@@ -1087,7 +1285,7 @@ Event::~Event() {
 }
 
 bool Event::query() {
-    if (!recorded_ || captured_in_ != nullptr) return true;
+    if (!recorded_ || (captured_in_ != nullptr && !replayed_)) return true;
     const ze_result_t r = zeEventQueryStatus(ev_);
     if (r == ZE_RESULT_NOT_READY) return false;
     if (r != ZE_RESULT_SUCCESS) fatal("zeEventQueryStatus", r, __FILE__, __LINE__);
@@ -1095,7 +1293,7 @@ bool Event::query() {
 }
 
 void Event::sync() {
-    if (!recorded_ || captured_in_ != nullptr) return;
+    if (!recorded_ || (captured_in_ != nullptr && !replayed_)) return;
     g_count.host_waits.fetch_add(1, std::memory_order_relaxed);
     const ze_result_t r = zeEventHostSynchronize(ev_, UINT64_MAX);
     if (r != ZE_RESULT_SUCCESS) fatal("zeEventHostSynchronize", r, __FILE__, __LINE__);

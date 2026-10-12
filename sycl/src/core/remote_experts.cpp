@@ -1,5 +1,6 @@
 #include "strata/ze/ze.hpp"
 #include "strata/core/remote_experts.hpp"
+#include "strata/core/on_device.hpp"
 
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/iq_kernels.hpp"
@@ -27,15 +28,6 @@ struct RemoteMeta {
     int32_t count;
 };
 
-struct DeviceScope {
-    int previous = -1;
-    explicit DeviceScope(int device) {
-        previous = strata::ze::current_device();
-        strata::ze::set_device(device);
-    }
-    ~DeviceScope() { if (previous >= 0) strata::ze::set_device(previous); }
-};
-
 bool check(bool ok, const char *what, std::string &err, int device) {
     if (ok) return true;
     err = "CUDA" + std::to_string(device) + " experts: " + what + ": failed";
@@ -52,12 +44,7 @@ bool RemoteExperts::preflight(int device, double &free_gib,
         err = "CUDA" + std::to_string(device) + " experts: CUDA device is not visible";
         return false;
     }
-    // The layer waits for this GPU on the CPU pool's critical path: spin instead of sleeping, whose wake-up
-    // costs more than a small expert batch takes (measured: ~0.3 ms per round trip on Windows).  Only possible
-    // before the device's context exists, so first thing; STRATA_REMOTE_SPIN=0 keeps the driver's default.
-    const char* spin = std::getenv("STRATA_REMOTE_SPIN");
-    (void) spin;   // no cudaInitDevice scheduling flags on Level Zero; the runtime picks its own wait policy
-    DeviceScope scope(device);
+    const OnDevice scope(device);
     size_t free_bytes = 0, total_bytes = 0;
     if (!check(strata::ze::mem_get_info(device, &free_bytes, &total_bytes),
                "preflight free memory", err, device)) return false;
@@ -67,7 +54,7 @@ bool RemoteExperts::preflight(int device, double &free_gib,
 
 void RemoteExperts::close() {
     if (device_ < 0) return;
-    DeviceScope scope(device_);
+    const OnDevice scope(device_);
     if (stream_) stream_->sync();
     cache_.close();
     if (d_x_) strata::ze::free(d_x_);
@@ -104,7 +91,7 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
         err = "CUDA" + std::to_string(device) + " experts: need the device, ranked experts and positive slot count";
         return false;
     }
-    DeviceScope scope(device);
+    const OnDevice scope(device);
     device_ = device;
     n_expert_ = experts;
     const auto& lay = strata::kernels::cpu::expert_layout();
@@ -271,7 +258,7 @@ bool RemoteExperts::begin(int64_t layer, const float *x, const int32_t *ids,
     std::memcpy(meta->dst, dst_.data(), dst_.size() * sizeof(dst_[0]));
     std::memcpy(meta->tok, tok_.data(), tok_.size() * sizeof(tok_[0]));
     meta->count = (int32_t) group_id_.size();
-    DeviceScope scope(device_);
+    const OnDevice scope(device_);
     groups_ = (int32_t) group_id_.size();
     strata::ze::Stream* const s = stream_;
     if (!zero_copy_) s->memcpy(d_x_, h_x_, (size_t)n_tok * H * sizeof(float));
@@ -298,7 +285,7 @@ bool RemoteExperts::begin(int64_t layer, const float *x, const int32_t *ids,
 
 bool RemoteExperts::finish(float *out, std::string &err) {
     if (group_id_.empty()) return true;
-    DeviceScope scope(device_);
+    const OnDevice scope(device_);
     const auto w0 = std::chrono::steady_clock::now();
     stream_->sync();
     ms_wait_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count();
