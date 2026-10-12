@@ -123,10 +123,6 @@ bool exchange_cache_complement(std::vector<uint64_t>& offsets, size_t in, size_t
 /// cache, and because a test can supply an in-memory source without a 34 GB artifact.
 class ExpertSource {
 public:
-    /*
-    DPCT1109: Virtual functions cannot be called in SYCL device code. You
-    need to adjust the code.
-    */
     virtual ~ExpertSource() = default;
 
     /// The expert-layout blob for `(layer, expert)`, or nullptr if it cannot be produced.

@@ -1,4 +1,5 @@
-// include/strata/sycl_doorbell.hpp - the SYCL port: host<->device flag traffic that must bypass the GPU's caches.
+// include/strata/sycl_doorbell.hpp - host<->device flag traffic that must bypass the GPU's caches: the device side (SYCL device
+// code, compiled offline) and the host side (the bounds and switches the launchers pass in).
 //
 // Strata's decode loop is a handshake through host-mapped memory: the GPU rings a sequence number the host polls,
 // and a one-thread kernel spins on a flag the host writes. In CUDA those are `volatile` loads and stores, which
@@ -7,22 +8,19 @@
 // Atomic loads and stores with system scope are the accesses that go to memory, so every side of the handshake
 // goes through these two.
 #pragma once
-#include <sycl/sycl.hpp>
-#include <sycl/ext/intel/experimental/cache_control_properties.hpp>
+
+#include "strata/port.hpp"
+
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
-#include <atomic>
-#include <unordered_map>
 #include <mutex>
 #include <string>
-#include "strata/sycl_queue.hpp"
+
+#if defined(SYCL_LANGUAGE_VERSION)
+#include <sycl/ext/intel/experimental/cache_control_properties.hpp>
 
 namespace strata {
-// STRATA_SYCL_A770_FAST=1 (opt-in, experimental, PR #1710): the A770 router and 64-bit paired payload transfers.
-inline bool a770_fast() {
-    static const bool on = [] { const char* v = std::getenv("STRATA_SYCL_A770_FAST"); return v != nullptr && v[0] == '1'; }();
-    return on;
-}
 using sys_atomic_u32 = sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::system>;
 
 // Payload pairs use 64-bit transactions; flags remain 32-bit. Keep the same
@@ -103,6 +101,18 @@ template<class T> inline void sys_store_mapped(T* p, T v) {
 template<class T> inline void sys_store_mapped(bool plain, T* p, T v) {
     if (plain) *p = v; else sys_store_mapped(p, v);
 }
+}  // namespace strata
+
+#else
+
+#include "strata/intel_gpu.hpp"
+
+namespace strata {
+// STRATA_SYCL_A770_FAST=1 (opt-in, experimental, PR #1710): the A770 router and 64-bit paired payload transfers.
+inline bool a770_fast() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_SYCL_A770_FAST"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
 inline bool doorbell_plain_payload() {
     static const bool v = [] {
         if (const char* e = std::getenv("STRATA_DOORBELL_PLAIN")) return e[0] == '1';
@@ -123,7 +133,7 @@ inline bool doorbell_plain_payload() {
 // layers) is slower than that, the GPU gave up, went on with the experts' outputs missing, and the answer was token 0
 // ("!!!!!") or the engine crashed in the CPU pool on the garbage routing it read next.
 // STRATA_SPIN_MAX=<reads> overrides both; a build's -DSTRATA_SYCL_SPIN_MAX=<reads> (CMake) fixes one bound for every
-// device. The device functions take the bound as an argument: the launchers pass spin_max(queue).
+// device. The device functions take the bound as an argument: the launchers pass spin_max(device).
 // Without a sysfs driver name (Windows, OpenCL) a B-series card is recognised from the device itself (intel_gpu_gen):
 // its window waits are the xe kind (expected to expire, so 20,000 reads), EXCEPT in a run that drafts without the MTP
 // layer (--spec N, no --mtp): the suffix drafter's own waits have to complete there, and 20,000 reads left it empty-handed
@@ -131,13 +141,12 @@ inline bool doorbell_plain_payload() {
 // launch. A Linux xe card keeps 20,000 in every mode (unchanged).
 inline std::atomic<bool>& spin_long_drafts_flag() { static std::atomic<bool> f{false}; return f; }
 inline void spin_drafts_need_long_bound(bool on) { spin_long_drafts_flag() = on; }
-inline uint32_t spin_max(const sycl::queue& q) {
+inline uint32_t spin_max(int ordinal = -1) {
     static std::mutex mu;
-    static std::unordered_map<sycl::device, uint32_t> cache;
-    const sycl::device d = q.get_device();
+    static uint32_t cache[ze::kMaxDevices] = {};
+    const int d = ordinal < 0 ? ze::current_device() : ordinal;
     std::lock_guard<std::mutex> lk(mu);
-    auto it = cache.find(d);
-    if (it != cache.end()) return it->second;
+    if (cache[d] != 0) return cache[d];
     uint32_t v;
     if (const char* e = std::getenv("STRATA_SPIN_MAX"); e && std::atol(e) > 0) v = (uint32_t) std::atol(e);
 #ifdef STRATA_SYCL_SPIN_MAX
@@ -148,7 +157,9 @@ inline uint32_t spin_max(const sycl::queue& q) {
         v = spin_long_drafts_flag().load() ? 2000000u : 20000u;
     else v = 2000000u;
 #endif
-    cache.emplace(d, v);
+    cache[d] = v;
     return v;
 }
 }  // namespace strata
+
+#endif

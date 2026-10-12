@@ -15,9 +15,7 @@
 // holds into the peer's least-used slots (per layer, so a slot keeps its layer's blob size).
 #pragma once
 
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
+#include "strata/ze/ze.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_source.hpp"
 
@@ -92,9 +90,8 @@ private:
     std::vector<int32_t> res_;                        ///< [n_layers * n_expert] -> peer slot or -1
     std::vector<std::pair<int32_t, int32_t>> pending_;   ///< (residency index, slot) once the copies land
     int64_t resident_ = 0, entries_ = 0, experts_ = 0, swaps_ = 0;
-    dpct::queue_ptr stream_ = &dpct::get_in_order_queue(),
-                    refill_ = &dpct::get_in_order_queue();
-    dpct::event_ptr refill_ev_ = nullptr;
+    strata::ze::Stream* stream_ = &strata::ze::default_stream(), *refill_ = &strata::ze::default_stream();
+    strata::ze::Event* refill_ev_ = nullptr;
     float* h_x_ = nullptr;   float* d_x_ = nullptr;   // n_tok x n_embd
     float* h_out_ = nullptr; float* d_out_ = nullptr; // compact rows
     void* h_meta_ = nullptr; void* d_meta_ = nullptr; // groups: ptr | start | dst | tok | count

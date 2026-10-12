@@ -1,7 +1,6 @@
 #pragma once
 
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
+#include "strata/ze/ze.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_source.hpp"
 
@@ -60,7 +59,7 @@ private:
     uint64_t full_row_bytes_ = 0;
     double ms_begin_ = 0, ms_wait_ = 0;
     ExpertCache cache_;
-    dpct::queue_ptr stream_ = &dpct::get_in_order_queue();
+    strata::ze::Stream* stream_ = &strata::ze::default_stream();
     float* h_x_ = nullptr;
     float* h_out_ = nullptr;
     void* h_meta_ = nullptr;

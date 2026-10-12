@@ -31,8 +31,7 @@
 // into the driver on this machine, and a layer with 8 submissions is ~0.1 ms of round trip.
 #pragma once
 
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
+#include "strata/ze/ze.hpp"
 #include <cstdint>
 #include <cstring>
 #include <functional>
@@ -46,7 +45,7 @@ namespace strata::core {
 enum class LayerType : int { GDN = 0, QSA = 1 };
 inline const char* to_string(LayerType t) { return t == LayerType::GDN ? "GDN" : "QSA"; }
 
-/// One recorded graph.  Move-only: it owns a `cudaGraphExec_t` and an event, and two owners would
+/// One recorded graph.  Move-only: it owns a recorded command list and an event, and two owners would
 /// double-destroy.
 class CapturedGraph {
 public:
@@ -74,14 +73,12 @@ public:
     bool wait_ms(int timeout_ms) const;
 
     size_t nodes() const { return nodes_; }
-    bool valid() const { return exec_ != nullptr; }
+    bool valid() const { return graph_ != nullptr; }
 
 private:
     void reset();
-    dpct::experimental::command_graph_ptr graph_ = nullptr;
-    dpct::experimental::command_graph_exec_ptr exec_ = nullptr;
-    dpct::event_ptr done_ = nullptr;
-    mutable std::chrono::time_point<std::chrono::steady_clock> done__ct1;
+    strata::ze::Graph* graph_ = nullptr;
+    strata::ze::Event* done_ = nullptr;
     size_t nodes_ = 0;
 };
 

@@ -14,9 +14,7 @@
 // enters once, here, at build time (`rope_scaling.hpp`).
 #pragma once
 
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
+#include "strata/port.hpp"
 #include <cstdint>
 
 #include "strata/kernels/rope_scaling.hpp"

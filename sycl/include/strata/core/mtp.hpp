@@ -19,8 +19,7 @@
 //   * all 512 routed experts live in VRAM (708 MB) and run through the grouped hit kernels.
 #pragma once
 
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
+#include "strata/ze/ze.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
 #include "strata/kernels/sampler.hpp"
@@ -93,7 +92,7 @@ public:
     /// --pipeline-windows: capture the prefill graphs and size its input records for windows of up to max_t rows now,
     /// so a later prefill(sync = false) of a window neither captures nor allocates (both wait for the device).
     bool prepare_prefill(std::string& err);
-    dpct::queue_ptr stream() const { return cs_; }
+    strata::ze::Stream* stream() const { return cs_; }
 
     /// One round: catch-up over T cells from `p` (rows = the window's final residuals, `tokens` = the window's
     /// argmaxes: row t pairs R_{p+t} with the token at p+t+1), then the draft chain from row `a` (the last
@@ -152,39 +151,33 @@ public:
     QsaState& kv_state_rw() { return st_; }
     int64_t first_needed() const { return (window_ > 0 && prompt_len_ > 0) ? prompt_len_ - window_ - 64 : 0; }
     int device() const { return device_; }
-    bool idle(std::string &err) try {
-        if (cs_ && DPCT_CHECK_ERROR(cs_->wait()) != 0) {
-            err = "mtp: its stream failed"; return false;
-        }
+    bool idle(std::string &err) {
+        (void) err;
+        if (cs_) cs_->sync();
         return true;
-    }
-    catch (sycl::exception const &exc) {
-      std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-                << ", line:" << __LINE__ << std::endl;
-      std::exit(1);
     }
 
 private:
-    bool record_forward(int T, int step_row0, dpct::queue_ptr cs,
+    bool record_forward(int T, int step_row0, strata::ze::Stream* cs,
                         std::string &err);
     /// The layer's front for T rows at step rows [row0, +T): the embedding, the fc projections, the attention
     /// hyper-connection read (R_, inj_, mixed_) and the K/V appended.
-    bool record_front(int T, int row0, dpct::queue_ptr cs, std::string &err);
+    bool record_front(int T, int row0, strata::ze::Stream* cs, std::string &err);
     /// The rest for row 0 at step row `step_row`: the attention from the q projection, the MLP, the final mixer,
     /// the head, the draft and its probability.  Needs row 0's R_, inj_ and mixed_ (its q8_1 rows in xq_).
-    bool record_rest(int step_row, dpct::queue_ptr cs, std::string &err);
+    bool record_rest(int step_row, strata::ze::Stream* cs, std::string &err);
     void norm_rope(float *data, const float *gamma, int rows, int cols,
-                   const int32_t *p, dpct::queue_ptr cs);
+                   const int32_t *p, strata::ze::Stream* cs);
     bool capture_prefill(int T, std::string& err);
     bool capture_prefill_dev(int T, std::string& err);   ///< E-4: without the mapped staging (inputs copied on device)
     bool capture_round(int T, bool coupled, std::string& err);
     bool capture_step(int j, bool coupled, std::string& err);
-    dpct::experimental::command_graph_exec_ptr step_exec_[9] = {};
+    strata::ze::Graph* step_exec_[9] = {};
     // coupled draft sampling: its own round/step graphs (the argmax ones stay as they were), the request's
     // parameters and the penalty ring (mapped staging + device copies), the split scratch, token id -> subset index
     bool setup_coupled(std::string& err);
-    dpct::experimental::command_graph_exec_ptr round_exec_c_[9] = {};
-    dpct::experimental::command_graph_exec_ptr step_exec_c_[9] = {};
+    strata::ze::Graph* round_exec_c_[9] = {};
+    strata::ze::Graph* step_exec_c_[9] = {};
     bool coupled_ok_ = false, coupled_active_ = false;
     bool coupled_rec_ = false;   ///< record_forward: the full layer ends in the coupled sampler (draft coupled_j_)
     int coupled_j_ = 0;
@@ -223,24 +216,24 @@ private:
     bool force_on_ = false, chain_live_ = false;
     const float* src_R_ = nullptr;
     int32_t *h_force_ = nullptr, *m_force_ = nullptr;   ///< the forced tokens (mapped), -1 = the step's own pick
-    dpct::event_ptr ev_chain_ = nullptr;
-    dpct::event_ptr ev_step_[8] =
+    strata::ze::Event* ev_chain_ = nullptr;
+    strata::ze::Event* ev_step_[8] =
         {}; ///< after each of the first n_early outputs
     int steps_seen_ = 0, chain_n_ = 0, chain_early_ = 0;
     int32_t chain_tok_[8] = {};
     float chain_prob_[8] = {};
     int64_t n_vocab_ = 0;
     uint64_t vram_ = 0;
-    dpct::queue_ptr cs_ = nullptr;   // load() creates it; not the device's queue, which ~MtpDrafter would destroy
-    dpct::experimental::command_graph_exec_ptr prefill_exec_[9] = {};
-    dpct::experimental::command_graph_exec_ptr prefill_dev_exec_[9] = {};
+    strata::ze::Stream* cs_ = nullptr;   // load() creates it; not the device's queue, which ~MtpDrafter would destroy
+    strata::ze::Graph* prefill_exec_[9] = {};
+    strata::ze::Graph* prefill_dev_exec_[9] = {};
     int32_t* pf_dev_ = nullptr;   ///< E-4: a prompt's rows' token / step / position records, uploaded at once
     int64_t pf_cap_ = 0;          ///< its capacity in ints
-    dpct::queue_ptr side_ =
-        &dpct::get_in_order_queue(); // the shared expert's branch of the draft
+    strata::ze::Stream* side_ =
+        &strata::ze::default_stream(); // the shared expert's branch of the draft
                                      // graphs (CUDA)
-    dpct::event_ptr sh_fork_ = nullptr, sh_join_ = nullptr;
-    dpct::experimental::command_graph_exec_ptr round_exec_[9] = {};
+    strata::ze::Event* sh_fork_ = nullptr, *sh_join_ = nullptr;
+    strata::ze::Graph* round_exec_[9] = {};
 
     struct Tensor { std::string name, kind; int64_t rows = 0, cols = 0; uint64_t off = 0, bytes = 0; };
     std::vector<Tensor> tensors_;

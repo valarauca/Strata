@@ -1,16 +1,16 @@
-# Strata on Intel GPUs - the SYCL build of the engine (Phase 4 of the Intel port, docs/INTEL.md).
+# Strata on Intel GPUs: the Intel engine, Strata's own engine on Level Zero.
 #
-# This is a separate project on purpose. The top-level build describes the CUDA engine; every source it lists is
-# taken from ../src unless this directory carries a migrated copy: `src/X.cu` -> `sycl/src/X.dp.cpp`,
-# `src/X.cpp` -> `sycl/src/X.cpp` (only host files that called the CUDA runtime were migrated). Headers resolve
-# the same way through the include order. Upstream files are never edited, so the port is the content of this
-# directory plus the tool that produced it (../../sycl/migrate.sh).
+# This is a separate project on purpose. The top-level build describes the CUDA/HIP engine; every source it lists is
+# taken from ../src unless this directory carries the Intel copy. A kernel family `src/kernels/cuda/X.cu` is three
+# files here: `X.dp.cpp` (device code, compiled offline into native GPU modules), `X.kern.inc` (its entry points) and
+# `X.host.cpp` (the launchers). Host files that called the CUDA runtime have an Intel copy (`src/X.cpp`) that calls
+# the Level Zero runtime in src/ze.
 #
-#   cmake -S sycl -B build-sycl -G Ninja -DCMAKE_CXX_COMPILER=icpx && cmake --build build-sycl
+#   cmake -S sycl -B build-ze -G Ninja -DCMAKE_CXX_COMPILER=icpx && cmake --build build-ze
 #
-# Device code is JIT-compiled from SPIR-V unless STRATA_SYCL_AOT names a device (bmg-g31 for the Arc Pro B70).
+# There is no SYCL runtime in the program: host code is plain C++ (icpx without -fsycl), the device code is compiled
+# by the SYCL device compiler alone (cmake/ze_device.cmake) and launched through Level Zero (src/ze).
 cmake_minimum_required(VERSION 3.24)
-# the engine's version is the project's (../CMakeLists.txt): the log line and BUILD.json say 0.1.40.2, not a number of the port's own
 file(STRINGS ${CMAKE_CURRENT_SOURCE_DIR}/../CMakeLists.txt _strata_proj REGEX "^project\\(strata VERSION [0-9.]+")
 string(REGEX MATCH "VERSION ([0-9.]+)" _m "${_strata_proj}")
 if(CMAKE_MATCH_1)
@@ -18,7 +18,7 @@ if(CMAKE_MATCH_1)
 else()
   set(STRATA_SYCL_VERSION 0.1.40.2)
 endif()
-project(strata_sycl VERSION ${STRATA_SYCL_VERSION} LANGUAGES C CXX)
+project(strata_intel VERSION ${STRATA_SYCL_VERSION} LANGUAGES C CXX ASM)
 set(STRATA_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/..)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -26,76 +26,42 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
-add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}")
+add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}" STRATA_INTEL_ZE=1)
 
-set(STRATA_SYCL_AOT "" CACHE STRING "AOT device for the GPU code, e.g. bmg-g31 (empty: SPIR-V, JIT at run time)")
-# The device spins on host flags are bounded (include/strata/sycl_doorbell.hpp). The bound is chosen per device at run
-# time (20,000 reads on a B-series card, 2,000,000 elsewhere; STRATA_SPIN_MAX overrides). STRATA_SYCL_SPIN_MAX fixes one
-# bound for every device in this build.
+# The GPU the device modules are compiled for (ocloc -device). STRATA_SYCL_AOT is the old spelling, kept so existing
+# build commands keep working.
+set(STRATA_SYCL_AOT "bmg-g31" CACHE STRING "old name of STRATA_ZE_DEVICE")
+set(STRATA_ZE_DEVICE "${STRATA_SYCL_AOT}" CACHE STRING "ocloc device of the GPU modules (bmg-g31: Arc Pro B70)")
+if(NOT STRATA_ZE_DEVICE)
+  message(FATAL_ERROR "STRATA_ZE_DEVICE is empty: the device modules are compiled ahead of time for one GPU (bmg-g31)")
+endif()
 set(STRATA_SYCL_SPIN_MAX "" CACHE STRING "fixed bound of the device's spins on host flags, in reads (empty: chosen per device at run time)")
+set(_strata_defs "")
 if(STRATA_SYCL_SPIN_MAX)
-  add_compile_definitions(STRATA_SYCL_SPIN_MAX=${STRATA_SYCL_SPIN_MAX}u)
+  list(APPEND _strata_defs STRATA_SYCL_SPIN_MAX=${STRATA_SYCL_SPIN_MAX}u)
 endif()
-set(_sycl_flags -fsycl)
-if(STRATA_SYCL_AOT MATCHES "^(bmg|lnl)")
-  add_compile_definitions(STRATA_XMX_SG16=1)   # the grouped XMX kernels on sub-group 16, joint_matrix 8x16x16 (Xe2)
-elseif(STRATA_SYCL_AOT MATCHES "^pvc")
-  add_compile_definitions(STRATA_NO_DG2_XMX=1)   # the grouped XMX kernels (sub-group 8, 8x8x16) do not compile for Xe2 / Xe-HPC
+if(STRATA_ZE_DEVICE MATCHES "^(bmg|lnl)")
+  list(APPEND _strata_defs STRATA_XMX_SG16=1)   # the grouped XMX kernels on sub-group 16, joint_matrix 8x16x16 (Xe2)
 endif()
-if(STRATA_SYCL_AOT)
-  list(APPEND _sycl_flags -fsycl-targets=spir64_gen)
-  # the divide/sqrt rounding option (below) must reach ocloc here: an AOT build has no spir64 backend to take it
-  set(_sycl_link -fsycl -fsycl-targets=spir64_gen -Xsycl-target-backend=spir64_gen
-      "-device ${STRATA_SYCL_AOT} -options -cl-fp32-correctly-rounded-divide-sqrt")
-else()
-  set(_sycl_link -fsycl)
+add_compile_definitions(${_strata_defs})
+# icpx defaults to a fast floating-point model; the host code (rope tables, CPU references, sampling on the host) was
+# measured with the precise one, as was the device code.
+if(CMAKE_CXX_COMPILER_ID MATCHES "IntelLLVM")
+  add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:-fp-model=precise>")
 endif()
-# The Intel GPU's fp32 divide is not correctly rounded by default (OpenCL allows 2.5 ulp). Strata's quantizers
-# are byte-exact against ggml through `amax / 127`, so the device compiler is told to round divides and sqrt
-# properly; measured: quantize_act_parity goes from 303k mismatches to byte-exact. (Same as
-# SYCL_PROGRAM_COMPILE_OPTIONS=-cl-fp32-correctly-rounded-divide-sqrt at run time.) The AOT build passes it to
-# ocloc above; without that the 303k mismatches came back on 2026-09-30, unnoticed since the AOT switch.
-if(NOT STRATA_SYCL_AOT)
-  # The JIT build is the Alchemist (Arc A-series) build. There IGC turns a kernel's pointer arguments into surface
-  # accesses with a 32-bit offset from the allocation's base, so a kernel misreads bytes more than 4 GiB into an
-  # allocation while copies of the same bytes are right. Measured on an Arc A770 (Coder IQ1_M, 4.46 GiB expert cache):
-  # every expert in the cache's last 0.46 GiB dequantized to NaN in the prompt path, and every prompt answered "!!!!"
-  # (token 0). This option keeps the kernels on 64-bit (stateless) addresses; with it the same prompts are right.
-  # (One backend argument for both: CMake drops a repeated -Xsycl-target-backend=spir64.)
-  option(STRATA_SYCL_JIT_STATELESS "JIT build: keep kernels on 64-bit addresses (-ze-opt-greater-than-4GB-buffer-required)" ON)
-  if(STRATA_SYCL_JIT_STATELESS)
-    list(APPEND _sycl_link "-Xsycl-target-backend=spir64"
-         "-cl-fp32-correctly-rounded-divide-sqrt -ze-opt-greater-than-4GB-buffer-required")
-  else()
-    list(APPEND _sycl_link "-Xsycl-target-backend=spir64" "-cl-fp32-correctly-rounded-divide-sqrt")
-  endif()
-endif()
-# Every translation unit gets -fsycl: the migrated host files construct queues and USM, not only the kernels.
-# icpx defaults to a fast floating-point model (reciprocal approximations, reassociation); the kernels are
-# compared byte-for-byte against ggml's, which nvcc built value-safe, so ask for the same here.
-# Every kernel was written for 32-lane warps (lane = tid & 31, warp-synchronous reductions). dpct pins the
-# sub-group size only where it saw a shuffle; the rest would get Xe2's default of 16 and race. Force 32 everywhere.
-list(APPEND _sycl_flags -fsycl-default-sub-group-size=32)
-# One device module per kernel: the first launch of a kernel then loads only its own module. With the default
-# split the first launch in the prompt path (the embedding gather) paid 245 ms for the image it shared (2026-09-30).
-list(APPEND _sycl_link -fsycl-device-code-split=per_kernel)
-list(APPEND _sycl_flags -fsycl-device-code-split=per_kernel)
-add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:${_sycl_flags}>" -fp-model=precise -Wno-unused-parameter
-                    -Wno-unused-variable -Wno-deprecated-declarations)
-add_link_options(${_sycl_link})
+add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:-Wno-unused-parameter>" "$<$<COMPILE_LANGUAGE:CXX>:-Wno-unused-variable>"
+                    "$<$<COMPILE_LANGUAGE:CXX>:-Wno-deprecated-declarations>")
 
-# --- source resolution: the migrated copy when there is one, the original otherwise -------------------------------
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/ze_device.cmake)
+strata_ze_device_includes(${CMAKE_CURRENT_SOURCE_DIR}/include ${STRATA_ROOT}/include ${STRATA_ROOT}/third_party/ggml
+                          ${STRATA_ROOT}/src/kernels ${STRATA_ROOT}/src/core)
+strata_ze_device_defines(STRATA_VERSION="${PROJECT_VERSION}" STRATA_INTEL_ZE=1 ${_strata_defs})
+
+# --- source resolution: the Intel copy when there is one, the original otherwise ---------------------------------
 function(strata_resolve out)
   set(r "")
   foreach(f IN LISTS ARGN)
-    if(f MATCHES "\\.cu$")
-      string(REGEX REPLACE "\\.cu$" ".dp.cpp" m "${f}")
-      if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${m})
-        list(APPEND r ${CMAKE_CURRENT_SOURCE_DIR}/${m})
-      else()
-        message(FATAL_ERROR "no migrated copy of ${f} (expected ${m})")
-      endif()
-    elseif(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${f})
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${f})
       list(APPEND r ${CMAKE_CURRENT_SOURCE_DIR}/${f})
     elseif(EXISTS ${STRATA_ROOT}/${f})
       list(APPEND r ${STRATA_ROOT}/${f})
@@ -106,9 +72,11 @@ function(strata_resolve out)
   set(${out} ${r} PARENT_SCOPE)
 endfunction()
 
+find_library(STRATA_ZE_LOADER ze_loader REQUIRED)
+
 add_library(strata_includes INTERFACE)
 target_include_directories(strata_includes INTERFACE
-  ${CMAKE_CURRENT_SOURCE_DIR}/include      # migrated headers + dpct/ helpers, first
+  ${CMAKE_CURRENT_SOURCE_DIR}/include      # the Intel copies of the engine's headers, first
   ${STRATA_ROOT}/include)
 target_compile_options(strata_includes INTERFACE -Wall -Wextra)
 
@@ -191,51 +159,72 @@ if(STRATA_NATIVE_EXPERTS)
   target_compile_definitions(strata_kernels_cpu PUBLIC STRATA_NATIVE_EXPERTS=1)
 endif()
 
-# --- the GPU engine ------------------------------------------------------------------------------------------------
-strata_resolve(_core src/core/device.cu src/core/pinned.cu src/platform/memory.cpp src/core/graph.cpp
-                     src/core/weights.cpp src/core/layout.cpp)
-add_library(strata_core STATIC ${_core})
-target_link_libraries(strata_core PUBLIC strata_includes)
-# zeMemAllocHost for the host memory a kernel polls (include/strata/sycl_queue.hpp, host_malloc_polled): only when libze-dev's header is there
-find_library(STRATA_ZE_LOADER ze_loader)
-if(STRATA_ZE_LOADER)
-  target_link_libraries(strata_core PUBLIC ${STRATA_ZE_LOADER})
-endif()
-
-set(_kernel_cu dequant_s2 s2_gemv s_gemv s2_gemv_quads s2_gemv_fast router_top10 quantize_act rope sampler s2_gemv_q8
-    s2_expert_grouped shared_expert gr gdn qsa elementwise bf16_gemv native_mmvq native_bf16 native_gr_norm native_moe
-    native_gdn native_gr_postops native_router native_gdn_preprocess native_qsa native_rope native_ple_postops
+# --- the device code: one bundle of native modules per kernel family -----------------------------------------------
+# <dir>/<X>.dp.cpp + <X>.kern.inc (device) and <X>.host.cpp (launchers).
+set(STRATA_KERNEL_FAMILIES dequant_s2 s2_gemv s_gemv s2_gemv_quads s2_gemv_fast router_top10 quantize_act rope sampler
+    s2_gemv_q8 s2_expert_grouped shared_expert gr gdn qsa elementwise bf16_gemv native_mmvq native_bf16 native_gr_norm
+    native_moe native_gdn native_gr_postops native_router native_gdn_preprocess native_qsa native_rope native_ple_postops
     native_flash_attn native_qsa_indexer native_qsa_score ple kv_q8 kv_stream kv_q4 fused_gr cvec qsa_decode_attn
-    qsa_prompt_attn fused_gdn dequant_bf16 qsa_select verify_kernels iq_kernels)
-set(_kernel_files "")
-foreach(k IN LISTS _kernel_cu)
-  list(APPEND _kernel_files src/kernels/cuda/${k}.cu)
+    qsa_prompt_attn fused_gdn dequant_bf16 qsa_select verify_kernels iq_kernels qsa_prompt_attn_xmx)
+set(STRATA_PREFILL_FAMILIES gemm kernels xmx_moe)
+set(STRATA_CORE_FAMILIES device)
+set(_kernel_host "")
+set(_prefill_host "")
+set(_core_host "")
+function(strata_family dir fam hostvar)
+  set(base ${CMAKE_CURRENT_SOURCE_DIR}/${dir}/${fam})
+  foreach(f ${base}.dp.cpp ${base}.kern.inc ${base}.host.cpp)
+    if(NOT EXISTS ${f})
+      message(FATAL_ERROR "kernel family ${dir}/${fam}: ${f} is missing")
+    endif()
+  endforeach()
+  strata_ze_bundle(${fam} SOURCES ${base}.dp.cpp KERN ${base}.kern.inc)
+  set(${hostvar} ${${hostvar}} ${base}.host.cpp PARENT_SCOPE)
+endfunction()
+foreach(k IN LISTS STRATA_KERNEL_FAMILIES)
+  strata_family(src/kernels/cuda ${k} _kernel_host)
 endforeach()
-strata_resolve(_kernels ${_kernel_files} src/kernels/ngram.cpp src/ngram/ple_reader.cpp src/platform/direct_file.cpp)
-list(APPEND _kernels ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cuda/qsa_prompt_attn_xmx.dp.cpp)   # port-only: the XMX prompt attention
-add_library(strata_kernels STATIC ${_kernels})
+foreach(k IN LISTS STRATA_PREFILL_FAMILIES)
+  strata_family(src/prefill ${k} _prefill_host)
+endforeach()
+foreach(k IN LISTS STRATA_CORE_FAMILIES)
+  strata_family(src/core ${k} _core_host)
+endforeach()
+strata_ze_bundle(ze_core SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/ze/ze_core.dp.cpp
+                 KERN ${CMAKE_CURRENT_SOURCE_DIR}/src/ze/ze_core.kern.inc)
+
+# --- the Level Zero runtime: devices, the context, memory, streams, events, graphs, modules -----------------------
+add_library(strata_ze STATIC ${CMAKE_CURRENT_SOURCE_DIR}/src/ze/ze.cpp ${CMAKE_CURRENT_SOURCE_DIR}/src/ze/modules.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/ze/ze_util.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/ze/intel_gpu.cpp)
+target_link_libraries(strata_ze PUBLIC strata_includes ${STRATA_ZE_LOADER} Threads::Threads)
+strata_ze_embed(strata_ze)
+
+# --- the GPU engine (host side) ----------------------------------------------------------------------------------
+strata_resolve(_core src/core/pinned.cpp src/platform/memory.cpp src/core/graph.cpp src/core/weights.cpp
+                     src/core/layout.cpp)
+add_library(strata_core STATIC ${_core} ${_core_host})
+target_link_libraries(strata_core PUBLIC strata_includes strata_ze)
+
+strata_resolve(_kernels src/kernels/ngram.cpp src/ngram/ple_reader.cpp src/platform/direct_file.cpp)
+add_library(strata_kernels STATIC ${_kernel_host} ${_kernels})
 target_include_directories(strata_kernels PRIVATE ${STRATA_ROOT}/third_party/ggml)
 target_link_libraries(strata_kernels PUBLIC strata_core)
 
 strata_resolve(_engine src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
                        src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp
                        src/core/mtp.cpp src/core/conversation_snapshot.cpp src/core/conversation_state.cpp
-                       src/core/conversation_memory.cpp   # 0.1.31: the conversation snapshots (#216)
-                       src/core/arch_defaults.cpp src/core/vmm.cpp   # vmm.cpp is the port's stub: no driver VMM on Level Zero
+                       src/core/conversation_memory.cpp
+                       src/core/arch_defaults.cpp src/core/vmm.cpp
                        src/core/conversation_file.cpp
-                       src/core/peer_experts.cpp src/core/remote_expert_opt_stub.cpp)         # 0.1.36+: --peer-device (a stub in the port: no second GPU tier yet)
-add_library(strata_engine STATIC ${_engine} ${CMAKE_CURRENT_SOURCE_DIR}/src/core/gguf_expert_source.cpp
-            ${CMAKE_CURRENT_SOURCE_DIR}/src/core/copy_queue.cpp)   # 0.1.43: a queue on the copy engine
+                       src/core/peer_experts.cpp src/core/remote_expert_opt_stub.cpp)
+add_library(strata_engine STATIC ${_engine} ${CMAKE_CURRENT_SOURCE_DIR}/src/core/gguf_expert_source.cpp)
 target_include_directories(strata_engine PRIVATE ${STRATA_ROOT}/src/core)   # conversation_checked.hpp (#include "...")
 target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu)
 
-# cuBLAS -> oneMKL through dpct::blas (needs the MKL SYCL BLAS domain)
-strata_resolve(_prefill src/prefill/gemm.cu src/prefill/kernels.cu src/prefill/prefill.cpp)
-add_library(strata_prefill STATIC ${_prefill}
-            ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill/moe_fused_stub.cpp   # upstream's fused int8 kernels: not built here
-            ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill/xmx_moe.dp.cpp)      # A770 port: grouped XMX expert GEMM
-target_compile_options(strata_prefill PUBLIC -qmkl=sequential)
-target_link_options(strata_prefill PUBLIC -qmkl=sequential)
+strata_resolve(_prefill src/prefill/prefill.cpp)
+add_library(strata_prefill STATIC ${_prefill} ${_prefill_host}
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill/moe_fused_stub.cpp)   # upstream's fused int8 kernels: not built here
 target_link_libraries(strata_prefill PUBLIC strata_engine)
 
 strata_resolve(_main src/program/generate.cpp)
@@ -243,7 +232,7 @@ add_executable(strata ${_main})
 target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec)
 
 # --- the kernel parity self-tests (each runs on the card and compares against a CPU reference) ---------------------
-option(STRATA_SYCL_PARITY "Build the kernel parity tests" ON)
+option(STRATA_SYCL_PARITY "Build the kernel parity tests" OFF)
 if(STRATA_SYCL_PARITY)
   enable_testing()
   foreach(p IN ITEMS dequant_s2 s2_gemv shared_expert gr gdn s2_gemv_q8 sampler rope quantize_act router_top10

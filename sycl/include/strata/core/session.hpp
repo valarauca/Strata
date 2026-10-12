@@ -14,8 +14,7 @@
 // lets the CPU expert pool start while the GPU is still working on the next layer.
 #pragma once
 
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
+#include "strata/ze/ze.hpp"
 #include "strata/core/hit_hook.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/kernels/cpu/pool.hpp"
@@ -135,7 +134,7 @@ bool session_token(const WeightTable& tables, const ModelGeometry& g, int64_t po
 /// of them while a block makes ~45.  Replaying the 43-node block graph measured **1.585 ms against 2.393 ms**
 /// for the same work as direct launches - a 1.51x that is pure launch overhead.
 struct SessionGraphs {
-    dpct::experimental::command_graph_exec_ptr *execs =
+    strata::ze::Graph** execs =
         nullptr; ///< one per layer, in layer order
     int64_t n = 0;
     /// **THE SECOND GRAPH PER LAYER: `moe_finish` + `gr_write`, launched AFTER the host has run the pool.**
@@ -148,7 +147,7 @@ struct SessionGraphs {
     /// inside `pre[l]` - the shared expert, and nothing else, because everything after the combine depends on
     /// `parts`.  **A per-layer CPU pool cannot be hidden behind a strictly serial residual chain**, which is
     /// why the CPU term is answered by Phase 3's VRAM cache and not by this pipeline.
-    dpct::experimental::command_graph_exec_ptr *posts = nullptr;
+    strata::ze::Graph** posts = nullptr;
     bool captured = false;
     /// THE DEVICE ADDRESS THE GRAPHS WERE CAPTURED WITH.  The host loop copies each layer's expert outputs
     /// here before launching the next layer, and a graph bakes the POINTER, so it has to be this one.
@@ -195,12 +194,12 @@ struct SessionGraphs {
     /// has ~7 more nodes than prefix 4, so the two differ in launch setup as well as in execution - and the
     /// difference attributed ALL of it to stage 4, the router. Capturing prefix 5 the same way as the others
     /// makes the two comparable and the difference purely stage 4's.
-    dpct::experimental::command_graph_exec_ptr *preP[5] = {
+    strata::ze::Graph** preP[5] = {
         nullptr, nullptr, nullptr, nullptr, nullptr};
-    dpct::experimental::command_graph_exec_ptr *preA =
+    strata::ze::Graph** preA =
         nullptr; ///< `half == 1`: gr_read -> attention -> gr_write   (the
                  ///< MIXER)
-    dpct::experimental::command_graph_exec_ptr *preB =
+    strata::ze::Graph** preB =
         nullptr; ///< `half == 2`: gr_read -> moe_route              (FFN front
                  ///< + ROUTER)
     bool split_captured = false;
@@ -375,7 +374,7 @@ using PoolFn = void (*)(void* user, const float* x_f, const int32_t* ids, const 
 struct SessionLoopScratch {
     float* y_miss = nullptr;        ///< pinned host staging for the pool's answer, `parts_bytes` long
     size_t parts_bytes = 0;
-    dpct::event_ptr probe = nullptr;
+    strata::ze::Event* probe = nullptr;
     strata::kernels::cpu::ThreadAffinity pinned_core{};  ///< affinity to restore, or invalid if the host was not pinned
     bool pinned = false;
 
@@ -403,7 +402,7 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
 // Same kernels, same order per layer as `session_loop`, so the token is bitwise the same.  No VRAM expert tier
 // yet (the hit decision is a host step between ring and post); the caller falls back to `session_loop` then.
 struct TokenGraph {
-    dpct::experimental::command_graph_exec_ptr exec = nullptr;
+    strata::ze::Graph* exec = nullptr;
     bool captured = false;
     int64_t n_layers = 0;
     const float* y_src = nullptr;    ///< the pinned host staging the graph's H2D copies read (baked in)
