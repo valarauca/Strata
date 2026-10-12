@@ -12047,6 +12047,18 @@ int main(int argc, char **argv) try {
         // --spec-follow: the run ends with the continuation
         const int64_t max_new = follow.empty() ? o.max_new : std::min<int64_t>(o.max_new, (int64_t) follow.size());
         int64_t follow_differ = 0, follow_emitted = 0;
+        std::FILE* spec_dump = nullptr;
+        std::vector<float> spec_row;
+        int32_t spec_rows = 0;
+        std::FILE* layer_dump = nullptr;
+        std::vector<float> layer_row;
+        int32_t layer_rows = 0;
+        const char* layer_dump_path = std::getenv("STRATA_DUMP_SPEC_LAYERS");
+        const char* spec_dump_path = std::getenv("STRATA_DUMP_SPEC_LOGITS");
+        std::FILE* route_dump = nullptr;
+        std::vector<uint32_t> route_row;
+        int32_t route_rows = 0;
+        const char* route_dump_path = std::getenv("STRATA_DUMP_SPEC_ROUTE");
         if (thits.d_res == nullptr) {
             std::fprintf(stderr, "strata generate: --spec needs the device residency table (--expert-profile, "
                                  "--expert-cache and the token graph)\n");
@@ -12416,6 +12428,62 @@ int main(int argc, char **argv) try {
                     if (f) std::fclose(f);
                 }
             }
+            if (spec_dump_path != nullptr && *spec_dump_path) {
+                if (spec_dump == nullptr) {
+                    spec_dump = std::fopen(spec_dump_path, "wb");
+                    spec_row.resize((size_t) ver.vocab());
+                    const int32_t hdr0[2] = {(int32_t) ver.vocab(), 0};
+                    if (spec_dump == nullptr || std::fwrite(hdr0, sizeof hdr0, 1, spec_dump) != 1) {
+                        std::fprintf(stderr, "strata generate: STRATA_DUMP_SPEC_LOGITS: cannot write %s\n", spec_dump_path);
+                        return 1;
+                    }
+                }
+                for (int i = 0; i <= a && (int64_t) produced.size() + i < max_new; ++i) {
+                    if (!ver.copy_logits(i, spec_row.data()) ||
+                        std::fwrite(spec_row.data(), sizeof(float), spec_row.size(), spec_dump) != spec_row.size()) {
+                        std::fprintf(stderr, "strata generate: STRATA_DUMP_SPEC_LOGITS: row %d failed\n", (int) spec_rows);
+                        return 1;
+                    }
+                    if (layer_dump_path != nullptr && *layer_dump_path && spec_rows % 16 == 0) {
+                        if (layer_dump == nullptr) {
+                            layer_dump = std::fopen(layer_dump_path, "wb");
+                            layer_row.resize((size_t) ver.layer_row_floats());
+                            const int32_t lh[5] = {0x31594C53, (int32_t) g.n_layers, (int32_t) g.hc, (int32_t) g.n_embd, 0};
+                            if (layer_dump == nullptr || std::fwrite(lh, sizeof lh, 1, layer_dump) != 1) {
+                                std::fprintf(stderr, "strata generate: STRATA_DUMP_SPEC_LAYERS: cannot write %s\n", layer_dump_path);
+                                return 1;
+                            }
+                        }
+                        if (!ver.copy_layers(i, layer_row.data()) ||
+                            std::fwrite(&spec_rows, sizeof spec_rows, 1, layer_dump) != 1 ||
+                            std::fwrite(layer_row.data(), sizeof(float), layer_row.size(), layer_dump) != layer_row.size()) {
+                            std::fprintf(stderr, "strata generate: STRATA_DUMP_SPEC_LAYERS: row %d failed\n", (int) spec_rows);
+                            return 1;
+                        }
+                        ++layer_rows;
+                    }
+                    if (route_dump_path != nullptr && *route_dump_path && spec_rows % 16 == 0) {
+                        if (route_dump == nullptr) {
+                            route_dump = std::fopen(route_dump_path, "wb");
+                            route_row.resize((size_t) ver.route_row_words());
+                            const int32_t rh[5] = {0x31545253, (int32_t) g.n_layers, (int32_t) g.n_expert,
+                                                   (int32_t) ((route_row.size() / (size_t) g.n_layers - (size_t) g.n_expert) / 2), 0};
+                            if (route_dump == nullptr || std::fwrite(rh, sizeof rh, 1, route_dump) != 1) {
+                                std::fprintf(stderr, "strata generate: STRATA_DUMP_SPEC_ROUTE: cannot write %s\n", route_dump_path);
+                                return 1;
+                            }
+                        }
+                        if (!ver.copy_route(i, route_row.data()) ||
+                            std::fwrite(&spec_rows, sizeof spec_rows, 1, route_dump) != 1 ||
+                            std::fwrite(route_row.data(), sizeof(uint32_t), route_row.size(), route_dump) != route_row.size()) {
+                            std::fprintf(stderr, "strata generate: STRATA_DUMP_SPEC_ROUTE: row %d failed\n", (int) spec_rows);
+                            return 1;
+                        }
+                        ++route_rows;
+                    }
+                    ++spec_rows;
+                }
+            }
             // plan v0.3 P6: the adaptive tier's host work (ranking, copy submission) runs on its own thread while the
             // GPU commits and drafts; it touches only the residency tables, which nothing reads until the next window
             std::thread adapt_thr;
@@ -12471,6 +12539,24 @@ int main(int argc, char **argv) try {
             return 1;
         }
         if (hashes != nullptr) std::fclose(hashes);
+        if (layer_dump != nullptr) {
+            std::fseek(layer_dump, 16, SEEK_SET);
+            std::fwrite(&layer_rows, sizeof layer_rows, 1, layer_dump);
+            std::fclose(layer_dump);
+            std::printf("%-24s %s (%d rows)\n", "spec layers dumped", layer_dump_path, (int) layer_rows);
+        }
+        if (route_dump != nullptr) {
+            std::fseek(route_dump, 16, SEEK_SET);
+            std::fwrite(&route_rows, sizeof route_rows, 1, route_dump);
+            std::fclose(route_dump);
+            std::printf("%-24s %s (%d rows)\n", "spec route dumped", route_dump_path, (int) route_rows);
+        }
+        if (spec_dump != nullptr) {
+            std::fseek(spec_dump, 4, SEEK_SET);
+            std::fwrite(&spec_rows, sizeof spec_rows, 1, spec_dump);
+            std::fclose(spec_dump);
+            std::printf("%-24s %s (%d rows of %lld)\n", "spec logits dumped", spec_dump_path, (int) spec_rows, (long long) ver.vocab());
+        }
         std::printf("%-24s %lld rounds of %d, drafts accepted %lld of %lld (%.3f), %.2f tokens per round\n",
                     "speculation", (long long) rounds, o.spec, (long long) drafts_ok, (long long) drafts_total,
                     drafts_total > 0 ? (double) drafts_ok / (double) drafts_total : 0.0,

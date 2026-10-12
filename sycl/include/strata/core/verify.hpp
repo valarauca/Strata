@@ -86,6 +86,16 @@ public:
     bool run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out, std::string& err);
     /// Diagnostics: row `t` of the last window's head logits (n_vocab floats) to the host. Valid after run().
     bool copy_logits(int t, float* host) const;
+    /// STRATA_DUMP_SPEC_LAYERS: row t's per-layer residual, mixer and MoE outputs of the last window, layer_row_floats()
+    /// floats into `host` (false when the dump is off or t is out of range)
+    bool copy_layers(int t, float* host) const;
+    /// STRATA_DUMP_SPEC_LAYERS: floats per dumped row, n_layers x (hc*n_embd + 2*n_embd)
+    int64_t layer_row_floats() const;
+    /// STRATA_DUMP_SPEC_ROUTE: row t's per-layer router logits, top-k ids and weights of the last window,
+    /// route_row_words() 32-bit words into `host` (false when the dump is off or t is out of range)
+    bool copy_route(int t, void* host) const;
+    /// STRATA_DUMP_SPEC_ROUTE: 32-bit words per dumped row, n_layers x (n_expert + 2*k)
+    int64_t route_row_words() const;
     int64_t vocab() const { return next_ ? next_->vocab() : n_vocab_; }
     /// The sampling the verify window's head applies (temperature / top_p / top_k / seed).  Set per
     /// request; greedy by default.  The sampling itself runs OUTSIDE the captured graph - its
@@ -395,7 +405,9 @@ private:
     int64_t n_vocab_ = 0;
     dpct::queue_ptr cs_ = &dpct::get_in_order_queue();
     float* dbgR_ = nullptr;   ///< SYCL port debug: R (token 0) after every layer, n_layers x n_embd
+    float* dbgL_ = nullptr;   ///< STRATA_DUMP_SPEC_LAYERS: [n_layers][residual max_t x hc*N | mixer max_t x N | moe max_t x N]
     float* dbgM_ = nullptr;   ///< SYCL port debug: mixed_ (token 0) after every layer
+    float* dbgRt_ = nullptr;  ///< STRATA_DUMP_SPEC_ROUTE: [n_layers][logits max_t x NE | ids max_t x K | weights max_t x K]
     dpct::queue_ptr sh_cs_ = &dpct::get_in_order_queue();
     dpct::event_ptr ev_fork_ = nullptr, ev_join_ = nullptr;
     dpct::experimental::command_graph_exec_ptr exec_[9] = {};

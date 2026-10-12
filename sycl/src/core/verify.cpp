@@ -774,6 +774,12 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
         dbgR_ = (float*) sycl::malloc_device((size_t) g.n_layers * g.n_embd * 4, dpct::get_in_order_queue());
         dbgM_ = (float*) sycl::malloc_device((size_t) g.n_layers * g.n_embd * 4, dpct::get_in_order_queue());
     }
+    if (std::getenv("STRATA_DUMP_SPEC_LAYERS") != nullptr && lb_ == 0 && le_ == g.n_layers)
+        dbgL_ = (float*) sycl::malloc_device((size_t) g.n_layers * (size_t) max_t * (size_t) (g.hc * g.n_embd + 2 * g.n_embd) * 4,
+                                     dpct::get_in_order_queue());
+    if (std::getenv("STRATA_DUMP_SPEC_ROUTE") != nullptr && lb_ == 0 && le_ == g.n_layers)
+        dbgRt_ = (float*) sycl::malloc_device((size_t) g.n_layers * (size_t) max_t * (size_t) (g.n_expert + 2 * ss.k) * 4,
+                                      dpct::get_in_order_queue());
     std::fprintf(stderr, "strata verify: window up to %d tokens, %.1f MiB of device buffers%s\n", max_t,
                  (double) count.used / 1048576.0,
                  all_resident_ ? " (100% VRAM resident: zero-doorbell graph)" : "");
@@ -1283,6 +1289,9 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
             return false;
         }
         stamp(l, 16, grp);
+        if (dbgL_)
+            cs->memcpy(dbgL_ + (size_t) l * (size_t) MT * (size_t) (HC * N + 2 * N) + (size_t) MT * HC * N + (size_t) tb * N,
+                       bo_ + tb * N, (size_t) n * N * 4);
         const bool q8_ffn = gr_read_group(1, true, inj_, inj2_);   // true: nat_xq_ holds the MoE input's q8_1 (STRATA_QFUSE)
         // with CPU experts in the window the shared expert forks off once the doorbell is published (it no longer
         // competes with it for the GPU's first microseconds); STRATA_SH_FORK_LATE=0 forks at the top as before
@@ -1534,6 +1543,20 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
     for (int64_t l = lb_; l < le_; ++l)
         for (int grp = 0; grp < G; ++grp) {
             if (!post(l, grp)) return false;
+            if (dbgL_) {
+                float* lay = dbgL_ + (size_t) l * (size_t) MT * (size_t) (HC * N + 2 * N);
+                const int tb = tb_[grp], n = te_[grp] - tb_[grp];
+                cs->memcpy(lay + (size_t) tb * HC * N, Rt(tb), (size_t) n * HC * N * 4);
+                cs->memcpy(lay + (size_t) MT * (HC * N + N) + (size_t) tb * N, bo_ + tb * N, (size_t) n * N * 4);
+            }
+            if (dbgRt_) {
+                const int64_t RW = NE + 2 * K;
+                float* lay = dbgRt_ + (size_t) l * (size_t) MT * (size_t) RW;
+                const int tb = tb_[grp], n = te_[grp] - tb_[grp];
+                cs->memcpy(lay + (size_t) tb * NE, logits_ + (size_t) tb * NE, (size_t) n * NE * 4);
+                cs->memcpy(lay + (size_t) MT * NE + (size_t) tb * K, ids_ + (size_t) tb * K, (size_t) n * K * 4);
+                cs->memcpy(lay + (size_t) MT * (NE + K) + (size_t) tb * K, w_ + (size_t) tb * K, (size_t) n * K * 4);
+            }
             if (dbgR_ && grp == 0) {   // recorded into the window graph as memcpy nodes
                 cs->memcpy(dbgR_ + (size_t) l * N, Rt(0), (size_t) N * 4);
                 cs->memcpy(dbgM_ + (size_t) l * N, mixed_, (size_t) N * 4);
@@ -2054,6 +2077,14 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
         *(volatile uint32_t*) h_flag_ = 1;
         std::atomic_thread_fence(std::memory_order_seq_cst);
     }
+    static const bool no_host = [] { const char* v = std::getenv("STRATA_VERIFY_NO_HOST"); return v && *v && std::strcmp(v, "0") != 0; }();
+    if (no_host && !ar_on() && !stepped_run && do_ple) {
+        const Clock::time_point tp = Clock::now();
+        if (!ss.ple.table->gather_batch(ple_rows, (size_t) T, h_ple_, err)) return false;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        _mm_sfence();
+        ms_host += ms_since(tp);
+    }
     dpct::err0 le = 0;
     if (stepped_run) {
         if (remote_opt_) { err = "verify: STRATA_VERIFY_STEPPED does not serve --remote-expert-opt"; return false; }
@@ -2182,7 +2213,6 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
     // memory are not reliably visible while the graph runs (measured: the ring is seen late or not at all),
     // so waiting on them per layer fails. STRATA_VERIFY_NO_HOST=1 waits for the whole window instead. Only for
     // an all-resident cache: a missed expert would leave the GPU waiting for a plan that never comes.
-    static const bool no_host = [] { const char* v = std::getenv("STRATA_VERIFY_NO_HOST"); return v && *v && std::strcmp(v, "0") != 0; }();
     const int64_t steps = (le_ - lb_) * G;
     const bool test_stall = g_test_stall > 0 && windows + 1 == g_test_stall;   // #267 test hook (off: false)
     if (stepped_run || stepped_ar) {
@@ -3524,6 +3554,48 @@ catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
             << ", line:" << __LINE__ << std::endl;
   std::exit(1);
+}
+
+int64_t Verifier::layer_row_floats() const { return g_->n_layers * (g_->hc * g_->n_embd + 2 * g_->n_embd); }
+
+bool Verifier::copy_layers(int t, float* host) const {
+    if (dbgL_ == nullptr || host == nullptr || t < 0 || t >= max_t_) return false;
+    const ModelGeometry& g = *g_;
+    const size_t HN = (size_t) (g.hc * g.n_embd), N = (size_t) g.n_embd, MT = (size_t) max_t_;
+    try {
+        for (int64_t l = 0; l < g.n_layers; ++l) {
+            const float* lay = dbgL_ + (size_t) l * MT * (HN + 2 * N);
+            float* out = host + (size_t) l * (HN + 2 * N);
+            cs_->memcpy(out, lay + (size_t) t * HN, HN * 4);
+            cs_->memcpy(out + HN, lay + MT * HN + (size_t) t * N, N * 4);
+            cs_->memcpy(out + HN + N, lay + MT * (HN + N) + (size_t) t * N, N * 4);
+        }
+        cs_->wait();
+    } catch (sycl::exception const&) {
+        return false;
+    }
+    return true;
+}
+
+int64_t Verifier::route_row_words() const { return g_->n_layers * (g_->n_expert + 2 * (int64_t) ss_->k); }
+
+bool Verifier::copy_route(int t, void* host) const {
+    if (dbgRt_ == nullptr || host == nullptr || t < 0 || t >= max_t_) return false;
+    const ModelGeometry& g = *g_;
+    const size_t NE = (size_t) g.n_expert, K = (size_t) ss_->k, MT = (size_t) max_t_, RW = NE + 2 * K;
+    try {
+        for (int64_t l = 0; l < g.n_layers; ++l) {
+            const float* lay = dbgRt_ + (size_t) l * MT * RW;
+            float* out = (float*) host + (size_t) l * RW;
+            cs_->memcpy(out, lay + (size_t) t * NE, NE * 4);
+            cs_->memcpy(out + NE, lay + MT * NE + (size_t) t * K, K * 4);
+            cs_->memcpy(out + NE + K, lay + MT * (NE + K) + (size_t) t * K, K * 4);
+        }
+        cs_->wait();
+    } catch (sycl::exception const&) {
+        return false;
+    }
+    return true;
 }
 
 bool Verifier::copy_logits(int t, float* host) const {
