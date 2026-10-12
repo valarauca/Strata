@@ -1,0 +1,4 @@
+gemmstone (oneDNN src/gpu/intel/gemm/jit: include, generator, selector) and nGEN (oneDNN third_party/ngen)
+from https://github.com/uxlfoundation/oneDNN commit 3971fb1ffcc4354658db7eb0f6332d8a02d3a5ca (2026-10-11 23:28:08 +0800).
+Not copied: oneDNN's glue (gen_kernel, pd, walk_orders), the DSL generator (dsl, generator_dsl). Apache-2.0 (LICENSE);
+nGEN's npack headers are MIT (third_party/ngen/COPYRIGHT).

@@ -58,6 +58,8 @@ struct DeviceInfo {
     uint64_t timer_ns_den = 1;
     uint64_t timestamp_mask = ~0ull;
     bool battlemage = false;     ///< Xe2 discrete (BMG-G21 / G31)
+    bool integrated = false;
+    uint32_t ip_version = 0;     ///< graphics IP version (ZE_extension_device_ip_version), 0 when not reported
     int compute_ordinal = 0;     ///< queue group with compute
     int copy_ordinal = -1;       ///< copy-only queue group, -1 when the device has none
 };
@@ -130,6 +132,30 @@ private:
     mutable std::atomic<ze_kernel_handle_t> h_[kMaxDevices] = {};
 };
 
+/// A kernel generated at run time as a native device binary (strata/gemmstone.hpp). The runtime creates its module and
+/// kernel and keeps both for the life of the process, so a NativeKernel is a plain value that never owns anything.
+class NativeKernel {
+public:
+    NativeKernel() = default;
+    const char* name() const { return name_; }
+    int device() const { return dev_; }
+    uint32_t nparams() const { return nparams_; }
+    ze_kernel_handle_t handle() const { return h_; }
+    explicit operator bool() const { return h_ != nullptr; }
+
+private:
+    friend NativeKernel load_native(int, const std::vector<uint8_t>&, const std::string&);
+    const char* name_ = "";
+    int dev_ = -1;
+    uint32_t nparams_ = 0;
+    ze_kernel_handle_t h_ = nullptr;
+};
+
+/// Loads the native binary `binary` on GPU `ordinal` and creates its kernel `name`. Returns an empty NativeKernel when
+/// the driver refuses the binary (the build log goes to stderr). The runtime keeps the module and the kernel until the
+/// process exits.
+NativeKernel load_native(int ordinal, const std::vector<uint8_t>& binary, const std::string& name);
+
 /// A kernel entry point with its C++ signature, declared by STRATA_KERNEL (strata/ze/kernel_abi.hpp).
 template <class Sig> class Kernel;
 template <class... P> class Kernel<void(P...)> : public KernelBase {
@@ -155,6 +181,8 @@ public:
 
     /// Appends kernel `k` with argument pointers `args` (k.nparams() of them, then a pointer to the size_t scratch size).
     void launch(const KernelBase& k, Dim3 grid, Dim3 block, void** args);
+    /// Appends native kernel `k` with argument pointers `args` (k.nparams() of them, a size_t* for a local-memory one).
+    void launch(const NativeKernel& k, Dim3 grid, Dim3 block, void** args);
     /// Copies between device memory and Strata host memory are asynchronous. A copy from or to pageable host memory
     /// (not from malloc_host) goes through a pinned bounce buffer and returns when it is done, as CUDA's does.
     void memcpy(void* dst, const void* src, size_t bytes);
@@ -203,6 +231,7 @@ private:
     friend Stream& copy_stream(int);
     ze_command_list_handle_t target() const { return cap_ ? cap_->list_ : imm_; }
     void after_append();
+    void append_launch(ze_kernel_handle_t h, const char* name, int dev, Dim3 grid, Dim3 block, void** args);
     int dev_;
     Engine engine_;
     ze_command_list_handle_t imm_ = nullptr;

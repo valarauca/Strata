@@ -166,7 +166,7 @@ set(STRATA_KERNEL_FAMILIES dequant_s2 s2_gemv s_gemv s2_gemv_quads s2_gemv_fast 
     native_moe native_gdn native_gr_postops native_router native_gdn_preprocess native_qsa native_rope native_ple_postops
     native_flash_attn native_qsa_indexer native_qsa_score ple kv_q8 kv_stream kv_q4 fused_gr cvec qsa_decode_attn
     qsa_prompt_attn fused_gdn dequant_bf16 qsa_select verify_kernels iq_kernels qsa_prompt_attn_xmx)
-set(STRATA_PREFILL_FAMILIES gemm kernels xmx_moe)
+set(STRATA_PREFILL_FAMILIES gemm kernels xmx_moe q4pack)
 set(STRATA_CORE_FAMILIES device)
 # families whose kernels need the large register file (256 GRF): the XMX GEMMs (grf_size<256> on a free-function
 # kernel drops it, so the whole bundle gets the ocloc option)
@@ -206,6 +206,22 @@ add_library(strata_ze STATIC ${CMAKE_CURRENT_SOURCE_DIR}/src/ze/ze.cpp ${CMAKE_C
 target_link_libraries(strata_ze PUBLIC strata_includes ${STRATA_ZE_LOADER} Threads::Threads)
 strata_ze_embed(strata_ze)
 
+# --- gemmstone: oneDNN's GEMM kernel generator (third_party/gemmstone, nGEN in third_party/ngen), Xe2 only ------------
+file(GLOB _gs_vendor ${CMAKE_CURRENT_SOURCE_DIR}/third_party/gemmstone/generator/*.cpp
+     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/gemmstone/generator/pieces/*.cpp ${CMAKE_CURRENT_SOURCE_DIR}/third_party/gemmstone/generator/microkernel/*.cpp
+     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/gemmstone/selector/*.cpp ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ngen/*.cpp
+     ${CMAKE_CURRENT_SOURCE_DIR}/src/gemmstone/catalog.cpp)
+add_library(strata_gemmstone_vendor STATIC ${_gs_vendor})
+target_compile_definitions(strata_gemmstone_vendor PUBLIC NGEN_CONFIG GEMMSTONE_CONFIG)
+target_include_directories(strata_gemmstone_vendor SYSTEM PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src/gemmstone
+                           ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ngen ${CMAKE_CURRENT_SOURCE_DIR}/third_party/gemmstone/include
+                           ${CMAKE_CURRENT_SOURCE_DIR}/third_party/gemmstone)
+target_compile_options(strata_gemmstone_vendor PRIVATE -w)
+add_library(strata_gemmstone STATIC ${CMAKE_CURRENT_SOURCE_DIR}/src/gemmstone/gemmstone.cpp)
+target_link_libraries(strata_gemmstone PUBLIC strata_includes strata_ze PRIVATE strata_gemmstone_vendor)
+add_executable(gs_probe ${CMAKE_CURRENT_SOURCE_DIR}/src/gemmstone/gs_probe.cpp)
+target_link_libraries(gs_probe PRIVATE strata_gemmstone)
+
 # --- the GPU engine (host side) ----------------------------------------------------------------------------------
 strata_resolve(_core src/core/pinned.cpp src/platform/memory.cpp src/core/graph.cpp src/core/weights.cpp
                      src/core/layout.cpp)
@@ -231,7 +247,7 @@ target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_ker
 strata_resolve(_prefill src/prefill/prefill.cpp)
 add_library(strata_prefill STATIC ${_prefill} ${_prefill_host}
             ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill/moe_fused_stub.cpp)   # upstream's fused int8 kernels: not built here
-target_link_libraries(strata_prefill PUBLIC strata_engine)
+target_link_libraries(strata_prefill PUBLIC strata_engine strata_gemmstone)
 
 strata_resolve(_main src/program/generate.cpp)
 add_executable(strata ${_main})

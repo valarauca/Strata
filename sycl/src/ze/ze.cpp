@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <map>
 #include <memory>
 #include <string>
@@ -43,6 +44,8 @@ struct DeviceState {
     DeviceInfo info;
     std::mutex mod_mu;
     std::vector<ze_module_handle_t> modules;
+    std::vector<ze_module_handle_t> native_modules;
+    std::deque<std::string> native_names;
     std::unique_ptr<Stream> def;
     std::unique_ptr<Stream> copy;
     std::once_flag def_once, copy_once;
@@ -204,6 +207,11 @@ void Runtime::init() {
         di.timestamp_mask = p.timestampValidBits >= 64 ? ~0ull : ((1ull << p.timestampValidBits) - 1);
         di.pci = pci_of(h);
         di.battlemage = (p.deviceId & 0xff00) == 0xe200;
+        di.integrated = (p.flags & ZE_DEVICE_PROPERTY_FLAG_INTEGRATED) != 0;
+        ze_device_ip_version_ext_t ipv{ZE_STRUCTURE_TYPE_DEVICE_IP_VERSION_EXT};
+        ze_device_properties_t pv{ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES};
+        pv.pNext = &ipv;
+        if (zeDeviceGetProperties(h, &pv) == ZE_RESULT_SUCCESS) di.ip_version = ipv.ipVersion;
         ze_device_compute_properties_t cp{ZE_STRUCTURE_TYPE_DEVICE_COMPUTE_PROPERTIES};
         STRATA_ZE_CHECK(zeDeviceGetComputeProperties(h, &cp));
         di.max_group_size = cp.maxTotalGroupSize;
@@ -630,6 +638,50 @@ ze_kernel_handle_t KernelBase::create(int ordinal) const {
     return h;
 }
 
+NativeKernel load_native(int ordinal, const std::vector<uint8_t>& binary, const std::string& name) {
+    DeviceState& st = dev_state(ordinal);
+    std::lock_guard<std::mutex> lk(st.mod_mu);
+    ze_module_desc_t md{ZE_STRUCTURE_TYPE_MODULE_DESC};
+    md.format = ZE_MODULE_FORMAT_NATIVE;
+    md.inputSize = binary.size();
+    md.pInputModule = binary.data();
+    ze_module_handle_t m = nullptr;
+    ze_module_build_log_handle_t log = nullptr;
+    ze_result_t r = zeModuleCreate(rt().ctx, st.h, &md, &m, &log);
+    if (r != ZE_RESULT_SUCCESS) {
+        size_t n = 0;
+        std::string text;
+        if (log && zeModuleBuildLogGetString(log, &n, nullptr) == ZE_RESULT_SUCCESS && n > 0) {
+            text.resize(n);
+            zeModuleBuildLogGetString(log, &n, text.data());
+        }
+        std::fprintf(stderr, "strata ze: native module %s on GPU %d: %s\n%s\n", name.c_str(), ordinal, result_name(r),
+                     text.c_str());
+        if (log) zeModuleBuildLogDestroy(log);
+        return {};
+    }
+    if (log) zeModuleBuildLogDestroy(log);
+    ze_kernel_desc_t kd{ZE_STRUCTURE_TYPE_KERNEL_DESC};
+    kd.pKernelName = name.c_str();
+    ze_kernel_handle_t h = nullptr;
+    r = zeKernelCreate(m, &kd, &h);
+    if (r != ZE_RESULT_SUCCESS) {
+        std::fprintf(stderr, "strata ze: native kernel %s on GPU %d: %s\n", name.c_str(), ordinal, result_name(r));
+        zeModuleDestroy(m);
+        return {};
+    }
+    ze_kernel_properties_t kp{ZE_STRUCTURE_TYPE_KERNEL_PROPERTIES};
+    STRATA_ZE_CHECK(zeKernelGetProperties(h, &kp));
+    st.native_modules.push_back(m);
+    st.native_names.push_back(name);
+    NativeKernel k;
+    k.name_ = st.native_names.back().c_str();
+    k.dev_ = ordinal;
+    k.nparams_ = kp.numKernelArgs;
+    k.h_ = h;
+    return k;
+}
+
 void check_geometry(const KernelBase& k, Dim3 grid, Dim3 block) {
     const uint64_t g = (uint64_t) block.x * block.y * block.z;
     if (g == 0 || g > 1024) {
@@ -689,12 +741,35 @@ void Stream::launch(const KernelBase& k, Dim3 grid, Dim3 block, void** args) {
     if (grid.x == 0 || grid.y == 0 || grid.z == 0) return;
     std::lock_guard<std::recursive_mutex> lk(mu_);
     const int d = cap_ ? cap_->dev : dev_;
-    ze_kernel_handle_t h = k.handle(d);
+    append_launch(k.handle(d), k.name(), d, grid, block, args);
+}
+
+void Stream::launch(const NativeKernel& k, Dim3 grid, Dim3 block, void** args) {
+    const uint64_t g = (uint64_t) block.x * block.y * block.z;
+    if (g == 0 || g > 1024 || !k) {
+        std::fprintf(stderr, "strata ze: native kernel %s launched with grid %ux%ux%u block %ux%ux%u\n", k.name(), grid.x,
+                     grid.y, grid.z, block.x, block.y, block.z);
+        std::fflush(stderr);
+        std::abort();
+    }
+    if (grid.x == 0 || grid.y == 0 || grid.z == 0) return;
+    std::lock_guard<std::recursive_mutex> lk(mu_);
+    const int d = cap_ ? cap_->dev : dev_;
+    if (d != k.device()) {
+        std::fprintf(stderr, "strata ze: native kernel %s of GPU %d launched on GPU %d\n", k.name(), k.device(), d);
+        std::fflush(stderr);
+        std::abort();
+    }
+    append_launch(k.handle(), k.name(), d, grid, block, args);
+}
+
+void Stream::append_launch(ze_kernel_handle_t h, const char* name, int dev, Dim3 grid, Dim3 block, void** args) {
+    (void) dev;
     const ze_group_count_t gc{grid.x, grid.y, grid.z};
     const ze_group_size_t gs{block.x, block.y, block.z};
     const ze_result_t r = zeCommandListAppendLaunchKernelWithArguments(target(), h, gc, gs, args, nullptr, nullptr, 0, nullptr);
     if (r != ZE_RESULT_SUCCESS) {
-        std::fprintf(stderr, "strata ze: launch of %s (grid %ux%ux%u block %ux%ux%u) failed: %s%s\n", k.name(), grid.x, grid.y,
+        std::fprintf(stderr, "strata ze: launch of %s (grid %ux%ux%u block %ux%ux%u) failed: %s%s\n", name, grid.x, grid.y,
                      grid.z, block.x, block.y, block.z, result_name(r), r == ZE_RESULT_ERROR_DEVICE_LOST ? " - DEVICE_LOST" : "");
         std::fflush(stderr);
         std::_Exit(1);
