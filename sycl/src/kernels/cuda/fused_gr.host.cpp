@@ -22,6 +22,14 @@ namespace strata::kernels {
 
 namespace {
 
+// GrMulti's pointers for the STRATA_ZE_CHECK_DEVICES launch check: each token's FusedGrArgs, then the scratch.
+void launch_ptrs(const GrMulti& m, const ze::LaunchPtrs& c) {
+    for (int t = 0; t < m.T && t < kFusedGrMaxT; ++t) launch_ptrs(m.a[t], c);
+    c(m.xn);
+    c(m.part);
+    c(m.part2);
+}
+
 bool gr_norm_split() {   // default; STRATA_GR_NORM_SPLIT=0: one work-group per token
     static const bool v = std::getenv("STRATA_GR_NORM_SPLIT") == nullptr || std::atoi(std::getenv("STRATA_GR_NORM_SPLIT")) != 0;
     return v;

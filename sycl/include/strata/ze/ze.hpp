@@ -381,9 +381,16 @@ bool check_devices();
 /// Strata allocation (pageable or freed memory): argument `index` of kernel `name` would read or write memory that GPU
 /// never mapped.
 void check_launch_ptr(const char* name, int index, const void* p, int dev);
-/// check_launch_ptr for the pointers a by-value struct argument holds: exits with a message when an aligned 8-byte word
-/// of `data` lies in a device allocation of a GPU other than `dev` (other words are taken as plain data).
-void check_launch_struct(const char* name, int index, const void* data, size_t bytes, int dev);
+/// The check a by-value struct argument's pointers get under STRATA_ZE_CHECK_DEVICES: a kernel argument type that holds
+/// pointers declares `void launch_ptrs(const T&, const LaunchPtrs&)` in its own namespace (strata/ze/launch_ptrs.hpp for
+/// the shared types), which hands each pointer member to it. Types without one are not checked.
+struct LaunchPtrs {
+    const char* name;
+    int index;
+    int dev;
+    /// Exits with a message when `p` is a device allocation of a GPU other than `dev`.
+    void operator()(const void* p) const;
+};
 
 template <class... P>
 template <class... A>
@@ -396,7 +403,8 @@ void Kernel<void(P...)>::operator()(Stream* s, Dim3 grid, Dim3 block, size_t slm
         auto one = [&](const auto& e) {
             using E = std::decay_t<decltype(e)>;
             if constexpr (std::is_pointer_v<E>) check_launch_ptr(name(), i, (const void*) e, s->device());
-            else if constexpr (std::is_class_v<E>) check_launch_struct(name(), i, &e, sizeof(E), s->device());
+            else if constexpr (requires(const E& x, const LaunchPtrs& c) { launch_ptrs(x, c); })
+                launch_ptrs(e, LaunchPtrs{name(), i, s->device()});
             ++i;
         };
         std::apply([&](const auto&... e) { (one(e), ...); }, v);

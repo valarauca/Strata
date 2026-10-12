@@ -36,6 +36,7 @@ template <class T = unsigned char> inline T* strata_slm() {
 #else
 
 #include "strata/ze/ze.hpp"
+#include "strata/ze/launch_ptrs.hpp"
 
 #define STRATA_KERNEL(name, params, ...) \
     inline ::strata::ze::Kernel<void params> k_##name{"__sycl_kernel_strata_k_" #name};

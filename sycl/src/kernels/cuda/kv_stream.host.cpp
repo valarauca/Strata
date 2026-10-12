@@ -18,6 +18,14 @@ void check(const char* what) {
 
 constexpr int RT = 1024;   // the resolve block
 
+// Runs' pointers for the STRATA_ZE_CHECK_DEVICES launch check.
+void launch_ptrs(const Runs& r, const ze::LaunchPtrs& c) {
+    for (int i = 0; i < r.n && i < 4; ++i) {
+        c(r.src[i]);
+        c(r.dst[i]);
+    }
+}
+
 #include "kv_stream.kern.inc"
 
 Runs runs_of(const QsaAttnPools& slots, const KvHostPools& host, int fmt, const QsaShapes& s) {

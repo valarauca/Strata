@@ -202,7 +202,8 @@ strata_ze_bundle(ze_core SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/ze/ze_core.dp.c
 # --- the Level Zero runtime: devices, the context, memory, streams, events, graphs, modules -----------------------
 add_library(strata_ze STATIC ${CMAKE_CURRENT_SOURCE_DIR}/src/ze/ze.cpp ${CMAKE_CURRENT_SOURCE_DIR}/src/ze/modules.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/src/ze/ze_util.cpp
-            ${CMAKE_CURRENT_SOURCE_DIR}/src/ze/intel_gpu.cpp)
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/ze/intel_gpu.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/ze/launch_ptrs.cpp)
 target_link_libraries(strata_ze PUBLIC strata_includes ${STRATA_ZE_LOADER} Threads::Threads)
 strata_ze_embed(strata_ze)
 

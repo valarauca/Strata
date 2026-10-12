@@ -843,17 +843,13 @@ void check_launch_ptr(const char* name, int index, const void* p, int dev) {
     std::abort();
 }
 
-void check_launch_struct(const char* name, int index, const void* data, size_t bytes, int dev) {
-    for (size_t o = 0; o + sizeof(uintptr_t) <= bytes; o += sizeof(uintptr_t)) {
-        uintptr_t w = 0;
-        std::memcpy(&w, (const uint8_t*) data + o, sizeof w);
-        int owner = -1;
-        if (w == 0 || kind_of((const void*) w, &owner) != MemKind::Device || owner == dev) continue;
-        std::fprintf(stderr, "strata ze: kernel %s argument %d holds GPU %d memory (%p at byte %zu), launched on GPU %d\n",
-                     name, index, owner, (const void*) w, o, dev);
-        std::fflush(nullptr);
-        std::abort();
-    }
+void LaunchPtrs::operator()(const void* p) const {
+    int owner = -1;
+    if (p == nullptr || kind_of(p, &owner) != MemKind::Device || owner == dev) return;
+    std::fprintf(stderr, "strata ze: kernel %s argument %d holds GPU %d memory (%p), launched on GPU %d\n", name, index,
+                 owner, p, dev);
+    std::fflush(nullptr);
+    std::abort();
 }
 
 void check_geometry(const KernelBase& k, Dim3 grid, Dim3 block) {

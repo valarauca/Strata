@@ -13,6 +13,14 @@
 
 namespace strata::kernels {
 
+// MappedCopies' pointers for the STRATA_ZE_CHECK_DEVICES launch check.
+inline void launch_ptrs(const MappedCopies& a, const ze::LaunchPtrs& c) {
+    for (const MappedCopy& m : a.c) {
+        c(m.dst);
+        c(m.src);
+    }
+}
+
 #include "elementwise.kern.inc"
 
 namespace {

@@ -9,6 +9,11 @@
 
 namespace strata::prefill::xmx {
 
+// Grp's weight pointers for the STRATA_ZE_CHECK_DEVICES launch check.
+inline void launch_ptrs(const Grp& g, const strata::ze::LaunchPtrs& c) {
+    for (int i = 0; i < g.n && i < kMaxGroup; ++i) c(g.w[i]);
+}
+
 #include "xmx_moe.kern.inc"
 
 namespace {

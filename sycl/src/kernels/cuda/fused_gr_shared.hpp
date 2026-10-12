@@ -47,9 +47,9 @@ static_assert(H_TILE % 256 == 0, "a staged tile holds whole rounds of 32 chunks:
 
 struct GrMulti {
     FusedGrArgs a[kFusedGrMaxT];
-    float* xn;
-    int T;
-    float* part;   ///< [DOWN_SPLIT][kFusedGrMaxT][LR] partial row sums of the down kernel
+    float* xn = nullptr;
+    int T = 0;
+    float* part = nullptr;   ///< [DOWN_SPLIT][kFusedGrMaxT][LR] partial row sums of the down kernel
     int nsplit = DOWN_SPLIT;   ///< SYCL port: splits the up kernel sums (1 after the sliced down kernel's reduce)
     float* part2 = nullptr;    ///< SYCL port: [GRS_SLICES][kFusedGrMaxT][LR + HC] slice partials of the sliced kernel
 };
