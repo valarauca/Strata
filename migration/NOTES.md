@@ -87,5 +87,11 @@ The layer split is not a working path of the reference, so there is no two-GPU b
   libc only. A read-only review of every converted launch against main found no geometry, SLM or argument defect.
 - First GPU run of the new GEMM (`xgemm_parity`, 03:00.0) hit DEVICE_LOST: swapped col_major checked-load arguments,
   fixed in 5d7c757a. GPU work is paused until the user clears it; nothing below is measured yet.
+- On 03:00.0: xgemm_parity passes all 18 shapes (dense f16 4096x2560x2560 113.7 TFLOP/s). The ctest suite: 26 of 29
+  pass, gr_parity fails its QFUSE check (main's code never writes the q8_1 images either), s2_expert_grouped_parity
+  fails old-vs-new bitwise (failing on SYCL too, docs/INTEL.md), ple_parity lacks its Q2_0 fixture.
+  conversation_snapshot_test hit DEVICE_LOST (a write one page below the device USM pool). The review found missing
+  kernel indirect access (fixed, 70fec4b3) but no line that writes there; the serialized rerun then hung the compute
+  engine. Second strike: GPU work stopped for the user.
 - Pending on the GPU: xgemm_parity, the ctest parity suite, kl-a/b/c and kl-a-mtp against `$REF`, serve perf against
   the baseline, memory (auto and 4,096 slots), repeated inference and shutdown, the /proc maps audit.
