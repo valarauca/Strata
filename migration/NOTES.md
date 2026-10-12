@@ -83,7 +83,7 @@ The layer split is not a working path of the reference, so there is no two-GPU b
 
 ## Status (2026-10-11)
 
-- Builds on Level Zero only. On 03:00.0: xgemm_parity 53 of 53, ctest 26 of 29 (gr_parity's QFUSE check and
+- Builds on Level Zero only. On 03:00.0: xgemm_parity passes (43 of 43 in the full run, the 3 large Q4 cases added since pass on their own), ctest 26 of 29 (gr_parity's QFUSE check and
   s2_expert_grouped_parity fail as on SYCL, ple_parity lacks its fixture), the model's kl-a/b/c and MTP captures, warmed
   serve, memory scaling and the process audit (results below).
 - conversation_snapshot_test: its DEVICE_LOST was a kernel writing through pointers in a by-value struct to memory
