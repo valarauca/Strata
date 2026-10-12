@@ -95,3 +95,21 @@ The layer split is not a working path of the reference, so there is no two-GPU b
   engine. Second strike: GPU work stopped for the user.
 - Pending on the GPU: xgemm_parity, the ctest parity suite, kl-a/b/c and kl-a-mtp against `$REF`, serve perf against
   the baseline, memory (auto and 4,096 slots), repeated inference and shutdown, the /proc maps audit.
+
+## Results (L0 engine, 03:00.0, min_freq 2800)
+
+Arms in `$REF/data/l0-ng/<tag>/<set>` (`$REF/scripts/ng-l0.sh`, the reference config and corpus), compared with the
+frozen `ng-compare.py` (notebook `scripts/`), switches declared for device selection and dump paths only.
+
+| set | prompt (SYCL / L0) | decode tok/s (SYCL / L0) |
+|---|---|---|
+| kl-a, 63 tokens | 1,287.5 / 560.4 ms | 10.98 / 10.97 |
+| kl-b, 63 tokens | 1,342.9 / 518.2 ms | 13.32 / 13.34 |
+| kl-c, 4,095 tokens | 641.2 / 1,207.4 tok/s | 13.44 / 13.40 |
+| kl-a with MTP | 1,249.6 / 546.7 ms | 28.73 / 28.29 |
+
+Numerics, kl-a/b/c pooled (768 rows): KLD mean 8.7e-3, 18 top-1 flips, layer 0 bitwise equal, drift from layer 1.
+Corpus top-1 0.7734 (SYCL) / 0.7747 (L0), NLL 0.9710 / 0.9661. The gap is GEMM-order sensitivity, not a bug: two L0
+builds that differ only in the prompt GEMM (gemmstone vs the XMX kernel) differ from each other by KLD mean 3.4e-3 on
+kl-a, the same layer profile as either against SYCL (5.1e-3, 6.0e-3). oneMKL's summation order cannot be reproduced,
+so ng-compare's T0-T2 tiers (written for unchanged GEMMs) cannot pass; the tolerance for this cutover is open.
