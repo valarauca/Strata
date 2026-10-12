@@ -194,6 +194,8 @@ endforeach()
 foreach(k IN LISTS STRATA_CORE_FAMILIES)
   strata_family(src/core ${k} _core_host)
 endforeach()
+strata_ze_bundle(iq_xmx SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cuda/iq_xmx.dp.cpp
+                 KERN ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cuda/iq_xmx.kern.inc OCLOC_OPTIONS "-ze-opt-large-register-file")
 strata_ze_bundle(ze_core SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/ze/ze_core.dp.cpp
                  KERN ${CMAKE_CURRENT_SOURCE_DIR}/src/ze/ze_core.kern.inc)
 

@@ -108,16 +108,9 @@ IQK_DOWN_LANES(20) IQK_DOWN_LANES(23) IQK_DOWN_LANES(42) IQK_DOWN_LANES(7) IQK_D
 IQK_DOWN_LANES(3) IQK_DOWN_LANES(8)
 IQK_DOWNM(20) IQK_DOWNM(23) IQK_DOWNM(42)
 
-// ---------------------------------------------------------------- iq_xmx_grouped (xmxg::launch)
-#ifndef STRATA_NO_DG2_XMX
-#define IQK_XG(name, C)                                                                                                \
-    STRATA_KERNEL_SG(xmxg::kSgW, iq_kernels_##name, (int ty, int gu, const uint16_t* X, float* Y, xmxg::Grp gp, int N,  \
-                                                     int K),                                                           \
-                     xmxg::grouped_kernel<C>(ty, gu != 0, (const sycl::half*) X, Y, gp, N, K))                         \
-    IQK_SEL(iq_kernels_##name, IqXmxg<C>)
-IQK_XG(xg_small, xmxg::Small)
-IQK_XG(xg_big, xmxg::Big)
-#undef IQK_XG
+// ---------------------------------------------------------------- iq_xmx_grouped (xmxg::launch): iq_xmx.kern.inc
+#if !defined(__SYCL_DEVICE_ONLY__)
+#include "iq_xmx.kern.inc"
 #endif
 
 #undef IQK_DOWNM

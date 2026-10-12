@@ -4375,6 +4375,10 @@ void gemm_slm(Src src, const sycl::half* X, int K, int slab_k, float* Y, int64_t
 }
 }  // namespace xmx
 
+#if defined(STRATA_IQ_XMX_MODULE)
+#include "iq_xmx.kern.inc"
+#else
 #include "iq_kernels.kern.inc"
+#endif
 
 }  // namespace strata::kernels
