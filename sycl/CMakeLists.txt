@@ -325,11 +325,10 @@ if(STRATA_SYCL_PARITY)
     target_link_libraries(${p}_parity PRIVATE strata_kernels)
     add_test(NAME ${p}_parity COMMAND ${p}_parity)
   endforeach()
-  # not built here: qsa_topk_parity / qsa_topk_active_parity (the sm_90 thread-block-cluster QSA top-k has no SYCL
-  # counterpart: the callers take the plain kernels), route_window_parity and fused_gr_bench (no migrated copy yet);
-  # on the SYCL runtime still, not moved to Level Zero: native_expert_parity, q5_projection_parity, the benches
-  # (dequant_bench, mmvq_bench, mmvq_sg_bench, q6k_align_bench, gr_bench) and the probes (sycl_router_fast,
-  # sycl_payload_pairs); xmx_gemm_bench and xmx_group_parity take their reference from oneMKL, which is gone
+  # not built here: qsa_topk_parity / qsa_topk_active_parity (the sm_90 thread-block-cluster QSA top-k has no Intel
+  # counterpart: the callers take the plain kernels); the SYCL-runtime benches, probes and parity programs that were not
+  # moved to Level Zero (native_expert_parity, q5_projection_parity, route_window_parity, the mmvq/dequant/gr/xmx
+  # benches) were removed with the SYCL runtime; xgemm_parity covers the prompt path's GEMM
   # (upstream PR #413's gdn_rec_parity is an SM-holding NVIDIA bench - PTX timers, __nanosleep - not built here; the
   # key-head kernel is checked through the engine: output hashes with STRATA_GDN_KEYHEAD=1 and without)
   # the conversation snapshots (#216) against the engine, as upstream's STRATA_BUILD_CONVERSATION_TESTS
