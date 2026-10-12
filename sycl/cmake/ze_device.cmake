@@ -3,7 +3,8 @@
 # strata_ze_bundle(<name> SOURCES <dev.cpp...> [KERN <x.kern.inc...>] [OCLOC_OPTIONS "..."]) compiles each source with the SYCL device
 # compiler alone (icpx -fsycl-device-only: no host code, no SYCL runtime), then tools/ze_devlink.py links the group,
 # splits it where kernels need different properties, compiles it for STRATA_ZE_DEVICE with ocloc and writes
-# <name>.szeb. OCLOC_OPTIONS adds module-wide compile options (-ze-opt-large-register-file: 256 GRF for every
+# <name>.szeb. -D/-U options in CMAKE_CXX_FLAGS reach the device compile too, so host and device agree on every
+# compile-time knob. OCLOC_OPTIONS adds module-wide compile options (-ze-opt-large-register-file: 256 GRF for every
 # kernel of the bundle; a per-kernel SYCL property for it drops a free-function kernel). strata_ze_embed(<target> <bundles...>) links the bundles into <target> as read-only data.
 include_guard(GLOBAL)
 
@@ -40,6 +41,16 @@ function(strata_ze_bundle name)
   foreach(d IN LISTS defs)
     list(APPEND dflags "-D${d}")
   endforeach()
+  separate_arguments(cxx_flags NATIVE_COMMAND "${CMAKE_CXX_FLAGS}")
+  foreach(f IN LISTS cxx_flags)
+    if(f MATCHES "^-[DU]")
+      list(APPEND dflags "${f}")
+    endif()
+  endforeach()
+  set(cppargs "")
+  foreach(d IN LISTS dflags)
+    list(APPEND cppargs "--cpp-arg=${d}")
+  endforeach()
   set(dir ${CMAKE_BINARY_DIR}/ze/${name})
   file(MAKE_DIRECTORY ${dir})
   set(bcs "")
@@ -66,7 +77,7 @@ function(strata_ze_bundle name)
   add_custom_command(OUTPUT ${out}
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/ze_devlink.py --out ${out} --work ${dir}/link
             --device ${STRATA_ZE_DEVICE} --ocloc-options=${opts} --compiler-dir ${STRATA_ZE_COMPILER_DIR}
-            --ocloc ${STRATA_OCLOC} ${expect} ${bcs}
+            --ocloc ${STRATA_OCLOC} --cpp ${STRATA_ICPX} ${cppargs} ${expect} ${bcs}
     DEPENDS ${bcs} ${B_KERN} ${CMAKE_CURRENT_SOURCE_DIR}/tools/ze_devlink.py
     COMMENT "device ${name}: link + ocloc ${STRATA_ZE_DEVICE}"
     VERBATIM)

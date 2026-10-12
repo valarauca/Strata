@@ -482,6 +482,11 @@ std::vector<uint8_t> probe(Weights w, int64_t T, int64_t N, int64_t K, bool accu
     return image;
 }
 
+bool supported(int dev) {
+    Hardware hw;
+    return hardware_of(dev, hw);
+}
+
 bool gemm(Weights w, const uint16_t* X, int64_t ldx, const void* W, int64_t ldw, const uint16_t* scales, float* Y,
           int64_t ldy, int64_t T, int64_t N, int64_t K, bool accumulate, void* stream) {
     if (T <= 0 || N <= 0) return true;

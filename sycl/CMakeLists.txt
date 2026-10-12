@@ -40,9 +40,12 @@ set(_strata_defs "")
 if(STRATA_SYCL_SPIN_MAX)
   list(APPEND _strata_defs STRATA_SYCL_SPIN_MAX=${STRATA_SYCL_SPIN_MAX}u)
 endif()
-if(STRATA_ZE_DEVICE MATCHES "^(bmg|lnl)")
-  list(APPEND _strata_defs STRATA_XMX_SG16=1)   # the grouped XMX kernels on sub-group 16, joint_matrix 8x16x16 (Xe2)
+if(NOT STRATA_ZE_DEVICE MATCHES "^(bmg|lnl)")
+  message(FATAL_ERROR "STRATA_ZE_DEVICE=${STRATA_ZE_DEVICE}: the Level Zero engine needs an Xe2 GPU (bmg-*, lnl-*). Its "
+                      "XMX GEMMs are sub-group 16 with 8x16x16 joint_matrix tiles and gemmstone generates Xe2 kernels only; "
+                      "Arc A-series (DG2) has neither")
 endif()
+list(APPEND _strata_defs STRATA_XMX_SG16=1)   # the grouped XMX kernels on sub-group 16, joint_matrix 8x16x16 (Xe2)
 add_compile_definitions(${_strata_defs})
 # icpx defaults to a fast floating-point model; the host code (rope tables, CPU references, sampling on the host) was
 # measured with the precise one, as was the device code.
@@ -356,19 +359,26 @@ if(STRATA_SYCL_PARITY)
   target_link_libraries(conversation_snapshot_test PRIVATE strata_engine)
   add_test(NAME conversation_snapshot_test COMMAND conversation_snapshot_test)
   set_tests_properties(conversation_snapshot_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
-  # the prompt-attention parity takes a context length, not --selftest, and needs the tensor-core kernel (not
-  # ported yet: it reports "refused the pools" here). Built, not registered.
+  add_test(NAME xgemm_parity COMMAND xgemm_parity)
+  set_tests_properties(xgemm_parity PROPERTIES TIMEOUT 600)
+  # the prompt-attention parity takes a context length, query rows and repeats, not --selftest, and needs the
+  # tensor-core kernel (not ported: it reports "refused the pools" here). Registered disabled, so ctest lists it.
   strata_resolve(_src src/kernels/qsa_prompt_attn_parity.cpp)
   add_executable(qsa_prompt_attn_parity ${_src})
   target_link_libraries(qsa_prompt_attn_parity PRIVATE strata_kernels)
+  add_test(NAME qsa_prompt_attn_parity COMMAND qsa_prompt_attn_parity 4096 512 1)
+  set_tests_properties(qsa_prompt_attn_parity PROPERTIES DISABLED TRUE)
   # the hybrid K8V4 KV test (upstream 0.1.27) passes its appends, gathers and attention here and fails only its
-  # last step, the same tensor-core prompt kernel. Built, not registered, until that kernel is ported.
+  # last step, the same tensor-core prompt kernel. Registered disabled until that kernel is ported.
   strata_resolve(_src src/kernels/kv_hybrid_parity.cpp)
   add_executable(kv_hybrid_parity ${_src})
   target_include_directories(kv_hybrid_parity PRIVATE ${STRATA_ROOT}/src/kernels)
   target_link_libraries(kv_hybrid_parity PRIVATE strata_kernels)
-  # the multi_exact contract of native_mmvq, bitwise (upstream 0.1.40). Built, not registered.
+  add_test(NAME kv_hybrid_parity COMMAND kv_hybrid_parity)
+  set_tests_properties(kv_hybrid_parity PROPERTIES DISABLED TRUE)
+  # the multi_exact contract of native_mmvq, bitwise (upstream 0.1.40)
   strata_resolve(_src src/kernels/mmvq_multi_parity.cpp)
   add_executable(mmvq_multi_parity ${_src})
   target_link_libraries(mmvq_multi_parity PRIVATE strata_kernels)
+  add_test(NAME mmvq_multi_parity COMMAND mmvq_multi_parity)
 endif()

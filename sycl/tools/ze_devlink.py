@@ -7,8 +7,10 @@ The steps are the ones icpx runs for an AOT SYCL build (icpx -### shows them), w
 bitcode, link the SYCL device libraries it needs, sycl-post-link (split only where kernels need different properties,
 for example a required sub-group size), llvm-spirv, then ocloc for the device. The bundle (format in
 src/ze/modules.cpp) holds every resulting module and the names of the kernels it defines. A source group whose
-declared entries (STRATA_KERNEL lines of the given .kern.inc files) are not all present fails the build: a kernel the
-device compiler dropped must not surface as a missing kernel at run time.
+declared entries (the STRATA_KERNEL entries of the given .kern.inc files, after the C preprocessor has expanded the
+helper macros that stamp them, as the device compile sees them: __SYCL_DEVICE_ONLY__ and the --cpp-arg defines) are not
+all present fails the build: a kernel
+the device compiler dropped must not surface as a missing kernel at run time.
 """
 from __future__ import annotations
 
@@ -48,14 +50,25 @@ def run(cmd: list[str], cwd: str | None = None) -> None:
         sys.exit(1)
 
 
-def declared(kern_files: list[str]) -> set[str]:
+def declared(kern_files: list[str], cpp: str, cpp_args: list[str], work: str) -> set[str]:
     names = set()
-    pat = re.compile(r"^\s*(?:STRATA_KERNEL_SG\s*\(\s*[^,()]+,|STRATA_KERNEL\s*\()\s*([A-Za-z_][A-Za-z0-9_]*)\s*,", re.M)
-    for f in kern_files:
-        text = open(f).read()
-        text = re.sub(r"^\s*#\s*define.*?(?<!\\)$", "", text, flags=re.M | re.S)
-        for m in pat.finditer(text):
-            names.add("__sycl_kernel_strata_k_" + m.group(1))
+    prelude = os.path.join(work, "expect_prelude.h")
+    with open(prelude, "w") as f:
+        f.write("#define STRATA_KERNEL(name, params, ...) STRATA_EXPECT_ENTRY name STRATA_EXPECT_END\n"
+                "#define STRATA_KERNEL_SG(sg, name, params, ...) STRATA_EXPECT_ENTRY name STRATA_EXPECT_END\n")
+    pat = re.compile(r"STRATA_EXPECT_ENTRY\s+([A-Za-z_][A-Za-z0-9_]*)\s+STRATA_EXPECT_END")
+    for k in kern_files:
+        r = subprocess.run([cpp, "-E", "-P", "-x", "c++", "-std=c++20", "-D__SYCL_DEVICE_ONLY__=1", *cpp_args, "-include",
+                            prelude, k],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if r.returncode != 0:
+            sys.stderr.write(f"ze_devlink: cannot preprocess {k} for its kernel list:\n{r.stderr}\n")
+            sys.exit(1)
+        found = pat.findall(r.stdout)
+        if not found:
+            sys.stderr.write(f"ze_devlink: {k} declares no kernel after preprocessing\n")
+            sys.exit(1)
+        names.update("__sycl_kernel_strata_k_" + n for n in found)
     return names
 
 
@@ -67,7 +80,9 @@ def main() -> int:
     ap.add_argument("--ocloc-options", default="")
     ap.add_argument("--compiler-dir", required=True)
     ap.add_argument("--ocloc", default="ocloc")
-    ap.add_argument("--expect", action="append", default=[], help="a .kern.inc whose plain entries must all be present")
+    ap.add_argument("--expect", action="append", default=[], help="a .kern.inc whose entries must all be present")
+    ap.add_argument("--cpp", default="cpp", help="the C preprocessor that expands the --expect files (icpx)")
+    ap.add_argument("--cpp-arg", action="append", default=[], help="a define the device sources are compiled with")
     ap.add_argument("inputs", nargs="+")
     a = ap.parse_args()
     cdir = a.compiler_dir
@@ -96,7 +111,7 @@ def main() -> int:
         names = [n.strip() for n in open(sym).read().splitlines() if n.strip()]
         mods.append((open(binpath, "rb").read(), names))
     present = {n for _, names in mods for n in names}
-    missing = sorted(declared(a.expect) - present)
+    missing = sorted(declared(a.expect, a.cpp, a.cpp_arg, work) - present)
     if missing:
         sys.stderr.write(f"ze_devlink: {a.out}: declared kernels missing from the device code: {' '.join(missing)}\n")
         return 1

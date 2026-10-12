@@ -43,11 +43,14 @@ std::mutex g_import_mu;
 std::unordered_map<const PinnedArena*, std::vector<void*>> g_imports;
 
 // Maps the arena's bytes [lo, hi) for every GPU (ze::import_host), page-rounded so that slices never overlap: a slice
-// owns the pages that start inside it, the last one runs to the end of its page.
-bool import_pages(const PinnedArena* arena, uint8_t* base, uint64_t lo, uint64_t hi, uint64_t total) {
+// owns the pages that start inside it, the last one runs to the end of its page. `mapped_end` (when given) gets where
+// the mapped prefix now ends: the page boundary at or below `hi`, or `total` for the last slice.
+bool import_pages(const PinnedArena* arena, uint8_t* base, uint64_t lo, uint64_t hi, uint64_t total,
+                  uint64_t* mapped_end = nullptr) {
     const uint64_t pg = (uint64_t) sysconf(_SC_PAGESIZE);
     const uint64_t a = lo / pg * pg;
     const uint64_t b = hi >= total ? (total + pg - 1) / pg * pg : hi / pg * pg;
+    if (mapped_end) *mapped_end = b < total ? b : total;
     if (b <= a) return true;
     if (!ze::import_host(base + a, (size_t) (b - a))) return false;
     std::lock_guard<std::mutex> lk(g_import_mu);
@@ -423,9 +426,10 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t> &bounds,
             for (size_t i = 0; i + 1 < bounds.size(); ++i) {
                 const uint64_t off = bounds[i], n = bounds[i + 1] - bounds[i];
                 if (limited && (off > limit || n > limit - off)) break;
-                if (!import_pages(this, (uint8_t*) base, off, off + n, bounds.back())) break;
+                uint64_t end = 0;
+                if (!import_pages(this, (uint8_t*) base, off, off + n, bounds.back(), &end)) break;
                 slice_starts.push_back(off);
-                registered_bytes = off + n;
+                registered_bytes = end;
                 ++registered_slices;
             }
             char gib[32];
@@ -505,9 +509,10 @@ void PinnedArena::register_slices(std::atomic<int> &ready) {
     int i = 0;
     for (; base != nullptr && i < n; ++i) {
         const uint64_t off = bounds_[(size_t) i], len = bounds_[(size_t) i + 1] - off;
-        if (!import_pages(this, (uint8_t*) base, off, off + len, bounds_.back())) break;
+        uint64_t end = 0;
+        if (!import_pages(this, (uint8_t*) base, off, off + len, bounds_.back(), &end)) break;
         slice_starts.push_back(off);
-        registered_bytes = off + len;
+        registered_bytes = end;
         ++registered_slices;
         ready.store(i + 1, std::memory_order_release);
     }

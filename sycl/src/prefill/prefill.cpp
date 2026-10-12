@@ -821,10 +821,10 @@ constexpr int MMQ_GROUP = 16;                  // experts per MMQ launch (the ga
 // llama.cpp zero-pads after every tensor, and so does a group buffer: this many zeroed bytes follow its last expert.
 constexpr size_t MMQ_TAIL = 4096;
 // Q4_0 expert layers run on gemmstone straight from repacked blocks (strata/gemmstone.hpp, strata/prefill/q4pack.hpp)
-// instead of dequantize + fp16 GEMM; STRATA_PF_GS_Q4=0 keeps the dequantize path for them too.
-bool gs_q4_layer(const strata::kernels::cpu::NativeFmt& f) {
+// instead of dequantize + fp16 GEMM on a GPU gemmstone supports; STRATA_PF_GS_Q4=0 keeps the dequantize path for them too.
+bool gs_q4_layer(const strata::kernels::cpu::NativeFmt& f, int dev) {
     static const bool on = [] { const char* v = std::getenv("STRATA_PF_GS_Q4"); return !(v && v[0] == '0'); }();
-    return on && f.gu_type == 2 && f.d_type == 2 && f.n_embd % 32 == 0 && f.n_ff % 32 == 0 &&
+    return on && strata::gs::supported(dev) && f.gu_type == 2 && f.d_type == 2 && f.n_embd % 32 == 0 && f.n_ff % 32 == 0 &&
            f.gu_row == (size_t) (f.n_embd / 32 * 18) && f.d_row == (size_t) (f.n_ff / 32 * 18);
 }
 
@@ -3318,7 +3318,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                             }
                             const bool xmx_on = strata::prefill::xmx::mode() == 1;
                             const int q = (int) (j % (size_t) dq_slots());
-                            const bool q4gs = lay.native && !xmx_on && gs_q4_layer(lay.fmt[(size_t) l]);
+                            const bool q4gs = lay.native && !xmx_on && gs_q4_layer(lay.fmt[(size_t) l], m.device);
                             if (lay.native) {
                                 // plan v0.3 P6: a native pack's layer, dequantized by llama.cpp's own formulas
                                 const auto& f = lay.fmt[(size_t) l];

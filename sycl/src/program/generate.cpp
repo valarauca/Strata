@@ -3524,6 +3524,7 @@ int main(int argc, char **argv) {
         }
     }
     std::vector<std::vector<std::unique_ptr<strata::core::SessionState>>> bslot_ss;
+    std::vector<std::vector<void*>> bslot_buf;   // each slot session's carved device memory, beside it
     if (o.batch != 0) {
         const int cap = strata::kernels::kVerifyMaxT;
         const char* off = !o.serve ? "it needs --serve" : o.batch < 2 ? "it needs 2 or more slots"
@@ -3544,6 +3545,7 @@ int main(int argc, char **argv) {
     }
     if (o.batch > 0) {
         bslot_ss.resize(1 + stages.size());
+        bslot_buf.resize(1 + stages.size());
         int fit = o.batch;   // the slots every stage could carve
         uint64_t bytes0 = 0;
         for (size_t k = 0; k < bslot_ss.size(); ++k) {
@@ -3560,7 +3562,7 @@ int main(int argc, char **argv) {
                     strata::core::session_init(g, o.max_context, K, buf, *u, lo,
                                                hi) == 0) {
                     if (buf != nullptr) {
-                        strata::core::session_release(*u);
+                        strata::core::session_destroy(*u);
                         strata::ze::free(buf);
                     }
                     size_t fb = 0, tb = 0;
@@ -3573,6 +3575,7 @@ int main(int argc, char **argv) {
                 }
                 strata::core::session_zero(*u, g, nullptr, nullptr);
                 bslot_ss[k].push_back(std::move(u));
+                bslot_buf[k].push_back(buf);
             }
             strata::ze::device_sync();
             size_t fb = 0, tb = 0;
@@ -3580,11 +3583,25 @@ int main(int argc, char **argv) {
             std::fprintf(stderr, "strata generate: --batch: %d slot sessions on CUDA%d (%.2f GiB each); %.2f GiB free\n",
                          (int) bslot_ss[k].size(), dev, (double) bytes / 1073741824.0, (double) fb / 1073741824.0);
         }
-        for (auto& v : bslot_ss) if ((int) v.size() > fit) v.resize((size_t) fit);   // the same count on every stage
+        auto drop_slots = [&](int keep) {   // the same count on every stage; a dropped slot gives back all it holds
+            for (size_t k = 0; k < bslot_ss.size(); ++k) {
+                const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
+                strata::ze::device_sync();
+                while ((int) bslot_ss[k].size() > keep) {
+                    strata::core::session_destroy(*bslot_ss[k].back());
+                    strata::ze::free(bslot_buf[k].back());
+                    bslot_ss[k].pop_back();
+                    bslot_buf[k].pop_back();
+                }
+            }
+        };
+        drop_slots(fit);
         if (fit < 2) {
             std::fprintf(stderr, "strata generate: WARNING: --batch is off: not two slot sessions fit (a smaller "
                                  "--max-context or KV streaming, --kv-resident, makes them smaller)\n");
+            drop_slots(0);
             bslot_ss.clear();
+            bslot_buf.clear();
             o.batch = 0;
         } else {
             o.batch = fit;
@@ -10540,7 +10557,7 @@ int main(int argc, char **argv) {
             ms_embed += std::chrono::duration<double, std::milli>(n - tp).count();
             tp = n;
         }
-        if (ss.ple.ready() && !strata::core::ple_finish_token(ss.ple, token_stream, err)) {
+        if (ss.ple.ready() && !strata::core::ple_finish_token(ss.ple, main_cs, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }

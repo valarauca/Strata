@@ -28,6 +28,9 @@ enum class Weights : int {
 bool gemm(Weights w, const uint16_t* X, int64_t ldx, const void* W, int64_t ldw, const uint16_t* scales, float* Y,
           int64_t ldy, int64_t T, int64_t N, int64_t K, bool accumulate, void* stream);
 
+/// True when gemmstone generates kernels for GPU `dev` (Xe2); gemm() returns false on any other.
+bool supported(int dev);
+
 /// Generates, without any GPU, the kernel gemm() would choose for a case on an Xe2 discrete GPU with `eu_count` EUs and
 /// 64-byte aligned operands, for offline checks. Returns its native binary (empty when there is none) and describes the
 /// chosen strategy in `what`.

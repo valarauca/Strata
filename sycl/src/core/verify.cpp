@@ -641,8 +641,8 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
     sink_.staging = (unsigned long long) staging_;
     sink_.staging_cap = kStagingBlobs;
     (void) TS;
-    copy_ = new strata::ze::Stream(-1, strata::ze::has_copy_engine() ? strata::ze::Stream::Engine::Copy
-                                                                     : strata::ze::Stream::Engine::Compute);
+    const bool dma_engine = strata::ze::has_copy_engine() && strata::ze::device_info(strata::ze::current_device()).battlemage;
+    copy_ = new strata::ze::Stream(-1, dma_engine ? strata::ze::Stream::Engine::Copy : strata::ze::Stream::Engine::Compute);
     cs_ = ext_stream_ != nullptr ? ext_stream_ : new strata::ze::Stream();
     sh_cs_ = new strata::ze::Stream();
     owns_streams_ = true;
@@ -1936,7 +1936,7 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
             }
             copy_->sync();   // fetch_dma's copies and its flag-B host task
             std::atomic_thread_fence(std::memory_order_seq_cst);
-            raise_flag(h_flagB_, want);
+            raise_b(want);
             if (want == 1 && do_ple) {   // layer 1's pre copies h_ple_ after layer 0's wait on the M flag
                 const Clock::time_point tp = Clock::now();
                 if (!ss.ple.table->gather_batch(ple_rows, (size_t) T, h_ple_, err)) return false;
@@ -2070,7 +2070,7 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
             sink_.start2[0] = 0;
             std::atomic_thread_fence(std::memory_order_seq_cst);
             *(volatile uint32_t*) h_flagA_ = want;
-            raise_flag(h_flagB_, want);
+            raise_b(want);
         }
         // Layer 1's pre(1, 0) copies h_ple_ -> ple_ after Layer 0's wait_flag_ge(m_flag_, 1).
         // By collecting PLE here at k == 0 (after publishing flagA/flagB for Layer 0 so the GPU can run
@@ -2258,7 +2258,7 @@ void Verifier::fetch_dma(void *ctx, const uint8_t *const *src, int n,
                          size_t bytes) {
     Verifier* v = (Verifier*) ctx;
     const uint32_t want = v->cur_layer_ + 1;
-    if (n <= 0) { raise_flag(v->h_flagB_, want); return; }
+    if (n <= 0) { v->raise_b(want); return; }
     v->copy_used_ = true;
     uint8_t* stage = (uint8_t*) v->sink_.staging;                  // this group's half in a split window
     // STRATA_DMA_BATCH (midhatn's #807, F12): the group's independent uploads as one cudaMemcpyBatchAsync.  Mode 0 is
@@ -2276,6 +2276,17 @@ void Verifier::fetch_dma(void *ctx, const uint8_t *const *src, int n,
     fs.flag = v->h_flagB_;
     fs.value = want;
     strata::ze::host_func(*v->copy_, [](void* p) { raise_flag(((FlagSet*) p)->flag, ((FlagSet*) p)->value); }, &fs);
+}
+
+void Verifier::raise_b(uint32_t want) {
+    if (!copy_used_ || copy_ == nullptr || copy_->idle()) {
+        raise_flag(h_flagB_, want);
+        return;
+    }
+    FlagSet& fs = flag_sets_[(want - 1) % (sizeof flag_sets_ / sizeof flag_sets_[0])];
+    fs.flag = h_flagB_;
+    fs.value = want;
+    strata::ze::host_func(*copy_, [](void* p) { raise_flag(((FlagSet*) p)->flag, ((FlagSet*) p)->value); }, &fs);
 }
 
 void Verifier::publish_plan(void* ctx) {
@@ -2737,7 +2748,7 @@ bool Verifier::run_slot_rows(const int *rows, int S, const int32_t *tokens,
             sink_.start2[0] = 0;
             std::atomic_thread_fence(std::memory_order_seq_cst);
             *(volatile uint32_t*) h_flagA_ = want;
-            raise_flag(h_flagB_, want);
+            raise_b(want);
         }
         *flag = want;
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
@@ -2886,7 +2897,7 @@ int Verifier::batch_poll(PoolMultiFn pool, void *user, std::string &err) {
             sink_.start2[0] = 0;
             std::atomic_thread_fence(std::memory_order_seq_cst);
             *(volatile uint32_t*) h_flagA_ = want;
-            raise_flag(h_flagB_, want);
+            raise_b(want);
         }
         *(volatile uint32_t*) h_flag_ = want;
         ms_pool += ms_since(b);
@@ -3144,7 +3155,7 @@ int Verifier::service(PoolMultiFn pool, void *user, std::string &err) {
             sink_.start2[0] = 0;
             std::atomic_thread_fence(std::memory_order_seq_cst);
             *(volatile uint32_t*) h_flagA_ = want;
-            raise_flag(h_flagB_, want);
+            raise_b(want);
         }
         if (fl_k_ == 0 && !gather_ple()) return -1;
         *(volatile uint32_t*) h_flag_ = want;

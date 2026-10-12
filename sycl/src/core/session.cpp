@@ -138,6 +138,23 @@ void session_release(SessionState& s) {
     }
 }
 
+void session_destroy(SessionState& s) {
+    session_release(s);
+    for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j) {
+        QsaState& q = s.qsa_states[s.qsa_ord0 + j];
+        if (q.host_step) strata::ze::free(q.host_step);
+        if (q.host_pos) strata::ze::free(q.host_pos);
+        void* pool = q.host.k_pool ? (void*) q.host.k_pool : q.host.k_q ? (void*) q.host.k_q : (void*) q.host.k_q4;
+        if (pool) strata::ze::free(pool);
+        q.host_step = nullptr;
+        q.host_pos = nullptr;
+        q.host = strata::kernels::KvHostPools{};
+    }
+    delete[] s.qsa_states;
+    s.qsa_states = nullptr;
+    s.qsa_alloc = 0;
+}
+
 void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, void* stream) {
     strata::ze::Stream* cs = strata::ze::stream_of(stream);
     // the residual: `hc` copies of the one vector a caller hands in.  A real sequence's first token is the

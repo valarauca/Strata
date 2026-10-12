@@ -185,6 +185,16 @@ public:
     template <class... A> void operator()(Stream* s, Dim3 grid, Dim3 block, size_t slm, A&&... a) const;
 };
 
+/// The host functions of one stream still queued or running (strata/ze/ze_util.cpp), shared with the worker and with
+/// device_sync so a waiter never touches a stream that is going away.
+struct HostFuncCount {
+    std::mutex mu;
+    std::condition_variable cv;
+    int pending = 0;
+    /// Blocks until none is queued or running.
+    void wait();
+};
+
 /// An in-order command stream on one engine of one GPU (an immediate command list).
 class Stream {
 public:
@@ -218,8 +228,8 @@ public:
     /// `e` completes when everything appended to this stream before it has.
     void record(Event& e);
     /// Work appended to this stream after this call starts after `e`'s last record. When that record is on another GPU
-    /// the host waits for it here: a GPU may only wait on a counter-based event of a peer it has access to, and the
-    /// event's counter lives with the GPU that signaled it.
+    /// the GPU waits for it if it has peer access to that GPU (a GPU may only wait on a counter-based event of a peer it
+    /// has access to); otherwise, or with STRATA_ZE_PEER_WAIT=0, the host waits for it here.
     void wait(Event& e);
     /// Host wait for everything appended so far, host functions included. Exits on DEVICE_LOST.
     void sync();
@@ -257,16 +267,12 @@ private:
     friend Stream& default_stream(int);
     friend Stream& copy_stream(int);
     friend void host_func(Stream& s, void (*fn)(void*), void* arg);
-    /// The runtime's host-function worker reports a finished callback of `s` (strata/ze/ze_util.cpp).
-    friend void host_func_finished(Stream& s);
     friend void free(void* p);
     friend void device_sync(int ordinal);
     ze_command_list_handle_t target() const { return cap_ ? cap_->list_ : imm_; }
     void after_append();
     void append_launch(ze_kernel_handle_t h, const char* name, int dev, Dim3 grid, Dim3 block, void** args);
     void check_operand(const void* p, const char* what) const;
-    void host_func_done();
-    void wait_host_funcs();
     std::shared_ptr<Event> fence_locked();
     static constexpr int kBounce = 4;
     int dev_;
@@ -281,9 +287,7 @@ private:
     std::atomic<uint64_t> appends_{0};
     std::shared_ptr<Event> fence_;
     uint64_t fence_at_ = ~0ull;
-    std::mutex hf_mu_;
-    std::condition_variable hf_cv_;
-    int hf_pending_ = 0;
+    std::shared_ptr<HostFuncCount> hf_ = std::make_shared<HostFuncCount>();
 };
 
 /// The current GPU's default compute stream (ordinal -1), shared by every thread of the process.
@@ -328,13 +332,13 @@ private:
     ze_event_handle_t ev_ = nullptr;
     void* pool_ = nullptr;
     uint32_t index_ = 0;
-    bool recorded_ = false;
+    std::atomic<bool> recorded_{false};
     bool timing_ = false;
     uint64_t* stamp_ = nullptr;
     int stamp_dev_ = 0;
-    int dev_ = -1;                       ///< GPU of the last signal (a stream record or a graph replay)
-    Stream::Capture* captured_in_ = nullptr;
-    bool replayed_ = false;              ///< recorded in a capture whose graph has been launched since
+    std::atomic<int> dev_{-1};                          ///< GPU of the last signal (a stream record or a graph replay)
+    std::atomic<Stream::Capture*> captured_in_{nullptr};
+    std::atomic<bool> replayed_{false};                 ///< recorded in a capture whose graph has been launched since
 };
 
 /// A recorded command list, replayed with Stream::launch(Graph&).

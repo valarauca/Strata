@@ -94,6 +94,7 @@ public:
     };
     std::mutex defer_mu;
     std::vector<Deferred> deferred;
+    std::vector<std::shared_ptr<Event>> retired;   ///< streams' replaced fences, dropped once they have passed
 
     std::mutex cap_mu;              // Capture::events and Event::captured_in_
     std::mutex launch_mu[64];       // appends of one kernel handle (WithArguments sets the kernel's arguments)
@@ -533,11 +534,45 @@ bool can_access_peer(int a, int b) {
 
 namespace {
 
+// Whether GPU `a`'s list may wait on a counter-based event GPU `b` signaled (the GPU needs peer access to the signaler,
+// ze_api.h): cached per pair; STRATA_ZE_PEER_WAIT=0 keeps every cross-GPU wait on the host.
+bool peer_wait_ok(int a, int b) {
+    static const bool on = env_on("STRATA_ZE_PEER_WAIT", true);
+    static std::atomic<int> cache[kMaxDevices][kMaxDevices] = {};
+    if (!on || a < 0 || b < 0 || a >= kMaxDevices || b >= kMaxDevices) return false;
+    int v = cache[a][b].load(std::memory_order_acquire);
+    if (v == 0) {
+        v = can_access_peer(a, b) ? 1 : 2;
+        cache[a][b].store(v, std::memory_order_release);
+    }
+    return v == 1;
+}
+
+}  // namespace
+
+namespace {
+
+void retire_fence(std::shared_ptr<Event> f) {
+    Runtime& r = rt();
+    std::lock_guard<std::mutex> lk(r.defer_mu);
+    r.retired.push_back(std::move(f));
+}
+
 void reap(bool block) {
     Runtime& r = rt();
     std::vector<Runtime::Deferred> done;
+    std::vector<std::shared_ptr<Event>> passed_fences;
     {
         std::lock_guard<std::mutex> lk(r.defer_mu);
+        for (auto it = r.retired.begin(); it != r.retired.end();) {
+            if (block) (*it)->sync();
+            if (block || (*it)->query()) {
+                passed_fences.push_back(std::move(*it));
+                it = r.retired.erase(it);
+            } else {
+                ++it;
+            }
+        }
         for (auto it = r.deferred.begin(); it != r.deferred.end();) {
             bool passed = true;
             for (auto& f : it->fences) {
@@ -883,7 +918,7 @@ Stream::~Stream() {
         std::abort();
     }
     if (imm_) zeCommandListHostSynchronize(imm_, UINT64_MAX);
-    wait_host_funcs();
+    hf_->wait();
     {
         DeviceState& st = dev_state(dev_);
         std::lock_guard<std::mutex> lk(st.streams_mu);
@@ -896,15 +931,9 @@ Stream::~Stream() {
     }
 }
 
-void Stream::host_func_done() {
-    std::lock_guard<std::mutex> lk(hf_mu_);
-    --hf_pending_;
-    hf_cv_.notify_all();
-}
-
-void Stream::wait_host_funcs() {
-    std::unique_lock<std::mutex> lk(hf_mu_);
-    hf_cv_.wait(lk, [&] { return hf_pending_ == 0; });
+void HostFuncCount::wait() {
+    std::unique_lock<std::mutex> lk(mu);
+    cv.wait(lk, [&] { return pending == 0; });
 }
 
 void Stream::check_operand(const void* p, const char* what) const {
@@ -920,10 +949,12 @@ void Stream::check_operand(const void* p, const char* what) const {
 std::shared_ptr<Event> Stream::fence_locked() {
     const uint64_t at = appends_.load(std::memory_order_relaxed);
     if (fence_ && fence_at_ == at) return fence_;
-    if (!fence_) fence_ = std::make_shared<Event>();
-    STRATA_ZE_CHECK(zeCommandListAppendBarrier(imm_, fence_->ev_, 0, nullptr));
-    fence_->recorded_ = true;
-    fence_->dev_ = dev_;
+    auto f = std::make_shared<Event>();
+    STRATA_ZE_CHECK(zeCommandListAppendBarrier(imm_, f->ev_, 0, nullptr));
+    f->recorded_ = true;
+    f->dev_ = dev_;
+    if (fence_) retire_fence(std::move(fence_));
+    fence_ = std::move(f);
     fence_at_ = at;
     return fence_;
 }
@@ -993,7 +1024,7 @@ void Stream::append_launch(ze_kernel_handle_t h, const char* name, int dev, Dim3
     if (r != ZE_RESULT_SUCCESS) {
         std::fprintf(stderr, "strata ze: launch of %s (grid %ux%ux%u block %ux%ux%u) failed: %s%s\n", name, grid.x, grid.y,
                      grid.z, block.x, block.y, block.z, result_name(r), r == ZE_RESULT_ERROR_DEVICE_LOST ? " - DEVICE_LOST" : "");
-        std::fflush(stderr);
+        std::fflush(nullptr);
         std::_Exit(1);
     }
     g_count.launches.fetch_add(1, std::memory_order_relaxed);
@@ -1114,7 +1145,7 @@ void Stream::record(Event& e) {
     {
         std::lock_guard<std::mutex> cl(rt().cap_mu);
         if (e.captured_in_ != nullptr && e.captured_in_ != cap_) {
-            auto& v = e.captured_in_->events;
+            auto& v = e.captured_in_.load()->events;
             v.erase(std::remove(v.begin(), v.end(), &e), v.end());
             e.captured_in_ = nullptr;
         }
@@ -1144,8 +1175,14 @@ void Stream::record(Event& e) {
 void Stream::wait(Event& e) {
     std::unique_lock<std::recursive_mutex> lk(mu_);
     if (!e.recorded_) return;
-    if (e.captured_in_ != nullptr && !e.replayed_) {
-        Capture* c = e.captured_in_;
+    Capture* c = nullptr;
+    bool replayed = false;
+    {
+        std::lock_guard<std::mutex> cl(rt().cap_mu);
+        c = e.captured_in_;
+        replayed = e.replayed_;
+    }
+    if (c != nullptr && !replayed) {
         if (cap_ == c) return;
         if (cap_ == nullptr && c->list_ != nullptr) {
             if (c->dev != dev_) {
@@ -1165,7 +1202,7 @@ void Stream::wait(Event& e) {
         static std::atomic<bool> said{false};
         if (check_devices() || !said.exchange(true)) {
             std::fprintf(stderr, "strata ze: a capture on GPU %d waited on an event recorded outside it (last signaled on GPU %d): "
-                                 "the graph does not wait on it\n", dev_, e.dev_);
+                                 "the graph does not wait on it\n", dev_, e.dev_.load());
             if (check_devices()) {
                 std::fflush(nullptr);
                 std::abort();
@@ -1173,7 +1210,8 @@ void Stream::wait(Event& e) {
         }
         return;
     }
-    if (e.dev_ >= 0 && e.dev_ != dev_) {
+    const int from = e.dev_;
+    if (from >= 0 && from != dev_ && !peer_wait_ok(dev_, from)) {
         lk.unlock();
         e.sync();
         return;
@@ -1193,7 +1231,7 @@ void Stream::sync() {
     const ze_result_t r = zeEventHostSynchronize(f->ev_, UINT64_MAX);
     if (r != ZE_RESULT_SUCCESS) fatal("zeEventHostSynchronize (stream sync)", r, __FILE__, __LINE__);
     if (rt().trace) std::fprintf(stderr, "strata ze trace: stream %p sync done\n", (void*) this);
-    wait_host_funcs();
+    hf_->wait();
 }
 
 bool Stream::sync_for(uint64_t timeout_ms) {
@@ -1205,14 +1243,14 @@ bool Stream::sync_for(uint64_t timeout_ms) {
         if (r == ZE_RESULT_NOT_READY) return false;
         if (r != ZE_RESULT_SUCCESS) fatal("zeCommandListHostSynchronize", r, __FILE__, __LINE__);
     }
-    std::unique_lock<std::mutex> hl(hf_mu_);
-    return hf_cv_.wait_until(hl, deadline, [&] { return hf_pending_ == 0; });
+    std::unique_lock<std::mutex> hl(hf_->mu);
+    return hf_->cv.wait_until(hl, deadline, [&] { return hf_->pending == 0; });
 }
 
 bool Stream::idle() {
     {
-        std::lock_guard<std::mutex> hl(hf_mu_);
-        if (hf_pending_ > 0) return false;
+        std::lock_guard<std::mutex> hl(hf_->mu);
+        if (hf_->pending > 0) return false;
     }
     std::lock_guard<std::recursive_mutex> lk(mu_);
     const ze_result_t r = zeCommandListHostSynchronize(imm_, 0);
@@ -1332,8 +1370,19 @@ bool has_copy_engine(int ordinal) {
 
 void device_sync(int ordinal) {
     DeviceState& st = dev_state(ordinal);
-    std::lock_guard<std::mutex> lk(st.streams_mu);
-    for (Stream* s : st.streams) s->sync();
+    std::vector<std::shared_ptr<Event>> fences;
+    std::vector<std::shared_ptr<HostFuncCount>> hfs;
+    {
+        std::lock_guard<std::mutex> lk(st.streams_mu);
+        for (Stream* s : st.streams) {
+            std::lock_guard<std::recursive_mutex> sl(s->mu_);
+            fences.push_back(s->fence_locked());
+            hfs.push_back(s->hf_);
+        }
+    }
+    g_count.host_waits.fetch_add(1, std::memory_order_relaxed);
+    for (auto& f : fences) f->sync();
+    for (auto& h : hfs) h->wait();
 }
 
 void sync_all() {
@@ -1360,7 +1409,7 @@ Event::~Event() {
     {
         std::lock_guard<std::mutex> cl(rt().cap_mu);
         if (captured_in_ != nullptr) {
-            auto& v = captured_in_->events;
+            auto& v = captured_in_.load()->events;
             v.erase(std::remove(v.begin(), v.end(), this), v.end());
         }
     }
