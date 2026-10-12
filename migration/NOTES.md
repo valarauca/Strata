@@ -56,3 +56,27 @@ reservation and ~46-57 GiB of `rw-s` render-node mappings (Rss 0) are VA, not me
 The SYCL reference's `--layer-split auto` over both B70s died on its first request: 08:00.0 page-faulted on a CPU-range
 address (CAT error, engine reset, `$REF/data/serve-2gpu-split/DEVICE_LOST.txt`). main keeps one `sycl::context` per GPU.
 The layer split is not a working path of the reference, so there is no two-GPU baseline.
+
+## Design (the Level Zero engine)
+
+- One runtime, `strata::ze` (`sycl/include/strata/ze/ze.hpp`, `sycl/src/ze/`), owns every Level Zero object. Devices
+  come from `STRATA_ZE_DEVICES=i,j` (or `ONEAPI_DEVICE_SELECTOR=level_zero:i,j`), one `zeContextCreateEx` spans them.
+- Memory: `malloc_device` with relaxed limits (ranges past 4 GiB), `malloc_device_guarded` (the xe aliasing check that
+  main ran on every arena), `malloc_host` pinned host only where it is meant (expert mirror, staging, rings),
+  `malloc_host_uncached` for polled flags. A registry knows every allocation's kind and device. `free` waits for the
+  device first. A pageable host pointer in a copy goes through a pinned bounce buffer, synchronously.
+- Streams are in-order immediate lists on the compute group (CCS) or the copy group (BCS, the copy engine where main
+  used one). Events are counter-based. A host wait happens only where the code asks for one, except under
+  `STRATA_L0_SERIALIZE=1` (a host wait after every command, for debugging).
+- Decode plan: capture records into a regular in-order list (a stream that waits on an event recorded in the capture
+  joins it), the closed list replays with `zeCommandListImmediateAppendCommandListsExp`. Host functions run on a worker
+  thread. The doorbell and rings keep main's protocol with bounded spins (`spin_max(device)`).
+- Kernels: the device code stays SYCL device C++, compiled offline (`icpx -fsycl-device-only` -> `sycl-post-link` ->
+  `llvm-spirv` -> `ocloc -device bmg-g31`), bundled per family and embedded in the binary; each entry is a free
+  function launched with `zeCommandListAppendLaunchKernelWithArguments` (`strata/ze/kernel_abi.hpp`). Families that
+  need it build with `-ze-opt-large-register-file`. No SYCL, UR, OpenCL or oneMKL library is linked or loaded.
+- Dense prompt GEMM (was oneMKL): `sycl/src/prefill/gemm.dp.cpp`, joint_matrix 8x16x16 on sub-group 16 with
+  bounds-checked 2-D block loads straight from global memory, three tile shapes picked by M, a sub-group-per-output
+  kernel for N < 16 or unaligned operands. Checked by `xgemm_parity` against a double CPU product.
+- Removed with the SYCL runtime: dpct host headers, the SYCL-runtime benches and probes, the oneMKL GEMM, the
+  multi-queue overlap/concurrency experiments.
