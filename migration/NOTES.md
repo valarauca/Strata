@@ -89,7 +89,11 @@ The layer split is not a working path of the reference, so there is no two-GPU b
 - conversation_snapshot_test: its DEVICE_LOST was a kernel writing through pointers in a by-value struct to memory
   never made resident (indirect access, fixed in 70fec4b3); the serialized rerun's hang did not reproduce
   (`STRATA_ZE_TRACE=1` run, 3,901 checks pass).
-- Not done: the two-B70 split (the SYCL reference has no working one; 08:00.0 needs the user's go-ahead).
+- Two-B70 layer split (`--layer-split auto`): works since c6b4c48c, answers identical to one GPU (results below).
+  The fixes on the way: f387525b (a stage's mirror offset taken from GPU 0's residency table, the DEVICE_LOST),
+  7d137a6e (GPU 1's missing experts had no path under STRATA_VERIFY_NO_HOST, the garbage output) and c6b4c48c (a graph
+  re-appended before its previous replay finished loses work on xe, the long-prompt hang). Method in the notebook's
+  `notes/divergence-bisection.md`.
 
 ## Results (L0 engine, 03:00.0, min_freq 2800)
 
@@ -133,3 +137,16 @@ Process audit (`r*-maps.txt`): the engine maps libze_loader, the Level Zero GPU 
 libigdgmm/libigdml, and IGC's libigc/libigdfcl/libopencl-clang2, which the driver loads to build its own copy and
 fill kernels) and the C/C++ runtime. No libsycl, libur_*, libOpenCL, libumf or libmkl_* (all mapped by the SYCL
 process). `strata` NEEDs libze_loader, libstdc++, libm, libgcc_s and libc only.
+
+### Two B70s, layer split (c6b4c48c)
+
+Serve, one round, 03:00.0 + 08:00.0 (`--layer-split auto`, K=24) against 03:00.0 alone, same build, same session,
+the reference config (`$REF/data/l0-serve-2gpu-split-graphwait`, `$REF/data/l0-serve-1gpu-graphwait`). Clocks not
+pinned for these two runs (min_freq 400). All five answers identical between the two.
+
+| | one GPU | split |
+|---|---|---|
+| pp@6k (6,345 tokens) | 1,385 tok/s | 1,490 tok/s |
+| pp@16k (15,796 tokens) | 1,557 tok/s | 2,245 tok/s |
+| tg@6k | 24.2 tok/s | 32.8 tok/s |
+| tg@16k | 23.6 tok/s | 32.7 tok/s |
