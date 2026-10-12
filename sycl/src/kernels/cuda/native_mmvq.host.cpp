@@ -615,8 +615,7 @@ bool native_q6_k_pack(const void *weights, int n_in, int n_out,
     const std::size_t nb = std::size_t(n_in / 256) * std::size_t(n_out);
     const std::size_t bytes = nb * sizeof(Q6KBlock);
     std::vector<Q6KBlock> host(nb);
-    strata::ze::default_stream().memcpy(host.data(), weights, bytes);
-    strata::ze::default_stream().sync();
+    strata::ze::copy_sync(host.data(), weights, bytes);
     // planes: ql | qh | scales | d, each 256-byte aligned
     const std::size_t o_qh = (nb * 128 + 255) & ~std::size_t(255);
     const std::size_t o_sc = (o_qh + nb * 64 + 255) & ~std::size_t(255);
@@ -631,8 +630,7 @@ bool native_q6_k_pack(const void *weights, int n_in, int n_out,
     }
     void* dev = strata::ze::malloc_device(total);
     if (dev == nullptr) return false;
-    strata::ze::default_stream().memcpy(dev, packed.data(), total);
-    strata::ze::default_stream().sync();
+    strata::ze::copy_sync(dev, packed.data(), total);
     auto* base = static_cast<uint8_t*>(dev);
     q6_packed_registry()[weights] =
         Q6Packed{dev,
@@ -660,8 +658,7 @@ bool native_q6_k_pack(const void *weights, int n_in, int n_out,
         dx = strata::ze::malloc_device(hx.size() * sizeof(Q81Block));
         ya = strata::ze::malloc_device(std::size_t(4) * n_out * 4);
         yb = strata::ze::malloc_device(std::size_t(4) * n_out * 4);
-        strata::ze::default_stream().memcpy(dx, hx.data(), hx.size() * sizeof(Q81Block));
-        strata::ze::default_stream().sync();
+        strata::ze::copy_sync(dx, hx.data(), hx.size() * sizeof(Q81Block));
         std::vector<float> a(std::size_t(4) * n_out), c(std::size_t(4) * n_out);
         bool same = true;
         for (int nc = 1; nc <= 4; ++nc) {
@@ -670,10 +667,8 @@ bool native_q6_k_pack(const void *weights, int n_in, int n_out,
             g_q6_bypass = false;
             native_q6_k_mmvq(weights, dx, (float*) yb, n_in, n_out, nc, s);
             s->sync();
-            strata::ze::default_stream().memcpy(a.data(), ya, std::size_t(nc) * n_out * 4);
-            strata::ze::default_stream().sync();
-            strata::ze::default_stream().memcpy(c.data(), yb, std::size_t(nc) * n_out * 4);
-            strata::ze::default_stream().sync();
+            strata::ze::copy_sync(a.data(), ya, std::size_t(nc) * n_out * 4);
+            strata::ze::copy_sync(c.data(), yb, std::size_t(nc) * n_out * 4);
             same = same && std::memcmp(a.data(), c.data(), std::size_t(nc) * n_out * 4) == 0;
         }
         strata::ze::Event *e0 = new strata::ze::Event(true), *e1 = new strata::ze::Event(true);

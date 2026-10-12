@@ -155,63 +155,11 @@ std::string vram_free_note() {
 // Whether pin_blobs locks anything (AMD on Linux with STRATA_ARENA_MMAP=1): the callers only gather the swaps' spans
 // then - `blob()` is not free (it counts reads, and the file tier may assemble the blob), so the default runs skip it.
 bool pin_blobs_on() {
-#if (defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)) && !defined(_WIN32)
-    static const bool on = std::getenv("STRATA_ARENA_MMAP") && std::getenv("STRATA_ARENA_MMAP")[0] == '1';
-    return on;
-#else
     return false;
-#endif
-}
-// #884 (HIP, opt-in STRATA_HIP_ADAPT_KERNEL_COPY=1): an adaptive swap's host-to-device copy as a kernel on the refill stream
-// instead of a copy-engine (SDMA) memcpy.  2x RX 6900 XT hung after a long prompt only with the MMQ prompt path, adaptive swaps
-// AND SDMA together (any one off avoids it; the barrier packet that never passes is a ROCm-side problem, #884).  This keeps
-// the swaps off SDMA without turning SDMA off for the prompt read (HSA_ENABLE_SDMA=0 costs 10-24% of it).  Needs the source to
-// be mapped, 16-byte aligned memory (the registered arena); anything else takes the normal cudaMemcpyAsync.
-int adapt_copy_h2d(void *dst, const void *src, size_t bytes,
-                          strata::ze::Stream* st) {
-#if defined(STRATA_USE_HIP)
-    static const bool kernel = [] {
-        const char* e = std::getenv("STRATA_HIP_ADAPT_KERNEL_COPY");
-        const bool on = e != nullptr && e[0] == '1';
-        if (on) std::fprintf(stderr, "strata: STRATA_HIP_ADAPT_KERNEL_COPY=1: adaptive swaps copy with a kernel, not SDMA (#884)\n");
-        return on;
-    }();
-    if (kernel && bytes % 16 == 0 && ((uintptr_t) src & 15) == 0 && ((uintptr_t) dst & 15) == 0) {
-        void* dsrc = nullptr;
-        if (cudaHostGetDevicePointer(&dsrc, const_cast<void*>(src), 0) == cudaSuccess && dsrc != nullptr) {
-            strata::kernels::copy_from_mapped((float*) dst, (const float*) dsrc, (int64_t) (bytes / 4), (void*) st);
-            return cudaGetLastError();
-        }
-        (void) cudaGetLastError();   // not registered / not mapped: the ordinary copy
-    }
-#endif
-    st->memcpy(dst, src, bytes);
-    return 0;
 }
 int pin_blobs(std::vector<std::pair<uintptr_t, uintptr_t>> r, std::vector<void*>& live) {
     int failed = 0;   // ranges left pageable (a copy from them still works, through the driver's staging)
-#if (defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)) && !defined(_WIN32)
-    if (!pin_blobs_on() || r.empty()) return 0;
-    for (auto& [a, e] : r) { a &= ~(uintptr_t) 4095; e = (e + 4095) & ~(uintptr_t) 4095; }
-    std::sort(r.begin(), r.end());
-    size_t k = 0;
-    for (size_t i = 1; i < r.size(); ++i) {
-        if (r[i].first <= r[k].second) r[k].second = std::max(r[k].second, r[i].second);
-        else r[++k] = r[i];
-    }
-    r.resize(k + 1);
-    for (const auto& [a, e] : r) {
-        if (cudaHostRegister((void*) a, (size_t) (e - a), cudaHostRegisterReadOnly | cudaHostRegisterPortable) ==
-            cudaSuccess)
-            live.push_back((void*) a);
-        else {
-            (void) cudaGetLastError();
-            ++failed;
-        }
-    }
-#else
     (void) r; (void) live;
-#endif
     return failed;
 }
 void unpin_blobs(std::vector<void*>& v) {
@@ -1455,22 +1403,9 @@ double probe_pcie_h2d_gbps(std::string *samples = nullptr, bool pin_source = fal
     s0.memcpy(d, h, kBytes);   // warmup: context up, copy engine primed
     s0.sync();
     float ms[kBursts] = {};
-#if defined(STRATA_USE_HIP) && defined(_WIN32)
-    // Windows HIP: the events do not bracket the copies there (an RX 6800 read 3,300-26,000 GB/s, so every link kept
-    // the x16 share), so each burst is timed on the host between two synchronizes: 256 MiB takes ~10 ms, so the
-    // synchronize around it hardly matters
-    bool ok = cudaDeviceSynchronize() == cudaSuccess;
-    for (int b = 0; b < kBursts && ok; ++b) {
-        const Clock::time_point t0 = Clock::now();
-        cudaMemcpyAsync(d, h, kBytes, cudaMemcpyHostToDevice);
-        ok = cudaDeviceSynchronize() == cudaSuccess;
-        ms[b] = (float) std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
-    }
-#else
     // the bursts run back to back on the stream, an event between each two
     strata::ze::Event* ev[kBursts + 1];
     for (int i = 0; i <= kBursts; ++i) ev[i] = new strata::ze::Event(true);
-    const bool ok = true;
     s0.record(*ev[0]);
     for (int b = 0; b < kBursts; ++b) {
         s0.memcpy(d, h, kBytes);
@@ -1480,10 +1415,9 @@ double probe_pcie_h2d_gbps(std::string *samples = nullptr, bool pin_source = fal
     ev[kBursts]->sync();
     for (int b = 0; b < kBursts; ++b) ms[b] = ev[b + 1]->elapsed_ms_since(*ev[b]);
     for (int i = 0; i <= kBursts; ++i) delete ev[i];
-#endif
     double bw = -1.0;
     if (samples != nullptr) samples->clear();
-    for (int b = 0; b < kBursts && ok; ++b) {
+    for (int b = 0; b < kBursts; ++b) {
         const double s = ms[b] > 0.01f ? (double) kBytes / (ms[b] * 1e-3) / 1e9 : -1.0;
         bw = std::max(bw, s);
         if (samples != nullptr) {
@@ -1538,15 +1472,6 @@ int main(int argc, char **argv) {
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
     // turns "it crashed at step 7" into "it crashed somewhere", and the difference is a debugging session.
     std::setvbuf(stdout, nullptr, _IONBF, 0);
-#if (defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)) && !defined(_WIN32)
-    // AMD, a file-backed arena (STRATA_ARENA_MMAP): ROCclr copies a pageable source of 1 MiB or more by locking its
-    // pages in place (a GPU userptr), and keeps them - so every expert the VRAM fill copied from the mapped
-    // experts.bin stayed resident, the release of the VRAM-held ones was undone by the driver at once, and a
-    // 32 GB PC ran with ~0.3 GB free: the kernel swapped, and a turn's checkpoint took 25-80 s.  Above this size
-    // ROCclr stages through its own pinned buffers instead; decode is unchanged (49.06 vs 49.16 ms/window).
-    if (std::getenv("STRATA_ARENA_MMAP") && std::getenv("STRATA_ARENA_MMAP")[0] == '1')
-        setenv("GPU_PINNED_MIN_XFER_SIZE", "1000000", 0);   // MiB; an explicit setting wins
-#endif
     // Load every CUDA kernel when the context is created, before the expert cache takes the free VRAM.  With the
     // default lazy loading, a kernel first used mid-prompt (MMQ for IQ3_XXS at 64K+ on a 12 GB card) found no VRAM
     // left for its code and the engine ended ("out of memory: cudaFuncSetAttribute").  Costs ~30 MB of VRAM.
@@ -1876,14 +1801,6 @@ int main(int argc, char **argv) {
         }
         }
     }
-#if defined(STRATA_USE_HIP)
-    {   // gfx1151 (Strix Halo): the switches that are exact there are on by default (strata/core/arch_defaults.hpp); before
-        // any engine code reads its switches (they are read at first use), and the user's own settings are kept
-        cudaDeviceProp ad{};
-        if (cudaGetDeviceProperties(&ad, 0) == cudaSuccess) strata::core::apply_arch_defaults(ad.gcnArchName);
-        else (void) cudaGetLastError();
-    }
-#endif
     strata::core::set_coupled_draft(o.coupled_draft);
     {   // --host-core / STRATA_HOST_CORE, before the pool and the session pin any thread
         std::string hc = o.host_core;
@@ -2093,22 +2010,6 @@ int main(int argc, char **argv) {
             o.no_prefill_borrow = o.max_context <= 32768;
         }
     }
-#if defined(STRATA_USE_HIP)
-    {
-        // every GPU this run uses must be an architecture the binary has code for (a gfx1100 build on a gfx1201
-        // card would otherwise fail later with "invalid device function")
-        std::vector<int> used{0};
-        if (multi_gpu) used.insert(used.end(), split_devs.begin(), split_devs.end());
-        for (int r = 0; r < 3; ++r)
-            if (o.expert_cache_remote[(size_t) r] > 0) used.push_back(remote_dev[r]);
-        for (const int d : used) {
-            if (const std::string why = strata::core::gpu_arch_problem(d); !why.empty()) {
-                std::fprintf(stderr, "strata generate: %s\n", why.c_str());
-                return 1;
-            }
-        }
-    }
-#endif
     if (o.prefill_auto && (o.no_prefill_borrow || o.expert_profile.empty())) {
         o.prefill_auto = false;       // nothing to lend from: the buffers are reserved for the session, so keep them small
         o.prefill_chunk = 2048;
@@ -2742,8 +2643,7 @@ int main(int argc, char **argv) {
             std::fprintf(stderr, "strata generate: cannot allocate the image position table\n");
             return 1;
         }
-        strata::ze::default_stream().memcpy(d_mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t));
-        strata::ze::default_stream().sync();
+        strata::ze::copy_sync(d_mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t));
         strata::kernels::mrope_table_set(d_mrope);
     }
     strata::kernels::ple_set_native_postops(o.native_ple_postops);
@@ -3124,8 +3024,7 @@ int main(int argc, char **argv) {
                 std::fprintf(stderr, "strata generate: layer split, CUDA%d: the image position table failed\n", st.dev);
                 return 1;
             }
-            strata::ze::default_stream().memcpy(st.mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t));
-            strata::ze::default_stream().sync();
+            strata::ze::copy_sync(st.mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t));
             strata::kernels::mrope_table_set(st.mrope);
         }
         // its own PCIe share of the missed experts (the same rule as CUDA0's above: its link is probed).  A given
@@ -3798,28 +3697,9 @@ int main(int argc, char **argv) {
         // otherwise, after the whole expert arena has loaded) - before the arena starts loading
         const int dev = strata::ze::current_device();
         const strata::ze::DeviceInfo& p = strata::ze::device_info(dev);
-        int ip_major = 0, ip_minor = 0;
-        {
-            ze_device_ip_version_ext_t ip{ZE_STRUCTURE_TYPE_DEVICE_IP_VERSION_EXT};
-            ze_device_properties_t zp{ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES};
-            zp.pNext = &ip;
-            if (zeDeviceGetProperties(strata::ze::device_handle(dev), &zp) == ZE_RESULT_SUCCESS) {
-                ip_major = (int) (ip.ipVersion >> 22);
-                ip_minor = (int) ((ip.ipVersion >> 14) & 0xff);
-            }
-        }
+        const int ip_major = (int) (p.ip_version >> 22);
+        const int ip_minor = (int) ((p.ip_version >> 14) & 0xff);
         const char *name = !p.name.empty() ? p.name.c_str() : "(an unnamed GPU)";
-#if defined(STRATA_USE_HIP)
-        std::fprintf(stderr, "strata generate: GPU %d: %s (%s)\n", dev, name, named ? p.gcnArchName : "?");
-#if defined(_WIN32)
-        // #468 #461: which HIP runtime was loaded - the bundled one beside the exe, or an AMD driver's System32 copy
-        if (HMODULE h = GetModuleHandleA("amdhip64_7.dll")) {
-            char path[MAX_PATH] = {};
-            if (GetModuleFileNameA(h, path, MAX_PATH) > 0)
-                std::fprintf(stderr, "strata generate: HIP runtime %s\n", path);
-        }
-#endif
-#else
         std::fprintf(
             stderr, "strata generate: GPU %d: %s, compute capability %d.%d%s\n",
             dev, name,
@@ -3828,7 +3708,6 @@ int main(int argc, char **argv) {
             strata::emulated_cc()
                 ? " (STRATA_EMULATE_CC: a test mode, the card is emulated)"
                 : "");
-#endif
         const std::string e = strata::core::device_code_error();
         if (!e.empty()) {
             std::fprintf(
@@ -4137,9 +4016,6 @@ int main(int argc, char **argv) {
                         : std::any_of(o.expert_cache_remote.begin(), o.expert_cache_remote.end(),
                                       [](int n) { return n > 0; }) ? "the helper caches on other GPUs"
                         : o.vram_segment_mib < 64 ? "--vram-segment-mib is below 64" : nullptr;
-#if defined(STRATA_USE_HIP)
-        if (why == nullptr) why = "it is NVIDIA-only for now";
-#endif
         if (why != nullptr) {
             std::fprintf(stderr, "strata generate: --vram-elastic is off: %s\n", why);
             o.vram_elastic = false;
@@ -4520,8 +4396,7 @@ int main(int argc, char **argv) {
                         if (gguf_src.pinned(l, e))
                             tab[(size_t) (l * g.n_expert + e)] = (unsigned long long) gguf_src.device_alias(l, e);
                 mirror_table_d = (unsigned long long*) strata::ze::malloc_device((tab.size()) * sizeof(unsigned long long));
-                strata::ze::default_stream().memcpy(mirror_table_d, tab.data(), tab.size() * sizeof(unsigned long long));
-                strata::ze::default_stream().sync();
+                strata::ze::copy_sync(mirror_table_d, tab.data(), tab.size() * sizeof(unsigned long long));
             }
         }
         unmirrored_misses = (int64_t) n_true_miss - (int64_t) (gguf_src.mirrored_bytes() ? std::count_if(miss.begin(), miss.begin() + (ptrdiff_t) n_true_miss,
@@ -4753,8 +4628,7 @@ int main(int argc, char **argv) {
                  w->bytes == (uint64_t) (g.n_expert * g.n_embd) * 2;
             if (!ok) break;
             routers[(size_t) l].resize((size_t) (g.n_expert * g.n_embd));
-            strata::ze::default_stream().memcpy(routers[(size_t) l].data(), w->data, (size_t) w->bytes);
-            strata::ze::default_stream().sync();
+            strata::ze::copy_sync(routers[(size_t) l].data(), w->data, (size_t) w->bytes);
         }
         const char* kv = std::getenv("STRATA_LOOKAHEAD_K");
         if (ok && lookahead.start(std::move(routers), g.n_embd, g.n_expert, kv ? std::atoi(kv) : 10, &src, err)) {
@@ -5319,11 +5193,8 @@ int main(int argc, char **argv) {
     // The residency table is read by kernels on non-blocking streams, which do not wait for the legacy stream a plain
     // cudaMemcpy runs on, and a pageable copy can return before its DMA has landed: each upload waits for its own copy
     // (the current device's legacy stream, stream 0 - nothing else; HIP has no cudaStreamLegacy name, #550).
-    auto res_put = [&host_res](int32_t *dst) -> int {
-        // the default stream's memcpy, waited for: the copy is complete when this returns
-        strata::ze::default_stream().memcpy(dst, host_res.data(), host_res.size() * sizeof(int32_t));
-        strata::ze::default_stream().sync();
-        return 0;
+    auto res_put = [&host_res](int32_t *dst) {
+        strata::ze::copy_sync(dst, host_res.data(), host_res.size() * sizeof(int32_t));
     };
     int32_t* d_res = nullptr;
     int32_t* d_hit_count = nullptr;
@@ -5341,10 +5212,11 @@ int main(int argc, char **argv) {
             }
         d_res = (int32_t*) strata::ze::malloc_device(host_res.size() * sizeof(int32_t));
         d_hit_count = (int32_t*) strata::ze::malloc_device(sizeof(int32_t));
-        if (d_res == nullptr || d_hit_count == nullptr || res_put(d_res) != 0) {
+        if (d_res == nullptr || d_hit_count == nullptr) {
             std::fprintf(stderr, "strata generate: the device residency table could not be staged\n");
             return 1;
         }
+        res_put(d_res);
         thits.d_res = d_res;
         thits.n_expert = g.n_expert;
         // a file-backed arena (STRATA_ARENA_MMAP): the experts no GPU holds are the ones the CPU pool and the
@@ -5375,10 +5247,11 @@ int main(int argc, char **argv) {
         for (auto& st : stages) {   // layer split across GPUs: the same table on every device
             const strata::core::OnDevice on(st->dev);
             st->d_res = (int32_t*) strata::ze::malloc_device(host_res.size() * sizeof(int32_t));
-            if (st->d_res == nullptr || res_put(st->d_res) != 0) {
-                std::fprintf(stderr, "strata generate: layer split: CUDA%d residency table failed\n", st->dev);
+            if (st->d_res == nullptr) {
+                std::fprintf(stderr, "strata generate: layer split: GPU %d residency table failed\n", st->dev);
                 return 1;
             }
+            res_put(st->d_res);
         }
         thits.cache_base = drive.d.cache_base;
         thits.blob = drive.d.cache_blob;
@@ -5701,9 +5574,8 @@ int main(int argc, char **argv) {
                             lay.blob_bytes(layer))
                         vi = -1;
                     else {
-                        strata::ze::default_stream().memcpy(xcache.device_slot(vs), xcache.device_slot((int32_t) kvg.lo),
+                        strata::ze::copy_sync(xcache.device_slot(vs), xcache.device_slot((int32_t) kvg.lo),
                                                             (size_t) lay.blob_bytes(layer));
-                        strata::ze::default_stream().sync();
                         cold.pop_back();
                         host_res[(size_t) oi] = vs;
                         host_res[(size_t) vi] = strata::core::kNotResident;
@@ -5725,8 +5597,7 @@ int main(int argc, char **argv) {
                     if (const strata::core::VmmChunk h = r.unmap(c)) kvg.spare.push_back(h);
         }
         if (gave > 0) {
-            strata::ze::default_stream().memcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t));
-            strata::ze::default_stream().sync();
+            strata::ze::copy_sync(d_res, host_res.data(), host_res.size() * sizeof(int32_t));
         }
         int64_t fresh = 0;
         const bool ok = strata::core::qsa_kv_elastic_grow(target, [&]() -> strata::core::VmmChunk {
@@ -5792,8 +5663,7 @@ int main(int argc, char **argv) {
                 if (host_res[i] >= 0 || lay.blob_bytes(l) > room) continue;
                 const uint8_t* b = srcp->blob(l, e);
                 if (b == nullptr) continue;
-                strata::ze::default_stream().memcpy(xcache.device_slot((int32_t)s), b, (size_t)lay.blob_bytes(l));
-                strata::ze::default_stream().sync();
+                strata::ze::copy_sync(xcache.device_slot((int32_t)s), b, (size_t)lay.blob_bytes(l));
                 filled.emplace_back(i, (int32_t) s);
                 ++pi;
                 break;
@@ -5802,8 +5672,7 @@ int main(int argc, char **argv) {
         strata::ze::device_sync();
         for (const auto& [i, s] : filled) host_res[i] = s;
         kvg.refilled += (int64_t) filled.size();
-        strata::ze::default_stream().memcpy(d_res, host_res.data(), host_res.size() * sizeof(int32_t));
-        strata::ze::default_stream().sync();
+        strata::ze::copy_sync(d_res, host_res.data(), host_res.size() * sizeof(int32_t));
         for (const strata::core::VmmChunk h : kvg.spare) strata::core::vmm_chunk_free(h);   // new ones, if any
         kvg.spare.clear();
         ++kvg.trims;
@@ -6732,11 +6601,7 @@ int main(int argc, char **argv) {
             if (!config_fp) {
                 strata::core::SessionConfig c;
                 c.engine_version = STRATA_VERSION;
-#if defined(STRATA_USE_HIP)
-                c.backend = "hip";
-#else
                 c.backend = "cuda";
-#endif
                 c.kv = o.kv;
                 c.max_context = o.max_context;
                 c.kv_resident = o.kv_resident;
@@ -6916,15 +6781,7 @@ int main(int argc, char **argv) {
         std::vector<int64_t> part_next(stages.size() + 1, INT64_MAX);
         // a checkpoint of the state after `cur[0, L)`; false only when the copy itself failed.  `parts`: the stages'
         // states saved at L (a split's mid-prompt checkpoint); without, they are read now (everything is at L)
-        // #613: why the last checkpoint_at failed - a failed device sync is the GPU itself (a hang Windows then resets),
-        // not the checkpoint, and the error says so
-        std::string ckpt_why;
-        auto gpu_sync_ok = [&]() -> bool {
-            strata::ze::device_sync();
-            return true;
-        };
         auto checkpoint_at = [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr, bool as_tail = false) -> bool {
-            ckpt_why.clear();
             if (o.prompt_cache <= 0 || L < 1) return true;
             for (ConvCheckpoint& c : checks)
                 if ((int64_t) c.ids.size() == L) {
@@ -6944,12 +6801,14 @@ int main(int argc, char **argv) {
                 c.block_pos = std::move((*parts)[0].block_pos);
                 for (size_t i = 1; i < parts->size(); ++i) c.stage_parts.push_back(std::move((*parts)[i]));
             } else {
-                if (!gpu_sync_ok() || !checkpoint_save(c, ss, g)) return false;
+                strata::ze::device_sync();
+                if (!checkpoint_save(c, ss, g)) return false;
                 for (auto& st : stages) {   // a layer split's later stages: their sessions' part
                     const strata::core::OnDevice on(st->dev);
                     ConvCheckpoint part;
                     part.ids = c.ids;
-                    if (!gpu_sync_ok() || !checkpoint_save(part, st->ss, g)) return false;
+                    strata::ze::device_sync();
+                    if (!checkpoint_save(part, st->ss, g)) return false;
                     c.stage_parts.push_back(std::move(part));
                 }
             }
@@ -7021,7 +6880,7 @@ int main(int argc, char **argv) {
                 } else {
                     saved = checkpoint_at(done, nullptr, tail_checkpoint && !periodic_checkpoint);
                 }
-                if (!saved) { e = "saving a conversation checkpoint failed" + ckpt_why; return false; }
+                if (!saved) { e = "saving a conversation checkpoint failed"; return false; }
                 if (periodic_checkpoint) pp_next_check = done + o.prompt_cache_every;
                 if (tail_checkpoint) pp_tail_saved = true;
             }
@@ -7186,13 +7045,7 @@ int main(int argc, char **argv) {
                     pending.emplace_back((int32_t) in, slot);
                     continue;
                 }
-                if (slot < 0 || b == nullptr ||
-                    adapt_copy_h2d(gs ? gs->cache.device_slot(slot)
-                                      : xcache.device_slot(slot),
-                                   b,
-                                   (size_t)strata::kernels::cpu::expert_layout()
-                                       .blob_bytes(s.layer),
-                                   gs ? gs->adapt_stream : adapt_stream) != 0) {
+                if (slot < 0 || b == nullptr) {
                     std::fprintf(stderr,
                                  "strata serve: adaptive swap copy failed "
                                  "(layer %d, slot %d, pinned %d)\n",
@@ -7200,6 +7053,9 @@ int main(int argc, char **argv) {
                                  pin_live.empty() ? 0 : 1);
                     return false;
                 }
+                (gs ? gs->adapt_stream : adapt_stream)
+                    ->memcpy(gs ? gs->cache.device_slot(slot) : xcache.device_slot(slot), b,
+                             (size_t)strata::kernels::cpu::expert_layout().blob_bytes(s.layer));
                 if (gs) gs->adapt_live = true;
                 else main_live = true;
                 host_res[out] = strata::core::kNotResident;   // evicted now: the CPU computes it meanwhile
@@ -7969,10 +7825,9 @@ int main(int argc, char **argv) {
                 }
                 if (batch_mtp && sl.active) {
                     const size_t stride = (size_t) g.hc * (size_t) g.n_embd;
-                    strata::ze::default_stream().memcpy(slot_mtp_rows[(size_t) b].get(),
+                    strata::ze::copy_sync(slot_mtp_rows[(size_t) b].get(),
                                                         ver.final_R_all() + (size_t) first[t] * stride,
                                                         2 * stride * sizeof(float));
-                    strata::ze::default_stream().sync();
                     if (!slot_mtp[(size_t)b]->draft(2, outb + first[t],
                                                     pos[first[t]], keep[b] - 1,
                                                     sl.draft.data(), err)) {
@@ -8542,13 +8397,11 @@ int main(int argc, char **argv) {
                 tr("device idle");
                 // CUDA0's table and, with a layer split, every later stage's (each device reads its own)
                 auto upload_mrope = [&]() -> bool {
-                    strata::ze::default_stream().memcpy(d_mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t));
-                    strata::ze::default_stream().sync();
+                    strata::ze::copy_sync(d_mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t));
                     for (auto& st : stages) {
                         const strata::core::OnDevice on(st->dev);
                         strata::ze::device_sync();
-                        strata::ze::default_stream().memcpy(st->mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t));
-                        strata::ze::default_stream().sync();
+                        strata::ze::copy_sync(st->mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t));
                     }
                     return true;
                 };
@@ -9368,7 +9221,7 @@ int main(int argc, char **argv) {
                 at = to;
                 if ((to == turn_at || to == root_at || to == message_at) &&
                     !checkpoint_at(to, nullptr, to == message_at && to != turn_at && to != root_at)) {   // the tail kind leaves first
-                    std::printf("ERR saving a conversation checkpoint failed%s\n", ckpt_why.c_str());
+                    std::printf("ERR saving a conversation checkpoint failed\n");
                     return 1;
                 }
                 if (trace && to == message_at)
@@ -10084,8 +9937,7 @@ int main(int argc, char **argv) {
                     strata::kernels::penalty_rows(consumed.data(), (int64_t) consumed.size(), window.data(), T,
                                                   hist_n, hist_stage.data());
                     const strata::core::OnDevice on_h(hist_dev);
-                    strata::ze::default_stream().memcpy(d_hist, hist_stage.data(), (size_t)T * (size_t)hist_n * sizeof(int32_t));
-                    strata::ze::default_stream().sync();
+                    strata::ze::copy_sync(d_hist, hist_stage.data(), (size_t)T * (size_t)hist_n * sizeof(int32_t));
                 }
                 // the elastic K/V: the window's cells and the drafter's beyond them
                 if (kvg.on && p + T + 64 > kvg.cells &&
@@ -10240,8 +10092,7 @@ int main(int argc, char **argv) {
                     for (size_t offset = 0; hash_ok && offset < bytes;) {
                         const size_t n = std::min(hash_buffer.size(), bytes - offset);
                         // VRAM or a streamed host copy, with fixed diagnostic workspace.
-                        strata::ze::default_stream().memcpy(hash_buffer.data(), static_cast<const uint8_t*>(p) + offset, n);
-                        strata::ze::default_stream().sync();
+                        strata::ze::copy_sync(hash_buffer.data(), static_cast<const uint8_t*>(p) + offset, n);
                         h = fnv1a(hash_buffer.data(), n, h);
                         offset += n;
                     }
@@ -10730,8 +10581,7 @@ int main(int argc, char **argv) {
             }
         }
         if (final_r != nullptr) {
-            strata::ze::default_stream().memcpy(final_r_host.data(), ss.R, final_r_host.size() * sizeof(float));
-            strata::ze::default_stream().sync();
+            strata::ze::copy_sync(final_r_host.data(), ss.R, final_r_host.size() * sizeof(float));
             const int64_t posrec[2] = {pos, tok};
             std::fwrite(posrec, sizeof posrec, 1, final_r);
             std::fwrite(final_r_host.data(), sizeof(float), final_r_host.size(), final_r);
@@ -11058,10 +10908,8 @@ int main(int argc, char **argv) {
                     cp_dst.push_back(xcache.device_slot(slot));
                     cp_src.push_back(b);
                     cp_bytes.push_back(blob_n);
-                } else if (adapt_copy_h2d(xcache.device_slot(slot), b, blob_n,
-                                          adapt_stream) != 0) {
-                    std::fprintf(stderr, "strata generate: an adaptive refill failed\n");
-                    return false;
+                } else {
+                    adapt_stream->memcpy(xcache.device_slot(slot), b, blob_n);
                 }
                 host_res[out] = strata::core::kNotResident;   // evicted now: the CPU computes it meanwhile
                 srcp->prefetch(s.layer, s.out);   // a file-backed arena released its pages: read them back ahead
@@ -11211,8 +11059,7 @@ int main(int argc, char **argv) {
             if (hashes != nullptr) {   // FNV-1a over the window's final residual rows (a test path: a plain copy)
                 const size_t n_floats = (size_t) T * (size_t) (g.hc * g.n_embd);
                 hash_rows.resize(n_floats);
-                strata::ze::default_stream().memcpy(hash_rows.data(), ver.final_R_all(), n_floats * sizeof(float));
-                strata::ze::default_stream().sync();
+                strata::ze::copy_sync(hash_rows.data(), ver.final_R_all(), n_floats * sizeof(float));
                 uint64_t h = 1469598103934665603ull;
                 const auto* bytes = (const uint8_t*) hash_rows.data();
                 for (size_t i = 0; i < n_floats * sizeof(float); ++i) h = (h ^ bytes[i]) * 1099511628211ull;
@@ -11417,8 +11264,7 @@ int main(int argc, char **argv) {
                         drive.d.ms_run / rounds);
         if (usage_dev != nullptr) {   // STRATA_USAGE_DUMP: the window's routing as make_profile.py reads it (layer, k=1, id, weight)
             std::vector<int32_t> uh((size_t) (g.n_layers * g.n_expert));
-            strata::ze::default_stream().memcpy(uh.data(), usage_dev, uh.size() * 4);
-            strata::ze::default_stream().sync();
+            strata::ze::copy_sync(uh.data(), usage_dev, uh.size() * 4);
             if (FILE* uf = std::fopen(usage_dump, "wb")) {
                 int64_t total = 0;
                 for (int64_t l = 0; l < g.n_layers; ++l)
@@ -11507,8 +11353,7 @@ int main(int argc, char **argv) {
                     prefill_ms > 0 ? 1000.0 * (double) (n_prompt - 1) / prefill_ms : 0.0, ttft_ms);
     if (!o.dump_mixed.empty()) {
         std::vector<float> mx((size_t) g.n_embd);
-        strata::ze::default_stream().memcpy(mx.data(), ss.block.mixed, mx.size() * sizeof(float));
-        strata::ze::default_stream().sync();
+        strata::ze::copy_sync(mx.data(), ss.block.mixed, mx.size() * sizeof(float));
         std::FILE* mf = std::fopen(o.dump_mixed.c_str(), "wb");
         if (mf == nullptr) {
             std::fprintf(stderr, "strata generate: cannot write %s\n", o.dump_mixed.c_str());
@@ -11525,8 +11370,7 @@ int main(int argc, char **argv) {
     // ---- the residual, for bisecting the head against the layers (see `dump_residual`'s note)
     if (!o.dump_residual.empty()) {
         std::vector<float> R((size_t) g.hc * g.n_embd);
-        strata::ze::default_stream().memcpy(R.data(), ss.R, R.size() * sizeof(float));
-        strata::ze::default_stream().sync();
+        strata::ze::copy_sync(R.data(), ss.R, R.size() * sizeof(float));
         std::FILE* rf = std::fopen(o.dump_residual.c_str(), "wb");
         if (rf == nullptr) {
             std::fprintf(stderr, "strata generate: cannot write %s\n", o.dump_residual.c_str());

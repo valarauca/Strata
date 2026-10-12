@@ -34,8 +34,7 @@ bool sync(std::string& error) {
 bool copy(void* dst, const void* src, size_t bytes, std::string& error) {
     if (!bytes) return true;
     if (!dst || !src) return fail(error, "missing running-state buffer");
-    strata::ze::default_stream().memcpy(dst, src, bytes);
-    strata::ze::default_stream().sync();
+    strata::ze::copy_sync(dst, src, bytes);
     return true;
 }
 

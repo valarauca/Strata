@@ -27,6 +27,10 @@ uint64_t alias_check(int dev, void* base, size_t bytes, size_t* first_bad) {
     if (n == 0) return 0;
     Stream& s = default_stream(dev);
     auto* res = (unsigned long long*) malloc_device(2 * sizeof(unsigned long long), dev);
+    if (res == nullptr) {
+        std::fprintf(stderr, "strata ze: no device memory left for the alias check's probe: the arena is not checked\n");
+        return 0;
+    }
     unsigned long long init[2] = {0, ~0ull};
     s.memcpy(res, init, sizeof init);
     s.sync();
@@ -71,7 +75,7 @@ void* malloc_device_guarded(size_t bytes, int ordinal, const char* what) {
                      "strata: WARNING: %llu 64-KiB blocks of the %s (%.2f GiB) do not keep their own bytes (first at +%zu MiB): the GPU's "
                      "page table maps them onto other pages; allocating it again behind a %d MiB spacer\n",
                      (unsigned long long) bad, what, (double) bytes / 1073741824.0, first >> 20, 2 * (attempt + 1));
-        free(p);
+        free_sync(p);
         spacers.push_back(malloc_device((size_t) (2 * (attempt + 1)) << 20, ordinal));
         p = malloc_device(bytes, ordinal);
     }

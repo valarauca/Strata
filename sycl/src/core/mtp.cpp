@@ -212,8 +212,7 @@ bool MtpDrafter::make_q4_dense(const std::vector<uint8_t>& blob, std::string& er
     }
     dense4_ = (uint8_t*) strata::ze::malloc_device_guarded((size_t) total, -1, "mtp Q4_0 projections");
     if (dense4_ == nullptr) { err = "mtp: the Q4_0 projections do not fit"; return false; }
-    strata::ze::default_stream().memcpy(dense4_, host.data(), (size_t) total);
-    strata::ze::default_stream().sync();
+    strata::ze::copy_sync(dense4_, host.data(), (size_t) total);
     vram_ += total;
     std::fprintf(stderr, "strata mtp: --mtp-q4: %zu projections as Q4_0 (%.1f MiB)\n", plan.size(), (double) total / 1048576.0);
     return true;
@@ -232,16 +231,14 @@ bool MtpDrafter::make_q4_head(std::string& err) {
     if (tt == nullptr || tt->to_float == nullptr || N % 32 != 0) { err = "mtp: --mtp-q4 cannot read the head's format"; return false; }
     const size_t in_row = head_->row_bytes(), out_row = (size_t) (N / 32) * 18;
     std::vector<uint8_t> src((size_t) n_dvocab_ * in_row), dst((size_t) n_dvocab_ * out_row);
-    strata::ze::default_stream().memcpy(src.data(), dhead_, src.size());
-    strata::ze::default_stream().sync();
+    strata::ze::copy_sync(src.data(), dhead_, src.size());
     std::vector<float> row((size_t) N);
     for (int64_t r = 0; r < n_dvocab_; ++r) {
         tt->to_float(src.data() + (size_t) r * in_row, row.data(), N);
         ggml_quantize_chunk(GGML_TYPE_Q4_0, row.data(), dst.data() + (size_t) r * out_row, 0, 1, N, nullptr);
     }
     // the Q4_0 rows replace the subset in place (they are smaller)
-    strata::ze::default_stream().memcpy(dhead_, dst.data(), dst.size());
-    strata::ze::default_stream().sync();
+    strata::ze::copy_sync(dhead_, dst.data(), dst.size());
     dhead_type_ = GGML_Q4_0;
     std::fprintf(stderr, "strata mtp: --mtp-q4: draft head over %lld tokens as Q4_0 (%.1f MiB read per step, was %.1f)\n",
                  (long long) n_dvocab_, (double) dst.size() / 1048576.0, (double) src.size() / 1048576.0);
@@ -303,8 +300,7 @@ bool MtpDrafter::load(const std::string &rt_dir, const ModelGeometry &g,
                   (info ? std::to_string(free_bytes >> 20) + " MiB" : "unknown");
             return false;
         }
-        strata::ze::default_stream().memcpy(dense_, blob.data(), blob.size());
-        strata::ze::default_stream().sync();
+        strata::ze::copy_sync(dense_, blob.data(), blob.size());
         vram_ += blob.size();
         if (q4_ && !make_q4_dense(blob, err)) return false;
     }
@@ -330,8 +326,7 @@ bool MtpDrafter::load(const std::string &rt_dir, const ModelGeometry &g,
         for (uint64_t off = 0; off < bytes;) {
             const uint64_t n = std::min<uint64_t>(chunk.size(), bytes - off);
             if (std::fread(chunk.data(), 1, (size_t) n, f) != (size_t) n) { err = "mtp: experts.bin is truncated"; return false; }
-            strata::ze::default_stream().memcpy(experts_ + off, chunk.data(), n);
-            strata::ze::default_stream().sync();
+            strata::ze::copy_sync(experts_ + off, chunk.data(), n);
             off += n;
         }
         vram_ += bytes;
@@ -439,8 +434,7 @@ bool MtpDrafter::load(const std::string &rt_dir, const ModelGeometry &g,
         std::vector<int32_t> id((size_t) (T * (uint64_t) cap_));
         for (uint64_t t = 0; t < T; ++t)
             for (int64_t i = 0; i < cap_; ++i) id[(size_t) (t * (uint64_t) cap_ + (uint64_t) i)] = (int32_t) i;
-        strata::ze::default_stream().memcpy(ident_, id.data(), id.size() * 4);
-        strata::ze::default_stream().sync();
+        strata::ze::copy_sync(ident_, id.data(), id.size() * 4);
     }
     // --pipeline-windows 2 (the forcing graphs): the chain shares its card with stage 1's windows and the next launch
     // on stage 0 waits for it, so its stream gets the highest priority there (STRATA_MTP_PRIORITY=0: the default)
@@ -491,8 +485,7 @@ void MtpDrafter::record_top2(int j) {
     if ((int64_t) lg_host_.size() < nv) lg_host_.resize((size_t) nv);
     if ((int) top2_.size() < max_t_) top2_.assign((size_t) max_t_, -1);
     if (j < 0 || j >= max_t_) return;
-    strata::ze::default_stream().memcpy(lg_host_.data(), head_logits_, (size_t) nv * sizeof(float));
-    strata::ze::default_stream().sync();
+    strata::ze::copy_sync(lg_host_.data(), head_logits_, (size_t) nv * sizeof(float));
     int64_t b1 = -1, b2 = -1;
     for (int64_t i = 0; i < nv; ++i) {
         const float v = lg_host_[(size_t) i];
@@ -659,8 +652,7 @@ bool MtpDrafter::bind(const WeightTable &wt, const NativeHead *head,
                 draft_head_hint(n_dvocab_, row_bytes);
                 return false;
             }
-            strata::ze::default_stream().memcpy(dvocab_, raw.data(), raw.size());
-            strata::ze::default_stream().sync();
+            strata::ze::copy_sync(dvocab_, raw.data(), raw.size());
             dvocab_host_.resize((size_t) n_dvocab_);
             std::memcpy(dvocab_host_.data(), raw.data(), raw.size());
             strata::kernels::gather_rows((const uint8_t*) head->weights(), row_bytes, dvocab_, n_dvocab_, dhead_, nullptr);
@@ -1444,8 +1436,7 @@ bool MtpDrafter::draft_first(int T, const float *R_row, int32_t token,
     // row 0 is the real pair; rows 1.. repeat it and only write cells the next round overwrites
     const int64_t HCN = g_->hc * g_->n_embd;
     for (int t = 0; t < T; ++t) {
-        strata::ze::default_stream().memcpy((void*) (window_R_ + (size_t) t * HCN), R_row, (size_t) HCN * sizeof(float));
-        strata::ze::default_stream().sync();
+        strata::ze::copy_sync((void*) (window_R_ + (size_t) t * HCN), R_row, (size_t) HCN * sizeof(float));
     }
     std::vector<int32_t> toks((size_t) T, token);
     return draft(T, toks.data(), cell, 0, drafts, err, probs, min_p, n_drafts);

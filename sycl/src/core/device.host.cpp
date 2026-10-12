@@ -51,12 +51,9 @@ std::string arch_problem(const cudaDeviceProp& p, int ordinal) {
 #endif
 
 void ip_version(int ordinal, int& major, int& minor) {
-    ze_device_ip_version_ext_t ip{ZE_STRUCTURE_TYPE_DEVICE_IP_VERSION_EXT};
-    ze_device_properties_t p{ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES};
-    p.pNext = &ip;
-    STRATA_ZE_CHECK(zeDeviceGetProperties(strata::ze::device_handle(ordinal), &p));
-    major = (int) (ip.ipVersion >> 22);
-    minor = (int) ((ip.ipVersion >> 14) & 0xff);
+    const uint32_t v = strata::ze::device_info(ordinal).ip_version;
+    major = (int) (v >> 22);
+    minor = (int) ((v >> 14) & 0xff);
 }
 
 }  // namespace

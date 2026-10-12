@@ -27,8 +27,7 @@ constexpr int QK = 64;
 /// cudaMemcpy: after the device's queued work, complete on return.
 void memcpy_sync(void* dst, const void* src, size_t bytes) {
     strata::ze::device_sync();
-    strata::ze::default_stream().memcpy(dst, src, bytes);
-    strata::ze::default_stream().sync();
+    strata::ze::copy_sync(dst, src, bytes);
 }
 
 // FP16 patterns, and they are deliberately NOT all powers of two.

@@ -138,8 +138,7 @@ KvStreamCounters kv_stream_counters(const KvStreamMap &m) {
     int32_t c[kKvCtlInts] = {};
     KvStreamCounters r;
     if (m.ctl == nullptr) return r;
-    ze::default_stream().memcpy(c, m.ctl, sizeof(c));
-    ze::default_stream().sync();
+    ze::copy_sync(c, m.ctl, sizeof(c));
     const unsigned long long* u = reinterpret_cast<const unsigned long long*>(c + 4);
     r.misses = u[0];
     r.lookups = u[1];

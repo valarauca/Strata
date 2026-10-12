@@ -93,8 +93,7 @@ int32_t *step_scratch() {
 
 void step_upload_raw(const int32_t *h_step) {
     int32_t* d = step_scratch();
-    strata::ze::default_stream().memcpy(d, h_step, qsa_step_bytes());
-    strata::ze::default_stream().sync();
+    strata::ze::copy_sync(d, h_step, qsa_step_bytes());
 }
 
 /// From a POSITION: fills all four entries.  This is the form the layer will use, and the only form that cannot

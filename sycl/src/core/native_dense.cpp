@@ -248,8 +248,7 @@ bool NativeDense::load(const std::vector<std::string> &shards,
                     err = "native dense upload " + tensor.name + ": out of device memory";
                         return false;
                 }
-                strata::ze::default_stream().memcpy(data.get(), gguf.tensor_data(tensor), bytes);
-                strata::ze::default_stream().sync();
+                strata::ze::copy_sync(data.get(), gguf.tensor_data(tensor), bytes);
                 max_in = (std::max)(max_in, (int) ref.ne0);
                 total += bytes;
                 // STRATA_Q8_PACKED=1: a second, packed copy of an eligible Q8_0 matrix for the decode MMVQ (the GGUF
@@ -267,8 +266,7 @@ bool NativeDense::load(const std::vector<std::string> &shards,
                         err = "native dense packed upload " + tensor.name + ": out of device memory";
                         return false;
                     }
-                    strata::ze::default_stream().memcpy(packed.get(), host.data(), bytes);
-                    strata::ze::default_stream().sync();
+                    strata::ze::copy_sync(packed.get(), host.data(), bytes);
                 }
                 pending.push_back(Pending{&ref, (int) tensor.type, bytes, std::move(data), std::move(packed)});
             }
@@ -292,9 +290,8 @@ bool NativeDense::load(const std::vector<std::string> &shards,
                     if (p == nullptr) {
                         err = "native dense (STRATA_HC_Q8) upload " + tensor.name; return false;
                     }
-                    strata::ze::default_stream().memcpy(p, f32_inject ? (const void *)q8.data() : gguf.tensor_data(tensor),
+                    strata::ze::copy_sync(p, f32_inject ? (const void *)q8.data() : gguf.tensor_data(tensor),
                                                         bytes);
-                    strata::ze::default_stream().sync();
                     ref.hc_q8 = p;
                     weights_.push_back(p);
                     hc_q8_bytes += bytes;

@@ -1790,7 +1790,6 @@ bool FileExpertSource::pin_cache_complement(
     const uint8_t* device = nullptr;
     bool pinned_ok = false;
     uint64_t locked = 0;
-    uint64_t partial_pin = 0;   ///< CS-T: a registered prefix of a locked arena
     uint64_t lock_off = 0;      ///< where the working-set lock starts (after the registered prefix)
     std::string note;
     auto release = [&]() {
@@ -1836,46 +1835,6 @@ bool FileExpertSource::pin_cache_complement(
                 return false;
             }
             if (pin) {
-                // CS-T, a RAM budget: its bytes are in profile order, hottest first, so the driver is asked to
-                // register the largest prefix it takes (from the cap down in 2 GiB steps).  Those experts can be
-                // read by the GPU over PCIe (--pcie-frac) and copied by DMA; only the rest is locked in the working
-                // set (the registered prefix is page-locked by the driver already - locking it twice made the next
-                // device allocation fail).
-                // opt-in (STRATA_PARTIAL_PIN=1): on the RTX 5070 PC the GPU's PCIe share of the misses measured no
-                // faster than the CPU computing them (7.30 / 7.44 tok/s with 24 / 16 GiB registered against 7.05-7.74
-                // unpinned at a 40 GiB budget), and registering adds startup time and driver memory pressure
-                static const bool partial_on = [] {
-                    const char* v = std::getenv("STRATA_PARTIAL_PIN");
-                    return v != nullptr && std::atoi(v) != 0;
-                }();
-                // at most STRATA_PARTIAL_PIN_GIB (default 24): registering 30 GiB of a 40 GiB arena left the driver
-                // unable to page-lock the prompt path's small buffers afterwards (RTX 5070, WDDM)
-                static const uint64_t pin_cap = [] {
-                    const char* v = std::getenv("STRATA_PARTIAL_PIN_GIB");
-                    return (uint64_t) ((v != nullptr && std::atof(v) > 0 ? std::atof(v) : 24.0) * 1073741824.0);
-                }();
-                if (budget_bytes > 0 && partial_on) {
-                    const uint64_t step = 2ull << 30;
-                    for (uint64_t want = std::min(bytes, pin_cap); want >= step; want = want > step ? want - step : 0) {
-                        // cut at an expert boundary: a blob that started inside the registered range and ran past it
-                        // would be taken as page-locked by a cudaMemcpyAsync and refused ("adaptive refill failed")
-                        uint64_t w = want;
-                        for (size_t i = 0; i < offsets.size(); ++i) {
-                            if (offsets[i] == kNoComplement) continue;
-                            const uint64_t b = layer_blob_bytes_[i / (size_t) n_expert_];
-                            if (offsets[i] < want && offsets[i] + b > want) { w = offsets[i]; break; }
-                        }
-                        if (w == 0) break;
-                        device = (const uint8_t*) arena;
-                        partial_pin = w;
-                        break;
-                    }
-                    char msg[160];
-                    std::snprintf(msg, sizeof msg, "%.2f GiB of it registered for the GPU (the hottest)",
-                                  (double) partial_pin / 1073741824.0);
-                    note += std::string("; ") + msg;
-                }
-                lock_off = partial_pin;
                 const strata::platform::LockResult lr =
                     strata::platform::lock_resident((uint8_t*) arena + lock_off, bytes - lock_off);
                 locked = lr.locked_bytes;
@@ -2007,9 +1966,9 @@ bool FileExpertSource::pin_cache_complement(
     complement_device_ = device;
     complement_bytes_ = bytes;
     complement_offsets_ = std::move(offsets);
-    complement_pinned_ = (pinned_ok || partial_pin > 0) && bytes > 0;
-    complement_pin_limit_ = pinned_ok ? bytes : partial_pin;
-    complement_partial_ = !pinned_ok && partial_pin > 0;
+    complement_pinned_ = pinned_ok && bytes > 0;
+    complement_pin_limit_ = pinned_ok ? bytes : 0;
+    complement_partial_ = false;
     complement_locked_ = locked;
     complement_lock_off_ = lock_off;
     complement_lent_slots_ = lend ? n_slots - keep_from : 0;

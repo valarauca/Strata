@@ -92,8 +92,7 @@ struct Fixture {
             std::vector<uint8_t> data(sizes[i]);
             for (size_t j=0;j<data.size();++j) data[j]=(uint8_t)(salt+i*31+j*7+j/257);
             if (!data.empty()) {
-                strata::ze::default_stream().memcpy(sources[i], data.data(), data.size());
-                strata::ze::default_stream().sync();
+                strata::ze::copy_sync(sources[i], data.data(), data.size());
             }
         }
     }
@@ -144,9 +143,8 @@ void full_session(int fmt, int mode, int experts) {
             strata::ze::default_stream().sync();
         }
         // A real indexer maintains its spare pooled row as a copy of idx_dead.
-        strata::ze::default_stream().memcpy(main.state.idx_pooled + (ids.size() / 4) * g.idx_key_dim,
+        strata::ze::copy_sync(main.state.idx_pooled + (ids.size() / 4) * g.idx_key_dim,
                                             main.state.idx_dead, sizes.dead);
-        strata::ze::default_stream().sync();
         strata::ze::device_sync();
     };
     fill(13);
@@ -213,9 +211,8 @@ void full_session(int fmt, int mode, int experts) {
         strata::ze::default_stream().sync();
         ids.resize(70);
         for (size_t i=65;i<ids.size();++i) ids[i]=int32_t(i+1);
-        strata::ze::default_stream().memcpy(main.state.idx_pooled + (ids.size() / 4) * g.idx_key_dim,
+        strata::ze::copy_sync(main.state.idx_pooled + (ids.size() / 4) * g.idx_key_dim,
                                             main.state.idx_dead, sizes.dead);
-        strata::ze::default_stream().sync();
         SavedConversation fresh,incremental;
         check(conversation_snapshot_save(fresh,view,ss,g,draft.state,err),"full capture reference after growth or rewind");
         size_t peak=0,reused=0;
@@ -277,8 +274,7 @@ void full_session(int fmt, int mode, int experts) {
     check(conversation_snapshot_restore(a,ss,g,draft.state,err)==ConversationRestore::restored,"restore A after stage images");
     check(conversation_checkpoint_restore(a.checkpoints[0],ss,g,err),"restore early running checkpoint");
     std::vector<uint8_t> spare(sizes.dead);
-    strata::ze::default_stream().memcpy(spare.data(), main.state.idx_pooled, sizes.dead);
-    strata::ze::default_stream().sync();
+    strata::ze::copy_sync(spare.data(), main.state.idx_pooled, sizes.dead);
     check(spare==a.checkpoints[0].dead,"checkpoint rebuilds spare row over a later completed block");
     check(ss.ple_prev[0]==2 && ss.ple_prev[1]==3,"checkpoint PLE token window");
 }
@@ -348,8 +344,7 @@ int main() {
             }
             if (mode==1) {
                 std::vector<int32_t> table((size_t)f.state.n_pages);
-                strata::ze::default_stream().memcpy(table.data(), f.state.page_table, table.size() * 4);
-                strata::ze::default_stream().sync();
+                strata::ze::copy_sync(table.data(), f.state.page_table, table.size() * 4);
                 check(std::all_of(table.begin(),table.end(),[](int32_t x){return x==-1;}),"stale VRAM pages invalidated");
             }
             if (mode==2 && upto>0) {
@@ -361,10 +356,9 @@ int main() {
                 const void* slots=fmt==kKvQ4?(void*)f.state.k_q4:fmt==kKvInt8?(void*)f.state.k_q:(void*)f.state.k_pool;
                 std::vector<uint8_t> got(code_block);
                 for (int64_t page=b0;page<b1;++page) {
-                    strata::ze::default_stream().memcpy(got.data(),
+                    strata::ze::copy_sync(got.data(),
                                                         (const uint8_t *)slots + (page % f.state.n_slots) * code_block,
                                                         code_block);
-                    strata::ze::default_stream().sync();
                     std::vector<uint8_t> expected(code_block);
                     check(a.k.read(expected.data(), page*code_block, code_block),"read segmented expected draft page");
                     check(got == expected,"draft ring contains restored pages");

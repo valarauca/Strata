@@ -30,8 +30,7 @@ using strata::kernels::Codebook;
 /// cudaMemcpy: after the device's queued work, complete on return.
 void memcpy_sync(void* dst, const void* src, size_t bytes) {
     strata::ze::device_sync();
-    strata::ze::default_stream().memcpy(dst, src, bytes);
-    strata::ze::default_stream().sync();
+    strata::ze::copy_sync(dst, src, bytes);
 }
 
 /// The host decode, transcribed from `docs/pack-format.md`'s rule: `value = cb[code] * scale + offset`, with

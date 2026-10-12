@@ -25,8 +25,7 @@ int g_fail = 0;
 /// cudaMemcpy: after the device's queued work, complete on return.
 void memcpy_sync(void* dst, const void* src, size_t bytes) {
     strata::ze::device_sync();
-    strata::ze::default_stream().memcpy(dst, src, bytes);
-    strata::ze::default_stream().sync();
+    strata::ze::copy_sync(dst, src, bytes);
 }
 
 template <typename T>

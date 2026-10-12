@@ -30,8 +30,7 @@ using strata::kernels::f32_from_bf16;
 /// cudaMemcpy: after the device's queued work, complete on return.
 void memcpy_sync(void* dst, const void* src, size_t bytes) {
     strata::ze::device_sync();
-    strata::ze::default_stream().memcpy(dst, src, bytes);
-    strata::ze::default_stream().sync();
+    strata::ze::copy_sync(dst, src, bytes);
 }
 
 double rel_l1(const std::vector<float>& a, const std::vector<float>& b) {

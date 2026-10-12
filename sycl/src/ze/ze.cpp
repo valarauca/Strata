@@ -108,6 +108,55 @@ private:
 
 const char* kDeviceLost = "DEVICE_LOST";
 
+// ONEAPI_DEVICE_SELECTOR as a STRATA_ZE_DEVICES list: the GPU ordinals (a sub-device N.M as GPU N) and PCI addresses of
+// its level_zero and * terms, or "*" for `gpu`, `*` or nothing usable. Other backends, device types and negations are
+// ignored with a note.
+std::string oneapi_spec(const std::string& sel) {
+    std::string out;
+    bool all = false, ignored = false;
+    size_t a = 0;
+    while (a <= sel.size()) {
+        size_t b = sel.find(';', a);
+        if (b == std::string::npos) b = sel.size();
+        const std::string term = sel.substr(a, b - a);
+        a = b + 1;
+        if (term.empty()) continue;
+        const size_t c = term.find(':');
+        const std::string backend = term.substr(0, c);
+        if (c == std::string::npos || (backend != "level_zero" && backend != "*")) {
+            ignored = true;
+            continue;
+        }
+        const std::string list = term.substr(c + 1);
+        size_t i = 0;
+        while (i <= list.size()) {
+            size_t j = list.find(',', i);
+            if (j == std::string::npos) j = list.size();
+            const std::string item = list.substr(i, j - i);
+            i = j + 1;
+            if (item.empty()) continue;
+            if (item == "*" || item == "gpu") {
+                all = true;
+            } else if (item.find(':') != std::string::npos) {
+                out += (out.empty() ? "" : ",") + item;
+            } else {
+                char* end = nullptr;
+                const long k = std::strtol(item.c_str(), &end, 10);
+                if (end != item.c_str() && k >= 0 && (*end == 0 || *end == '.')) {
+                    out += (out.empty() ? "" : ",") + std::to_string(k);
+                    ignored = ignored || *end == '.';
+                } else {
+                    ignored = true;
+                }
+            }
+        }
+    }
+    if (ignored)
+        std::fprintf(stderr, "strata ze: ONEAPI_DEVICE_SELECTOR='%s': only its level_zero GPUs are used, the rest is ignored\n",
+                     sel.c_str());
+    return all || out.empty() ? "*" : out;
+}
+
 void Runtime::init() {
     serialize = env_on("STRATA_L0_SERIALIZE", false);
     trace = env_on("STRATA_ZE_TRACE", false);
@@ -141,16 +190,7 @@ void Runtime::init() {
     std::vector<int> pick;
     std::string spec;
     if (const char* s = std::getenv("STRATA_ZE_DEVICES"); s && *s) spec = s;
-    else if (const char* o = std::getenv("ONEAPI_DEVICE_SELECTOR"); o && *o) {
-        const std::string v = o;
-        const size_t c = v.find(':');
-        if (v.rfind("level_zero", 0) != 0 || c == std::string::npos) {
-            std::fprintf(stderr, "strata ze: ONEAPI_DEVICE_SELECTOR='%s' is not a level_zero:<list> selector\n", o);
-            std::exit(1);
-        }
-        spec = v.substr(c + 1);
-        std::replace(spec.begin(), spec.end(), ';', ',');
-    }
+    else if (const char* o = std::getenv("ONEAPI_DEVICE_SELECTOR"); o && *o) spec = oneapi_spec(o);
     if (spec.empty() || spec == "*") {
         for (size_t i = 0; i < all.size(); ++i) pick.push_back((int) i);
     } else {
@@ -641,6 +681,11 @@ void free(void* p) {
     reap(false);
 }
 
+void free_sync(void* p) {
+    free(p);
+    reap(true);
+}
+
 MemKind kind_of(const void* p, int* dev) {
     if (dev) *dev = -1;
     if (p == nullptr) return MemKind::Unknown;
@@ -1074,7 +1119,7 @@ void Stream::record(Event& e) {
 }
 
 void Stream::wait(Event& e) {
-    std::lock_guard<std::recursive_mutex> lk(mu_);
+    std::unique_lock<std::recursive_mutex> lk(mu_);
     if (!e.recorded_) return;
     if (e.captured_in_ != nullptr && !e.replayed_) {
         Capture* c = e.captured_in_;
@@ -1097,6 +1142,7 @@ void Stream::wait(Event& e) {
         return;
     }
     if (e.dev_ >= 0 && e.dev_ != dev_) {
+        lk.unlock();
         e.sync();
         return;
     }
@@ -1256,6 +1302,17 @@ void device_sync(int ordinal) {
 
 void sync_all() {
     for (int i = 0; i < device_count(); ++i) device_sync(i);
+}
+
+void copy_sync(void* dst, const void* src, size_t bytes, int ordinal) {
+    if (bytes > 0 && (dst == nullptr || src == nullptr)) {
+        std::fprintf(stderr, "strata ze: copy_sync(%p, %p, %zu): null pointer\n", dst, src, bytes);
+        std::fflush(stderr);
+        std::abort();
+    }
+    Stream& s = default_stream(ordinal);
+    s.memcpy(dst, src, bytes);
+    s.sync();
 }
 
 Event::Event(bool timing) : timing_(timing) {

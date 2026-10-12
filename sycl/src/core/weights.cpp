@@ -446,8 +446,7 @@ bool WeightTable::load(const std::string &pack_dir, void *arena_base,
                 }
 
                 const double u0 = now_ms();
-                strata::ze::default_stream().memcpy(dst_base + r.dst_off + out_at, host_src, out_bytes);
-                strata::ze::default_stream().sync();
+                strata::ze::copy_sync(dst_base + r.dst_off + out_at, host_src, out_bytes);
                 upload_ms += now_ms() - u0;
                 done += n;
             }

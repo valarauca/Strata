@@ -93,8 +93,7 @@ void cvec_set_enabled(bool on) {
         if (g_dev[d].on == nullptr) continue;
         ze::set_device(d);
         ze::device_sync(); // nothing in flight may still read the flag
-        ze::default_stream().memcpy(g_dev[d].on, &v, sizeof(int));
-        ze::default_stream().sync();
+        ze::copy_sync(g_dev[d].on, &v, sizeof(int));
     }
     ze::set_device(prev);
     g_on_host = on;

@@ -113,8 +113,7 @@ bool transfer(void *dst, const void *src, size_t n, std::string &error) {
     if (!n) return true;
     if (!src || !dst) { error = "conversation snapshot: missing state buffer"; return false; }
     // Default handles both device allocations and device-mapped host pool aliases.
-    strata::ze::default_stream().memcpy(dst, src, n);
-    strata::ze::default_stream().sync();
+    strata::ze::copy_sync(dst, src, n);
     return true;
 }
 } // namespace

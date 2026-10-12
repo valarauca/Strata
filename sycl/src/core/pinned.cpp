@@ -64,7 +64,7 @@ void release_imports(const PinnedArena* arena) {
         v = std::move(it->second);
         g_imports.erase(it);
     }
-    for (void* p : v) ze::free(p);
+    for (void* p : v) ze::free_sync(p);
 }
 
 constexpr uint64_t kSharedArenaHeaderBytes = 4096;

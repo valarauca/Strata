@@ -634,8 +634,7 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
     carve(real);
     {
         const int32_t one = 1;
-        strata::ze::default_stream().memcpy(one_, &one, sizeof one);
-        strata::ze::default_stream().sync();
+        strata::ze::copy_sync(one_, &one, sizeof one);
     }
     sink_.staging = (unsigned long long) staging_;
     sink_.staging_cap = kStagingBlobs;
@@ -1758,8 +1757,7 @@ void Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0) {
 
 void Verifier::collect_profile() {
     if (std::getenv("STRATA_VERIFY_EAGER") == nullptr) {   // eager: prof_h_ already holds the host clocks
-        strata::ze::default_stream().memcpy(prof_h_.data(), prof_, prof_h_.size() * 8);
-        strata::ze::default_stream().sync();
+        strata::ze::copy_sync(prof_h_.data(), prof_, prof_h_.size() * 8);
     }
     accumulate_profile(prof_h_.data());
 }
@@ -2197,8 +2195,7 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
         static bool reported = false;
         if (!reported) {
             std::vector<float> h((size_t) T * (size_t) n_vocab_);
-            strata::ze::default_stream().memcpy(h.data(), head_logits_, h.size() * 4);
-            strata::ze::default_stream().sync();
+            strata::ze::copy_sync(h.data(), head_logits_, h.size() * 4);
             for (int t = 0; t < T && !reported; ++t) {
                 int64_t bad = 0;
                 for (int64_t v = 0; v < n_vocab_; ++v) bad += !std::isfinite(h[(size_t) t * n_vocab_ + v]);

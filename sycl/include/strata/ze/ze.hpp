@@ -66,7 +66,8 @@ struct DeviceInfo {
 };
 
 /// Number of GPUs Strata uses: STRATA_ZE_DEVICES ("0,1" or PCI addresses), or ONEAPI_DEVICE_SELECTOR="level_zero:0,1"
-/// kept as an alias for existing configs, else every GPU of the driver. Ordinals below index this list.
+/// kept as an alias for existing configs (its level_zero GPUs, other backends ignored), else every GPU of the driver.
+/// Ordinals below index this list.
 int device_count();
 /// The calling thread's current GPU (default 0).
 int current_device();
@@ -105,6 +106,9 @@ bool import_host(void* p, size_t bytes);
 /// has passed the point where free was called (a fence on each), and an allocation that finds no room first waits for
 /// the pending ones.
 void free(void* p);
+/// free(p), then a host wait until p and every free before it are back with the driver: for memory whose backing goes
+/// away next (an import_host range before munmap) or whose address must not come back from the next allocation.
+void free_sync(void* p);
 /// The kind and owning GPU of `p` (dev = -1 for host memory or unknown pointers).
 MemKind kind_of(const void* p, int* dev = nullptr);
 /// How far into its Strata device allocation the range [p, p + bytes) ends; 0 when p is not in one.
@@ -280,6 +284,9 @@ inline Stream* stream_of(const void* s) { return s ? (Stream*) s : &default_stre
 void device_sync(int ordinal = -1);
 /// Host wait for every stream of every GPU.
 void sync_all();
+/// Copies `bytes` from `src` to `dst` on GPU `ordinal`'s default stream (-1: current) and waits for that stream, so the
+/// copy and everything queued before it have completed on return. Aborts on a null pointer with a nonzero size.
+void copy_sync(void* dst, const void* src, size_t bytes, int ordinal = -1);
 
 /// A counter-based event: records a point in a stream, waited on by streams or the host.
 class Event {

@@ -1029,8 +1029,7 @@ bool Prefill::init(const core::WeightTable &wt, const core::ModelGeometry &g,
         if (m.ident_table == nullptr) {
             ok = false;
         } else {
-            strata::ze::default_stream().memcpy(m.ident_table, ident.data(), ident.size() * 4);
-            strata::ze::default_stream().sync();
+            strata::ze::copy_sync(m.ident_table, ident.data(), ident.size() * 4);
             m.owned.push_back(m.ident_table);
         }
     }
@@ -3470,8 +3469,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                         m.cs->sync();
                         auto bad = [&](const float *d, int64_t n) {
                             std::vector<float> h((size_t)n);
-                            strata::ze::default_stream().memcpy(h.data(), d, (size_t) n * 4);
-                            strata::ze::default_stream().sync();
+                            strata::ze::copy_sync(h.data(), d, (size_t) n * 4);
                             int64_t c = 0;
                             for (float v : h) c += !std::isfinite(v);
                             return c;
@@ -3484,8 +3482,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                         // gate/up (non-finite count, largest finite magnitude)
                         auto bad16 = [&](const uint16_t* d, int64_t n, double& mx) {
                             std::vector<uint16_t> h((size_t) n);
-                            strata::ze::default_stream().memcpy(h.data(), d, (size_t) n * 2);
-                            strata::ze::default_stream().sync();
+                            strata::ze::copy_sync(h.data(), d, (size_t) n * 2);
                             int64_t c = 0;
                             mx = 0;
                             for (uint16_t v : h) {
@@ -3614,8 +3611,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
             if (std::FILE* f = std::fopen(dump, c0 == 0 ? "wb" : "ab")) {
                 std::vector<float> row((size_t) D);
                 for (int64_t t = (64 - p0 % 64) % 64; t < T; t += 64) {
-                    strata::ze::default_stream().memcpy(row.data(), m.R + t * D, (size_t) D * 4);
-                    strata::ze::default_stream().sync();
+                    strata::ze::copy_sync(row.data(), m.R + t * D, (size_t) D * 4);
                     const int64_t pos = p0 + t;
                     std::fwrite(&pos, sizeof pos, 1, f);
                     std::fwrite(row.data(), 4, row.size(), f);
@@ -3633,8 +3629,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                 std::vector<uint16_t> out((size_t) (kRows * D));
                 for (int64_t t0 = 0; t0 < T; t0 += kRows) {
                     const int64_t nr = std::min<int64_t>(kRows, T - t0);
-                    strata::ze::default_stream().memcpy(rows.data(), m.R + t0 * D, (size_t) (nr * D) * 4);
-                    strata::ze::default_stream().sync();
+                    strata::ze::copy_sync(rows.data(), m.R + t0 * D, (size_t) (nr * D) * 4);
                     for (int64_t i = 0; i < nr * D; ++i) {
                         uint32_t u;
                         std::memcpy(&u, &rows[(size_t) i], 4);
@@ -3664,8 +3659,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
         m.cs->sync();
         auto bad = [&](const float *d, int64_t n) {
             std::vector<float> h((size_t)n);
-            strata::ze::default_stream().memcpy(h.data(), d, (size_t) n * 4);
-            strata::ze::default_stream().sync();
+            strata::ze::copy_sync(h.data(), d, (size_t) n * 4);
             int64_t c = 0;
             double mx = 0;
             for (float v : h) { c += !std::isfinite(v); if (std::isfinite(v)) mx = std::max(mx, (double) std::fabs(v)); }
@@ -3728,8 +3722,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
         std::string line;
         char h[8];
         for (int64_t i = 0; i < ss.gdn_alloc; ++i) {
-            strata::ze::default_stream().memcpy(b.data(), ss.gdn_state + (size_t) i * gdn_floats, b.size());
-            strata::ze::default_stream().sync();
+            strata::ze::copy_sync(b.data(), ss.gdn_state + (size_t) i * gdn_floats, b.size());
             uint64_t x = 1469598103934665603ull;
             for (uint8_t c : b) x = (x ^ c) * 1099511628211ull;
             std::snprintf(h, sizeof(h), "%04llx ", (unsigned long long) (x & 0xffff));

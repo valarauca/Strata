@@ -57,8 +57,7 @@ bool NativeHead::load(const std::vector<std::string> &shards, int64_t n_in,
             err = "native head upload: out of device memory";
             return false;
         }
-        strata::ze::default_stream().memcpy(weights, gguf.tensor_data(*tensor), bytes);
-        strata::ze::default_stream().sync();
+        strata::ze::copy_sync(weights, gguf.tensor_data(*tensor), bytes);
         weights_ = weights;
         scratch_ = scratch;
         bytes_ = bytes;
@@ -147,8 +146,7 @@ bool NativeEmbed::load(const std::vector<std::string> &shards, int64_t n_embd,
                       " MiB, nor place it in VRAM";
                 return false;
             }
-            strata::ze::default_stream().memcpy(d, gguf.tensor_data(*t), bytes_);
-            strata::ze::default_stream().sync();
+            strata::ze::copy_sync(d, gguf.tensor_data(*t), bytes_);
             std::fprintf(stderr, "strata: native embedding: cannot pin %llu MiB, kept in VRAM instead\n",
                          (unsigned long long) (bytes_ >> 20));
             dev_ = d;
