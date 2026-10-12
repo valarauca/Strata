@@ -19,9 +19,7 @@
 //      rounding from reduction order, and graph replay must preserve the precision chosen at capture.
 //   6. `gr_write`'s `2*sigmoid`, which centres the gate on 1 so a ZERO injection is a plain residual add.
 //      Asserted as a property, not as a value, because that is what the source comment claims.
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
+#include "strata/ze/ze.hpp"
 #include "strata/kernels/gr.hpp"
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/native_mmvq.hpp"
@@ -37,7 +35,18 @@
 
 namespace {
 
-void check(dpct::err0 e, const char *what) {
+/// cudaMemcpy: after the device's queued work, complete on return.
+void memcpy_sync(void* dst, const void* src, size_t bytes) {
+    strata::ze::device_sync();
+    strata::ze::default_stream().memcpy(dst, src, bytes);
+    strata::ze::default_stream().sync();
+}
+
+/// cudaMemset: after the device's queued work, complete on return.
+void memset_sync(void* dst, int value, size_t bytes) {
+    strata::ze::device_sync();
+    strata::ze::default_stream().memset(dst, value, bytes);
+    strata::ze::default_stream().sync();
 }
 
 /// The same rule the kernel uses, on the host - `ref/quant.py::bf16`.
@@ -171,25 +180,12 @@ int scalar_activation_contract() {
     float *d_R = nullptr, *d_norm = nullptr, *d_mixed = nullptr, *d_inject = nullptr;
     uint16_t* d_weights = nullptr;
     void* d_scratch = nullptr;
-    check(DPCT_CHECK_ERROR(
-              d_R = sycl::malloc_device<float>(2, dpct::get_in_order_queue())),
-          "scalar R");
-    check(DPCT_CHECK_ERROR(d_norm = sycl::malloc_device<float>(
-                               2, dpct::get_in_order_queue())),
-          "scalar norm");
-    check(DPCT_CHECK_ERROR(d_mixed = sycl::malloc_device<float>(
-                               2, dpct::get_in_order_queue())),
-          "scalar mixed");
-    check(DPCT_CHECK_ERROR(d_inject = sycl::malloc_device<float>(
-                               1, dpct::get_in_order_queue())),
-          "scalar inject");
-    check(DPCT_CHECK_ERROR(d_weights = sycl::malloc_device<uint16_t>(
-                               10, dpct::get_in_order_queue())),
-          "scalar weights");
-    check(DPCT_CHECK_ERROR(
-              d_scratch = (void *)sycl::malloc_device(
-                  gr_workspace_bytes(sh), dpct::get_in_order_queue())),
-          "scalar scratch");
+    d_R = (float*) strata::ze::malloc_device(2 * sizeof(float));
+    d_norm = (float*) strata::ze::malloc_device(2 * sizeof(float));
+    d_mixed = (float*) strata::ze::malloc_device(2 * sizeof(float));
+    d_inject = (float*) strata::ze::malloc_device(1 * sizeof(float));
+    d_weights = (uint16_t*) strata::ze::malloc_device(10 * sizeof(uint16_t));
+    d_scratch = strata::ze::malloc_device(gr_workspace_bytes(sh));
     GrWorkspace ws;
     gr_workspace_init(sh, d_scratch, ws);
     const float ones[] = {1.0f, 1.0f};
@@ -198,90 +194,35 @@ int scalar_activation_contract() {
         bf16_bits(1.5f), 0, bf16_bits(1.5f), 0, // both gate rows consume lo[0]
         bf16_bits(2.0f), 0                     // injection: 2*xn[0]
     };
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming in
-    the original code the source host memory is pageable memory. If the memory
-    is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    check(DPCT_CHECK_ERROR(
-              (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(d_R, ones, sizeof(ones)).wait()),
-          "scalar upload R");
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming in
-    the original code the source host memory is pageable memory. If the memory
-    is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(d_weights, weights,
-                                                             sizeof(weights)).wait()),
-          "scalar upload weights");
-    dpct::queue_ptr stream;
-    /*
-    DPCT1025: The SYCL queue is created ignoring the flag and priority
-    options.
-    */
-    check(DPCT_CHECK_ERROR(stream =
-                               dpct::get_current_device().create_queue(true)),
-          "scalar stream");
+    memcpy_sync(d_R, ones, sizeof(ones));
+    memcpy_sync(d_weights, weights, sizeof(weights));
+    strata::ze::Stream* stream = new strata::ze::Stream();
     int bad = 0;
     for (float gamma : {1.0f, 1.00390625f}) {
         const float gammas[] = {gamma, gamma};
-        /*
-        DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-        assuming in the original code the source host memory is pageable memory.
-        If the memory is not pageable, call wait() on event return by memcpy API
-        to ensure synchronization behavior.
-        */
-        check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-                  d_norm, gammas, sizeof(gammas)).wait()),
-              "scalar upload norm");
+        memcpy_sync(d_norm, gammas, sizeof(gammas));
         float mixed_by_mode[3][2] = {}, inject_by_mode[3] = {};
         for (int mode = 0; mode < 3; ++mode) {
             select_activation_mode(mode);
             gr_read(d_R, d_norm, d_weights, d_weights + 4, d_weights + 8, 0.0f,
                     sh, ws, d_mixed, d_inject, stream);
-            check(DPCT_CHECK_ERROR(stream->wait()), "scalar warmup");
-            dpct::experimental::command_graph_ptr graph;
-            dpct::experimental::command_graph_exec_ptr executable;
-            check(DPCT_CHECK_ERROR(dpct::experimental::begin_recording(stream)),
-                  "scalar capture begin");
+            stream->sync();
+            strata::ze::Graph* graph;
+            stream->begin_capture();
             gr_read(d_R, d_norm, d_weights, d_weights + 4, d_weights + 8, 0.0f,
                     sh, ws, d_mixed, d_inject, stream);
-            check(DPCT_CHECK_ERROR(
-                      dpct::experimental::end_recording(stream, &graph)),
-                  "scalar capture end");
-            check(DPCT_CHECK_ERROR(
-                      executable =
-                          new sycl::ext::oneapi::experimental::command_graph<
-                              sycl::ext::oneapi::experimental::graph_state::
-                                  executable>(graph->finalize())),
-                  "scalar instantiate");
+            graph = stream->end_capture();
             // Changing both host options after capture cannot change the graph's selected kernels.
             select_activation_mode((mode + 1) % 3);
             // Warmup results must not make a missing/no-op captured launch pass.
             // Poison the outputs and intermediate workspace before replay.
-            check(DPCT_CHECK_ERROR(
-                      stream->memset(d_mixed, 0xa5, 2 * sizeof(float))),
-                  "scalar poison mixed");
-            check(
-                DPCT_CHECK_ERROR(stream->memset(d_inject, 0xa5, sizeof(float))),
-                "scalar poison inject");
-            check(DPCT_CHECK_ERROR(stream->memset(d_scratch, 0xa5, ws.bytes)),
-                  "scalar poison workspace");
-            check(DPCT_CHECK_ERROR(stream->ext_oneapi_graph(*executable)),
-                  "scalar replay");
-            check(DPCT_CHECK_ERROR(stream->wait()), "scalar replay sync");
-            check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                       .memcpy(mixed_by_mode[mode], d_mixed,
-                                               2 * sizeof(float))
-                                       .wait()),
-                  "scalar mixed copy");
-            check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                       .memcpy(&inject_by_mode[mode], d_inject,
-                                               sizeof(float))
-                                       .wait()),
-                  "scalar inject copy");
+            stream->memset(d_mixed, 0xa5, 2 * sizeof(float));
+            stream->memset(d_inject, 0xa5, sizeof(float));
+            stream->memset(d_scratch, 0xa5, ws.bytes);
+            stream->launch(*graph);
+            stream->sync();
+            memcpy_sync(mixed_by_mode[mode], d_mixed, 2 * sizeof(float));
+            memcpy_sync(&inject_by_mode[mode], d_inject, sizeof(float));
             const float activation = mode ? gamma : to_bf16(gamma);
             const float projection = activation * 0.5f;
             const float lo = projection / (1.0f + std::exp(-projection));
@@ -300,31 +241,17 @@ int scalar_activation_contract() {
                         gamma, activation_mode_name(mode), ok ? "pass" : "FAIL",
                         mixed_by_mode[mode][0], expected_mixed);
             if (!ok) ++bad;
-            check(DPCT_CHECK_ERROR(delete (executable)),
-                  "scalar graph exec destroy");
-            check(DPCT_CHECK_ERROR(delete (graph)), "scalar graph destroy");
+            delete graph;
 
             const float sentinel = -73.25f;
-            check(
-                DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                     .memcpy(d_inject, &sentinel, sizeof(float))
-                                     .wait()),
-                "scalar sentinel");
+            memcpy_sync(d_inject, &sentinel, sizeof(float));
             select_activation_mode(mode);
             gr_read(d_R, d_norm, d_weights, d_weights + 4, nullptr, 0.0f,
                     sh, ws, d_mixed, d_inject, stream);
-            check(DPCT_CHECK_ERROR(stream->wait()), "scalar final mixer sync");
+            stream->sync();
             float final_mixed[2] = {}, untouched = 0.0f;
-            check(DPCT_CHECK_ERROR(
-                      (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                          .memcpy(final_mixed, d_mixed, sizeof(final_mixed))
-                          .wait()),
-                  "scalar final mixed");
-            check(DPCT_CHECK_ERROR(
-                      (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                          .memcpy(&untouched, d_inject, sizeof(float))
-                          .wait()),
-                  "scalar sentinel copy");
+            memcpy_sync(final_mixed, d_mixed, sizeof(final_mixed));
+            memcpy_sync(&untouched, d_inject, sizeof(float));
             const bool final_ok = std::memcmp(final_mixed, mixed_by_mode[mode], sizeof(final_mixed)) == 0 && untouched == sentinel;
             std::printf("  scalar final mixer %s %s\n", activation_mode_name(mode), final_ok ? "pass" : "FAIL");
             if (!final_ok) ++bad;
@@ -340,14 +267,13 @@ int scalar_activation_contract() {
         }
     }
     select_activation_mode(0);
-    check(DPCT_CHECK_ERROR(dpct::get_current_device().destroy_queue(stream)),
-          "scalar stream destroy");
-    sycl::free(d_R, dpct::get_in_order_queue());
-        sycl::free(d_norm, dpct::get_in_order_queue());
-        sycl::free(d_mixed, dpct::get_in_order_queue());
-        sycl::free(d_inject, dpct::get_in_order_queue());
-    sycl::free(d_weights, dpct::get_in_order_queue());
-        sycl::free(d_scratch, dpct::get_in_order_queue());
+    delete stream;
+    strata::ze::free(d_R);
+    strata::ze::free(d_norm);
+    strata::ze::free(d_mixed);
+    strata::ze::free(d_inject);
+    strata::ze::free(d_weights);
+    strata::ze::free(d_scratch);
     return bad;
 }
 
@@ -364,60 +290,18 @@ int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const ui
 
     float *d_r = nullptr, *d_r_out = nullptr, *d_bo = nullptr, *d_inj = nullptr;
     float *d_lo = nullptr, *d_rs = nullptr, *d_inj_out = nullptr, *d_mixed = nullptr, *d_xn = nullptr;
-    check(DPCT_CHECK_ERROR(d_r = sycl::malloc_device<float>(
-                               r.size(), dpct::get_in_order_queue())),
-          "multi R");
-    check(DPCT_CHECK_ERROR(d_r_out = sycl::malloc_device<float>(
-                               r.size(), dpct::get_in_order_queue())),
-          "multi R_out");
-    check(DPCT_CHECK_ERROR(d_bo = sycl::malloc_device<float>(
-                               bo.size(), dpct::get_in_order_queue())),
-          "multi bo");
-    check(DPCT_CHECK_ERROR(d_inj = sycl::malloc_device<float>(
-                               inj.size(), dpct::get_in_order_queue())),
-          "multi inj");
-    check(DPCT_CHECK_ERROR(d_lo = sycl::malloc_device<float>(
-                               (size_t)T * LR, dpct::get_in_order_queue())),
-          "multi lo");
-    check(DPCT_CHECK_ERROR(d_rs = sycl::malloc_device<float>(
-                               (size_t)T * HC, dpct::get_in_order_queue())),
-          "multi rs");
-    check(DPCT_CHECK_ERROR(d_inj_out = sycl::malloc_device<float>(
-                               (size_t)T * HC, dpct::get_in_order_queue())),
-          "multi injection");
-    check(DPCT_CHECK_ERROR(d_mixed = sycl::malloc_device<float>(
-                               (size_t)T * N, dpct::get_in_order_queue())),
-          "multi mixed");
-    check(DPCT_CHECK_ERROR(d_xn = sycl::malloc_device<float>(
-                               (size_t)T * D, dpct::get_in_order_queue())),
-          "multi xn");
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming in
-    the original code the source host memory is pageable memory. If the memory
-    is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-              d_r, r.data(), r.size() * sizeof(float)).wait()),
-          "multi copy R");
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming in
-    the original code the source host memory is pageable memory. If the memory
-    is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-              d_bo, bo.data(), bo.size() * sizeof(float)).wait()),
-          "multi copy bo");
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming in
-    the original code the source host memory is pageable memory. If the memory
-    is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-              d_inj, inj.data(), inj.size() * sizeof(float)).wait()),
-          "multi copy inj");
+    d_r = (float*) strata::ze::malloc_device(r.size() * sizeof(float));
+    d_r_out = (float*) strata::ze::malloc_device(r.size() * sizeof(float));
+    d_bo = (float*) strata::ze::malloc_device(bo.size() * sizeof(float));
+    d_inj = (float*) strata::ze::malloc_device(inj.size() * sizeof(float));
+    d_lo = (float*) strata::ze::malloc_device((size_t)T * LR * sizeof(float));
+    d_rs = (float*) strata::ze::malloc_device((size_t)T * HC * sizeof(float));
+    d_inj_out = (float*) strata::ze::malloc_device((size_t)T * HC * sizeof(float));
+    d_mixed = (float*) strata::ze::malloc_device((size_t)T * N * sizeof(float));
+    d_xn = (float*) strata::ze::malloc_device((size_t)T * D * sizeof(float));
+    memcpy_sync(d_r, r.data(), r.size() * sizeof(float));
+    memcpy_sync(d_bo, bo.data(), bo.size() * sizeof(float));
+    memcpy_sync(d_inj, inj.data(), inj.size() * sizeof(float));
 
     std::vector<FusedGrArgs> args(T);
     for (int t = 0; t < T; ++t) {
@@ -442,45 +326,18 @@ int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const ui
         std::vector<float> r_out, lo, rs, inject, mixed;
     };
     auto snapshot = [&]() {
-        try {
-    Snapshot s;
+        Snapshot s;
         s.r_out.resize((size_t) T * D);
         s.lo.resize((size_t) T * LR);
         s.rs.resize((size_t) T * HC);
         s.inject.resize((size_t) T * HC);
         s.mixed.resize((size_t) T * N);
-        check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                   .memcpy(s.r_out.data(), d_r_out,
-                                           s.r_out.size() * sizeof(float))
-                                   .wait()),
-              "multi read R_out");
-        check(DPCT_CHECK_ERROR(
-                  (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                      .memcpy(s.lo.data(), d_lo, s.lo.size() * sizeof(float))
-                      .wait()),
-              "multi read lo");
-        check(DPCT_CHECK_ERROR(
-                  (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                      .memcpy(s.rs.data(), d_rs, s.rs.size() * sizeof(float))
-                      .wait()),
-              "multi read rs");
-        check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                   .memcpy(s.inject.data(), d_inj_out,
-                                           s.inject.size() * sizeof(float))
-                                   .wait()),
-              "multi read inject");
-        check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                   .memcpy(s.mixed.data(), d_mixed,
-                                           s.mixed.size() * sizeof(float))
-                                   .wait()),
-              "multi read mixed");
+        memcpy_sync(s.r_out.data(), d_r_out, s.r_out.size() * sizeof(float));
+        memcpy_sync(s.lo.data(), d_lo, s.lo.size() * sizeof(float));
+        memcpy_sync(s.rs.data(), d_rs, s.rs.size() * sizeof(float));
+        memcpy_sync(s.inject.data(), d_inj_out, s.inject.size() * sizeof(float));
+        memcpy_sync(s.mixed.data(), d_mixed, s.mixed.size() * sizeof(float));
         return s;
-    }
-    catch (sycl::exception const &exc) {
-      std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-                << ", line:" << __LINE__ << std::endl;
-      std::exit(1);
-    }
     };
     // the split read (STRATA_GR_V3=1) sums in another order than the single-token kernel: equal within float
     // rounding, not to the bit, so it is compared with a relative tolerance; the default kernels bit for bit
@@ -505,20 +362,13 @@ int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const ui
                std::memcmp(a.mixed.data(), b.mixed.data(), a.mixed.size() * sizeof(float)) == 0;
     };
 
-    dpct::queue_ptr stream = &dpct::get_in_order_queue();
-    /*
-    DPCT1025: The SYCL queue is created ignoring the flag and priority
-    options.
-    */
-    check(DPCT_CHECK_ERROR(stream =
-                               dpct::get_current_device().create_queue(true)),
-          "multi stream");
+    strata::ze::Stream* stream = new strata::ze::Stream();
     // Max T forces the HIP kernel's full dynamic-LDS request: 8 * 1280 * sizeof(float) = 40 KiB.
     fused_gr_read_multi(args.data(), T, d_xn, stream);
-    check(DPCT_CHECK_ERROR(stream->wait()), "multi max-T sync");
+    stream->sync();
     const Snapshot multi = snapshot();
     for (int t = 0; t < T; ++t) fused_gr_read(args[t], stream);
-    check(DPCT_CHECK_ERROR(stream->wait()), "single reference sync");
+    stream->sync();
     const Snapshot single = snapshot();
     int bad = 0;
     if (!same(multi, single)) {
@@ -526,21 +376,12 @@ int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const ui
         ++bad;
     }
 
-    dpct::experimental::command_graph_ptr graph = nullptr;
-    dpct::experimental::command_graph_exec_ptr graph_exec = nullptr;
-    check(DPCT_CHECK_ERROR(dpct::experimental::begin_recording(stream)),
-          "multi graph begin");
+    strata::ze::Graph* graph = nullptr;
+    stream->begin_capture();
     fused_gr_read_multi(args.data(), T, d_xn, stream);
-    check(DPCT_CHECK_ERROR(dpct::experimental::end_recording(stream, &graph)),
-          "multi graph end");
-    check(DPCT_CHECK_ERROR(
-              graph_exec = new sycl::ext::oneapi::experimental::command_graph<
-                  sycl::ext::oneapi::experimental::graph_state::executable>(
-                  graph->finalize())),
-          "multi graph instantiate");
-    check(DPCT_CHECK_ERROR(stream->ext_oneapi_graph(*graph_exec)),
-          "multi graph initial replay");
-    check(DPCT_CHECK_ERROR(stream->wait()), "multi graph initial sync");
+    graph = stream->end_capture();
+    stream->launch(*graph);
+    stream->sync();
     const Snapshot captured = snapshot();
     if (!same(multi, captured)) {
         std::printf("  fused GR multi captured graph differs from direct max-T call\n");
@@ -551,43 +392,18 @@ int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const ui
     for (size_t i = 0; i < r.size(); ++i) r[i] = -0.7f * r[i] + 0.001f * (float) (i % 17);
     for (size_t i = 0; i < bo.size(); ++i) bo[i] = -0.4f * bo[i] + 0.02f;
     for (size_t i = 0; i < inj.size(); ++i) inj[i] += 0.3f;
-    /*
-    DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy API. While
-    the origin API might be synchronous, it depends on the type of operand
-    memory, so you may need to call wait() on event return by memcpy API to
-    ensure synchronization behavior.
-    */
-    check(DPCT_CHECK_ERROR(
-              stream->memcpy(d_r, r.data(), r.size() * sizeof(float))),
-          "multi replay R");
-    /*
-    DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy API. While
-    the origin API might be synchronous, it depends on the type of operand
-    memory, so you may need to call wait() on event return by memcpy API to
-    ensure synchronization behavior.
-    */
-    check(DPCT_CHECK_ERROR(
-              stream->memcpy(d_bo, bo.data(), bo.size() * sizeof(float))),
-          "multi replay bo");
-    /*
-    DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy API. While
-    the origin API might be synchronous, it depends on the type of operand
-    memory, so you may need to call wait() on event return by memcpy API to
-    ensure synchronization behavior.
-    */
-    check(DPCT_CHECK_ERROR(
-              stream->memcpy(d_inj, inj.data(), inj.size() * sizeof(float))),
-          "multi replay inj");
-    check(DPCT_CHECK_ERROR(stream->ext_oneapi_graph(*graph_exec)),
-          "multi graph changed replay");
-    check(DPCT_CHECK_ERROR(stream->wait()), "multi graph changed sync");
+    stream->memcpy(d_r, r.data(), r.size() * sizeof(float));
+    stream->memcpy(d_bo, bo.data(), bo.size() * sizeof(float));
+    stream->memcpy(d_inj, inj.data(), inj.size() * sizeof(float));
+    stream->launch(*graph);
+    stream->sync();
     const Snapshot replay = snapshot();
     if (std::memcmp(multi.mixed.data(), replay.mixed.data(), multi.mixed.size() * sizeof(float)) == 0) {
         std::printf("  fused GR graph replay ignored changed inputs\n");
         ++bad;
     }
     for (int t = 0; t < T; ++t) fused_gr_read(args[t], stream);
-    check(DPCT_CHECK_ERROR(stream->wait()), "changed single reference sync");
+    stream->sync();
     if (!same(replay, snapshot())) {
         std::printf("  fused GR changed graph replay differs from single-token calls\n");
         ++bad;
@@ -600,69 +416,35 @@ int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const ui
         uint8_t *d_q = nullptr, *d_ref = nullptr;
         unsigned* d_cnt = nullptr;
         const size_t qbytes = (size_t) T * (N / 32) * 36;
-        check(DPCT_CHECK_ERROR(d_q = (uint8_t *)sycl::malloc_device(
-                                   qbytes, dpct::get_in_order_queue())),
-              "qfuse q8");
-        check(DPCT_CHECK_ERROR(d_ref = (uint8_t *)sycl::malloc_device(
-                                   qbytes, dpct::get_in_order_queue())),
-              "qfuse ref");
-        check(DPCT_CHECK_ERROR(d_cnt = sycl::malloc_device<unsigned int>(
-                                   (N / 32), dpct::get_in_order_queue())),
-              "qfuse counters");
-        check(
-            DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                 .memset(d_cnt, 0, (N / 32) * sizeof(unsigned))
-                                 .wait()),
-            "qfuse counters zero");
+        d_q = (uint8_t*) strata::ze::malloc_device(qbytes);
+        d_ref = (uint8_t*) strata::ze::malloc_device(qbytes);
+        d_cnt = (unsigned int*) strata::ze::malloc_device((N / 32) * sizeof(unsigned int));
+        memset_sync(d_cnt, 0, (N / 32) * sizeof(unsigned));
         int qbad = 0;
         std::vector<uint8_t> hq(qbytes), hr(qbytes);
         for (int tt = 1; tt <= T && !qbad; ++tt) {
             std::vector<FusedGrArgs> qa(args.begin(), args.begin() + tt);
             for (int t = 0; t < tt; ++t) { qa[t].q8_mixed = d_q + (size_t) t * (N / 32) * 36; qa[t].q8_cnt = d_cnt; }
             for (int rep = 0; rep < 3 && !qbad; ++rep) {
-                check(DPCT_CHECK_ERROR(stream->memset(d_q, 0x5a, qbytes)),
-                      "qfuse poison");
+                stream->memset(d_q, 0x5a, qbytes);
                 bool wrote = false;
-                dpct::experimental::command_graph_ptr qg = nullptr;
-                dpct::experimental::command_graph_exec_ptr qx = nullptr;
+                strata::ze::Graph* qg = nullptr;
                 if (rep == 0) {
                     wrote = fused_gr_read_multi(qa.data(), tt, d_xn, stream);
                 } else {   // a captured read, replayed (twice: rep 1 and 2 use fresh captures, each replayed twice)
-                    check(DPCT_CHECK_ERROR(
-                              dpct::experimental::begin_recording(stream)),
-                          "qfuse begin");
+                    stream->begin_capture();
                     wrote = fused_gr_read_multi(qa.data(), tt, d_xn, stream);
-                    check(DPCT_CHECK_ERROR(
-                              dpct::experimental::end_recording(stream, &qg)),
-                          "qfuse end");
-                    check(
-                        DPCT_CHECK_ERROR(
-                            qx = new sycl::ext::oneapi::experimental::
-                                command_graph<sycl::ext::oneapi::experimental::
-                                                  graph_state::executable>(
-                                    qg->finalize())),
-                        "qfuse instantiate");
-                    check(DPCT_CHECK_ERROR(stream->ext_oneapi_graph(*qx)),
-                          "qfuse replay 1");
-                    check(DPCT_CHECK_ERROR(stream->memset(d_q, 0x5a, qbytes)),
-                          "qfuse poison 2");
-                    check(DPCT_CHECK_ERROR(stream->ext_oneapi_graph(*qx)),
-                          "qfuse replay 2");
+                    qg = stream->end_capture();
+                    stream->launch(*qg);
+                    stream->memset(d_q, 0x5a, qbytes);
+                    stream->launch(*qg);
                 }
                 strata::kernels::native_quantize_q8_1(d_mixed, d_ref, N, tt, stream);
-                check(DPCT_CHECK_ERROR(stream->wait()), "qfuse sync");
-                if (qx) { delete (qx); delete (qg); }
+                stream->sync();
+                if (qg) delete qg;
                 if (v3) { std::printf("  QFUSE: the v3 read writes no q8_1 (%s)\n", wrote ? "WRONG: it says it did" : "ok"); qbad += wrote; break; }
-                check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                           .memcpy(hq.data(), d_q,
-                                                   (size_t)tt * (N / 32) * 36)
-                                           .wait()),
-                      "qfuse read");
-                check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                           .memcpy(hr.data(), d_ref,
-                                                   (size_t)tt * (N / 32) * 36)
-                                           .wait()),
-                      "qfuse ref read");
+                memcpy_sync(hq.data(), d_q, (size_t)tt * (N / 32) * 36);
+                memcpy_sync(hr.data(), d_ref, (size_t)tt * (N / 32) * 36);
                 if (!wrote || std::memcmp(hq.data(), hr.data(), (size_t) tt * (N / 32) * 36) != 0) {
                     std::printf("  QFUSE: T=%d rep %d: %s\n", tt, rep, wrote ? "q8_1 bytes differ" : "not written");
                     ++qbad;
@@ -671,34 +453,23 @@ int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const ui
         }
         std::printf("  fused GR read + q8_1 (STRATA_QFUSE), T 1..8, direct and graph replays: %s\n", qbad ? "FAIL" : "pass");
         bad += qbad;
-        sycl::free(d_q, dpct::get_in_order_queue());
-            sycl::free(d_ref, dpct::get_in_order_queue());
-            sycl::free(d_cnt, dpct::get_in_order_queue());
+        strata::ze::free(d_q);
+        strata::ze::free(d_ref);
+        strata::ze::free(d_cnt);
     }
     std::printf("  fused GR multi max-T=8 LDS launch and changing graph replay %s\n",
                 bad == 0 ? "pass" : "FAIL");
-    check(DPCT_CHECK_ERROR(delete (graph_exec)), "multi graph exec destroy");
-    check(DPCT_CHECK_ERROR(delete (graph)), "multi graph destroy");
-    check(DPCT_CHECK_ERROR(dpct::get_current_device().destroy_queue(stream)),
-          "multi stream destroy");
-    check(DPCT_CHECK_ERROR(sycl::free(d_xn, dpct::get_in_order_queue())),
-          "free multi xn");
-    check(DPCT_CHECK_ERROR(sycl::free(d_mixed, dpct::get_in_order_queue())),
-          "free multi mixed");
-    check(DPCT_CHECK_ERROR(sycl::free(d_inj_out, dpct::get_in_order_queue())),
-          "free multi injection");
-    check(DPCT_CHECK_ERROR(sycl::free(d_rs, dpct::get_in_order_queue())),
-          "free multi rs");
-    check(DPCT_CHECK_ERROR(sycl::free(d_lo, dpct::get_in_order_queue())),
-          "free multi lo");
-    check(DPCT_CHECK_ERROR(sycl::free(d_inj, dpct::get_in_order_queue())),
-          "free multi inj");
-    check(DPCT_CHECK_ERROR(sycl::free(d_bo, dpct::get_in_order_queue())),
-          "free multi bo");
-    check(DPCT_CHECK_ERROR(sycl::free(d_r_out, dpct::get_in_order_queue())),
-          "free multi R_out");
-    check(DPCT_CHECK_ERROR(sycl::free(d_r, dpct::get_in_order_queue())),
-          "free multi R");
+    delete graph;
+    delete stream;
+    strata::ze::free(d_xn);
+    strata::ze::free(d_mixed);
+    strata::ze::free(d_inj_out);
+    strata::ze::free(d_rs);
+    strata::ze::free(d_lo);
+    strata::ze::free(d_inj);
+    strata::ze::free(d_bo);
+    strata::ze::free(d_r_out);
+    strata::ze::free(d_r);
     return bad;
 }
 
@@ -754,94 +525,29 @@ int main(int argc, char** argv) {
     // ---- device side
     float *d_R = nullptr, *d_norm = nullptr, *d_mixed = nullptr, *d_inject = nullptr;
     uint16_t *d_down = nullptr, *d_up = nullptr, *d_inj = nullptr;
-    check(DPCT_CHECK_ERROR(d_R = sycl::malloc_device<float>(
-                               R.size(), dpct::get_in_order_queue())),
-          "m R");
-    check(DPCT_CHECK_ERROR(d_norm = sycl::malloc_device<float>(
-                               w_norm.size(), dpct::get_in_order_queue())),
-          "m norm");
-    check(DPCT_CHECK_ERROR(d_down = sycl::malloc_device<uint16_t>(
-                               q_down.size(), dpct::get_in_order_queue())),
-          "m down");
-    check(DPCT_CHECK_ERROR(d_up = sycl::malloc_device<uint16_t>(
-                               q_up.size(), dpct::get_in_order_queue())),
-          "m up");
-    check(DPCT_CHECK_ERROR(d_inj = sycl::malloc_device<uint16_t>(
-                               q_inject.size(), dpct::get_in_order_queue())),
-          "m inj");
-    check(DPCT_CHECK_ERROR(d_mixed = sycl::malloc_device<float>(
-                               (size_t)n_embd, dpct::get_in_order_queue())),
-          "m mixed");
-    check(DPCT_CHECK_ERROR(d_inject = sycl::malloc_device<float>(
-                               (size_t)hc, dpct::get_in_order_queue())),
-          "m inject");
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming in
-    the original code the source host memory is pageable memory. If the memory
-    is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-              d_R, R.data(), R.size() * sizeof(float)).wait()),
-          "c R");
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming in
-    the original code the source host memory is pageable memory. If the memory
-    is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-              d_norm, w_norm.data(), w_norm.size() * sizeof(float)).wait()),
-          "c norm");
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming in
-    the original code the source host memory is pageable memory. If the memory
-    is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-              d_down, q_down.data(), q_down.size() * sizeof(uint16_t)).wait()),
-          "c down");
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming in
-    the original code the source host memory is pageable memory. If the memory
-    is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-              d_up, q_up.data(), q_up.size() * sizeof(uint16_t)).wait()),
-          "c up");
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming in
-    the original code the source host memory is pageable memory. If the memory
-    is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-              d_inj, q_inject.data(), q_inject.size() * sizeof(uint16_t)).wait()),
-          "c inj");
+    d_R = (float*) strata::ze::malloc_device(R.size() * sizeof(float));
+    d_norm = (float*) strata::ze::malloc_device(w_norm.size() * sizeof(float));
+    d_down = (uint16_t*) strata::ze::malloc_device(q_down.size() * sizeof(uint16_t));
+    d_up = (uint16_t*) strata::ze::malloc_device(q_up.size() * sizeof(uint16_t));
+    d_inj = (uint16_t*) strata::ze::malloc_device(q_inject.size() * sizeof(uint16_t));
+    d_mixed = (float*) strata::ze::malloc_device((size_t)n_embd * sizeof(float));
+    d_inject = (float*) strata::ze::malloc_device((size_t)hc * sizeof(float));
+    memcpy_sync(d_R, R.data(), R.size() * sizeof(float));
+    memcpy_sync(d_norm, w_norm.data(), w_norm.size() * sizeof(float));
+    memcpy_sync(d_down, q_down.data(), q_down.size() * sizeof(uint16_t));
+    memcpy_sync(d_up, q_up.data(), q_up.size() * sizeof(uint16_t));
+    memcpy_sync(d_inj, q_inject.data(), q_inject.size() * sizeof(uint16_t));
 
     const strata::kernels::GrShapes sh{n_embd, hc, hc_lr};
     // DEVICE memory: the workspace is written by the kernel.
     void* d_ws_raw = nullptr;
-    check(DPCT_CHECK_ERROR(d_ws_raw = (void *)sycl::malloc_device(
-                               strata::kernels::gr_workspace_bytes(sh),
-                               dpct::get_in_order_queue())),
-          "m ws");
+    d_ws_raw = strata::ze::malloc_device(strata::kernels::gr_workspace_bytes(sh));
     strata::kernels::GrWorkspace ws;
     strata::kernels::gr_workspace_init(sh, d_ws_raw, ws);
     strata::kernels::gr_read(d_R, d_norm, d_down, d_up, d_inj, eps, sh, ws, d_mixed, d_inject, nullptr);
     std::vector<float> got_mixed((size_t) n_embd), got_inject((size_t) hc);
-    check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                               .memcpy(got_mixed.data(), d_mixed,
-                                       got_mixed.size() * sizeof(float))
-                               .wait()),
-          "c mixed");
-    check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                               .memcpy(got_inject.data(), d_inject,
-                                       got_inject.size() * sizeof(float))
-                               .wait()),
-          "c inject");
+    memcpy_sync(got_mixed.data(), d_mixed, got_mixed.size() * sizeof(float));
+    memcpy_sync(got_inject.data(), d_inject, got_inject.size() * sizeof(float));
 
     int bad = 0;
 
@@ -906,16 +612,8 @@ int main(int argc, char** argv) {
         reference(R, w_norm, w_down, w_up, w_inject, eps, n_embd, hc, hc_lr, fp32, wm, wi);
         strata::kernels::gr_set_fp32_activations(true);
         strata::kernels::gr_read(d_R, d_norm, d_down, d_up, d_inj, eps, sh, ws, d_mixed, d_inject, nullptr);
-        check(DPCT_CHECK_ERROR(
-                  (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                      .memcpy(gm.data(), d_mixed, gm.size() * sizeof(float))
-                      .wait()),
-              "FP32 mixed");
-        check(DPCT_CHECK_ERROR(
-                  (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                      .memcpy(gi.data(), d_inject, gi.size() * sizeof(float))
-                      .wait()),
-              "FP32 inject");
+        memcpy_sync(gm.data(), d_mixed, gm.size() * sizeof(float));
+        memcpy_sync(gi.data(), d_inject, gi.size() * sizeof(float));
         strata::kernels::gr_set_fp32_activations(false);
         const double rm = rel_diff(wm, gm), ri = rel_diff(wi, gi);
         const bool ok = rm <= 1e-4 && ri <= 1e-4;
@@ -923,16 +621,8 @@ int main(int argc, char** argv) {
                     ok ? "pass" : "FAIL", rm, ri);
         if (!ok) ++bad;
         strata::kernels::gr_read(d_R, d_norm, d_down, d_up, d_inj, eps, sh, ws, d_mixed, d_inject, nullptr);
-        check(DPCT_CHECK_ERROR(
-                  (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                      .memcpy(gm.data(), d_mixed, gm.size() * sizeof(float))
-                      .wait()),
-              "restored mixed");
-        check(DPCT_CHECK_ERROR(
-                  (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                      .memcpy(gi.data(), d_inject, gi.size() * sizeof(float))
-                      .wait()),
-              "restored inject");
+        memcpy_sync(gm.data(), d_mixed, gm.size() * sizeof(float));
+        memcpy_sync(gi.data(), d_inject, gi.size() * sizeof(float));
         const bool restored = std::memcmp(gm.data(), got_mixed.data(), gm.size() * sizeof(float)) == 0 &&
                               std::memcmp(gi.data(), got_inject.data(), gi.size() * sizeof(float)) == 0;
         std::printf("  restoring default activation contract: %s\n", restored ? "byte-identical" : "FAIL");
@@ -945,12 +635,8 @@ int main(int argc, char** argv) {
     // output.  Feed transposed copies through the same code path and require the answer to differ.
     {
         uint16_t *d_down_bad = nullptr, *d_up_bad = nullptr;
-        check(DPCT_CHECK_ERROR(d_down_bad = sycl::malloc_device<uint16_t>(
-                                   q_down.size(), dpct::get_in_order_queue())),
-              "m down_bad");
-        check(DPCT_CHECK_ERROR(d_up_bad = sycl::malloc_device<uint16_t>(
-                                   q_up.size(), dpct::get_in_order_queue())),
-              "m up_bad");
+        d_down_bad = (uint16_t*) strata::ze::malloc_device(q_down.size() * sizeof(uint16_t));
+        d_up_bad = (uint16_t*) strata::ze::malloc_device(q_up.size() * sizeof(uint16_t));
         std::vector<uint16_t> tr_down(q_down.size()), tr_up(q_up.size());
         for (long long k = 0; k < hc_lr; ++k)
             for (long long i = 0; i < hc_dim; ++i)
@@ -958,59 +644,30 @@ int main(int argc, char** argv) {
         for (long long i = 0; i < hc_dim; ++i)
             for (long long k = 0; k < hc_lr; ++k)
                 tr_up[(size_t) (k * hc_dim + i)] = q_up[(size_t) (i * hc_lr + k)];
-        /*
-        DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-        assuming in the original code the source host memory is pageable memory.
-        If the memory is not pageable, call wait() on event return by memcpy API
-        to ensure synchronization behavior.
-        */
-        check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-                  d_down_bad, tr_down.data(), tr_down.size() * 2).wait()),
-              "cb d");
-        /*
-        DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-        assuming in the original code the source host memory is pageable memory.
-        If the memory is not pageable, call wait() on event return by memcpy API
-        to ensure synchronization behavior.
-        */
-        check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-                  d_up_bad, tr_up.data(), tr_up.size() * 2).wait()),
-              "cb u");
+        memcpy_sync(d_down_bad, tr_down.data(), tr_down.size() * 2);
+        memcpy_sync(d_up_bad, tr_up.data(), tr_up.size() * 2);
         std::vector<float> bad_mixed((size_t) n_embd);
         float* d_bad = nullptr;
-        check(
-            DPCT_CHECK_ERROR(d_bad = sycl::malloc_device<float>(
-                                 bad_mixed.size(), dpct::get_in_order_queue())),
-            "m bad");
+        d_bad = (float*) strata::ze::malloc_device(bad_mixed.size() * sizeof(float));
         strata::kernels::gr_read(d_R, d_norm, d_down_bad, d_up_bad, d_inj, eps, sh, ws, d_bad, d_inject,
                                  nullptr);
-        check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                   .memcpy(bad_mixed.data(), d_bad,
-                                           bad_mixed.size() * sizeof(float))
-                                   .wait()),
-              "cb b");
+        memcpy_sync(bad_mixed.data(), d_bad, bad_mixed.size() * sizeof(float));
         const double rel = rel_diff(want_mixed, bad_mixed);
         const bool visible = rel > 0.05;
         std::printf("  %-40s %s (%.1f%% apart)\n", "weight orientation is observable",
                     visible ? "yes" : "*** NO ***", rel * 100);
         if (!visible) ++bad;
-        sycl::free(d_down_bad, dpct::get_in_order_queue());
-            sycl::free(d_up_bad, dpct::get_in_order_queue());
-            sycl::free(d_bad, dpct::get_in_order_queue());
+        strata::ze::free(d_down_bad);
+        strata::ze::free(d_up_bad);
+        strata::ze::free(d_bad);
     }
 
     // ---- the FINAL mixer passes w_inject = nullptr, and then nothing may be written
     float sentinel = -12345.0f;
-    check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                               .memcpy(d_inject, &sentinel, sizeof(float))
-                               .wait()),
-          "c sentinel");
+    memcpy_sync(d_inject, &sentinel, sizeof(float));
     strata::kernels::gr_read(d_R, d_norm, d_down, d_up, nullptr, eps, sh, ws, d_mixed, d_inject, nullptr);
     float after = 0.0f;
-    check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                               .memcpy(&after, d_inject, sizeof(float))
-                               .wait()),
-          "c after");
+    memcpy_sync(&after, d_inject, sizeof(float));
     const bool untouched = (after == sentinel);
     std::printf("  %-40s %s\n", "null w_inject writes nothing", untouched ? "yes" : "*** NO ***");
     if (!untouched) ++bad;
@@ -1020,53 +677,17 @@ int main(int argc, char** argv) {
     for (auto& x : block_out) x = gauss(rng);
     std::vector<float> zero_inj((size_t) hc, 0.0f);
     float *d_Rw = nullptr, *d_bo = nullptr, *d_zi = nullptr, *d_outw = nullptr;
-    check(DPCT_CHECK_ERROR(d_Rw = sycl::malloc_device<float>(
-                               R.size(), dpct::get_in_order_queue())),
-          "m Rw");
-    check(DPCT_CHECK_ERROR(d_bo = sycl::malloc_device<float>(
-                               block_out.size(), dpct::get_in_order_queue())),
-          "m bo");
-    check(DPCT_CHECK_ERROR(d_zi = sycl::malloc_device<float>(
-                               zero_inj.size(), dpct::get_in_order_queue())),
-          "m zi");
-    check(DPCT_CHECK_ERROR(d_outw = sycl::malloc_device<float>(
-                               R.size(), dpct::get_in_order_queue())),
-          "m outw");
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming in
-    the original code the source host memory is pageable memory. If the memory
-    is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-              d_Rw, R.data(), R.size() * sizeof(float)).wait()),
-          "c Rw");
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming in
-    the original code the source host memory is pageable memory. If the memory
-    is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-              d_bo, block_out.data(), block_out.size() * sizeof(float)).wait()),
-          "c bo");
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming in
-    the original code the source host memory is pageable memory. If the memory
-    is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-              d_zi, zero_inj.data(), zero_inj.size() * sizeof(float)).wait()),
-          "c zi");
+    d_Rw = (float*) strata::ze::malloc_device(R.size() * sizeof(float));
+    d_bo = (float*) strata::ze::malloc_device(block_out.size() * sizeof(float));
+    d_zi = (float*) strata::ze::malloc_device(zero_inj.size() * sizeof(float));
+    d_outw = (float*) strata::ze::malloc_device(R.size() * sizeof(float));
+    memcpy_sync(d_Rw, R.data(), R.size() * sizeof(float));
+    memcpy_sync(d_bo, block_out.data(), block_out.size() * sizeof(float));
+    memcpy_sync(d_zi, zero_inj.data(), zero_inj.size() * sizeof(float));
 
     strata::kernels::gr_write(d_Rw, d_bo, d_zi, sh, d_outw, nullptr);
     std::vector<float> got_write((size_t) hc_dim);
-    check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                               .memcpy(got_write.data(), d_outw,
-                                       got_write.size() * sizeof(float))
-                               .wait()),
-          "c outw");
+    memcpy_sync(got_write.data(), d_outw, got_write.size() * sizeof(float));
 
     double worst_plain = 0;
     for (long long c = 0; c < hc; ++c)
@@ -1107,21 +728,9 @@ int main(int argc, char** argv) {
     // a non-zero injection: every stream receives the SAME block output, differing only by weight
     std::vector<float> inj((size_t) hc);
     for (auto& x : inj) x = gauss(rng) * 3.0f;
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming in
-    the original code the source host memory is pageable memory. If the memory
-    is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-              d_zi, inj.data(), inj.size() * sizeof(float)).wait()),
-          "c inj2");
+    memcpy_sync(d_zi, inj.data(), inj.size() * sizeof(float));
     strata::kernels::gr_write(d_Rw, d_bo, d_zi, sh, d_outw, nullptr);
-    check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                               .memcpy(got_write.data(), d_outw,
-                                       got_write.size() * sizeof(float))
-                               .wait()),
-          "c outw2");
+    memcpy_sync(got_write.data(), d_outw, got_write.size() * sizeof(float));
     double worst_stream = 0;
     for (long long c = 0; c < hc; ++c) {
         const double w = 2.0 / (1.0 + std::exp(-(double) inj[(size_t) c] / (double) hc));
@@ -1165,95 +774,30 @@ int main(int argc, char** argv) {
 
         float *dR = nullptr, *dN = nullptr, *dM = nullptr, *dI = nullptr;
         uint16_t *dD = nullptr, *dU = nullptr, *dJ = nullptr;
-        check(DPCT_CHECK_ERROR(dR = (float *)sycl::malloc_device(
-                                   rR.size() * 4, dpct::get_in_order_queue())),
-              "rR");
-        check(
-            DPCT_CHECK_ERROR(dN = (float *)sycl::malloc_device(
-                                 rnorm.size() * 4, dpct::get_in_order_queue())),
-            "rN");
-        check(DPCT_CHECK_ERROR(dD = (uint16_t *)sycl::malloc_device(
-                                   qd.size() * 2, dpct::get_in_order_queue())),
-              "rD");
-        check(DPCT_CHECK_ERROR(dU = (uint16_t *)sycl::malloc_device(
-                                   qu.size() * 2, dpct::get_in_order_queue())),
-              "rU");
-        check(DPCT_CHECK_ERROR(dJ = (uint16_t *)sycl::malloc_device(
-                                   qi.size() * 2, dpct::get_in_order_queue())),
-              "rJ");
-        check(DPCT_CHECK_ERROR(dM = (float *)sycl::malloc_device(
-                                   (size_t)rn * 4, dpct::get_in_order_queue())),
-              "rM");
-        check(
-            DPCT_CHECK_ERROR(dI = (float *)sycl::malloc_device(
-                                 (size_t)rhc * 4, dpct::get_in_order_queue())),
-            "rI");
-        /*
-        DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-        assuming in the original code the source host memory is pageable memory.
-        If the memory is not pageable, call wait() on event return by memcpy API
-        to ensure synchronization behavior.
-        */
-        check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-                  dR, rR.data(), rR.size() * 4).wait()),
-              "crR");
-        /*
-        DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-        assuming in the original code the source host memory is pageable memory.
-        If the memory is not pageable, call wait() on event return by memcpy API
-        to ensure synchronization behavior.
-        */
-        check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-                  dN, rnorm.data(), rnorm.size() * 4).wait()),
-              "crN");
-        /*
-        DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-        assuming in the original code the source host memory is pageable memory.
-        If the memory is not pageable, call wait() on event return by memcpy API
-        to ensure synchronization behavior.
-        */
-        check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-                  dD, qd.data(), qd.size() * 2).wait()),
-              "crD");
-        /*
-        DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-        assuming in the original code the source host memory is pageable memory.
-        If the memory is not pageable, call wait() on event return by memcpy API
-        to ensure synchronization behavior.
-        */
-        check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-                  dU, qu.data(), qu.size() * 2).wait()),
-              "crU");
-        /*
-        DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-        assuming in the original code the source host memory is pageable memory.
-        If the memory is not pageable, call wait() on event return by memcpy API
-        to ensure synchronization behavior.
-        */
-        check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-                  dJ, qi.data(), qi.size() * 2).wait()),
-              "crJ");
+        dR = (float*) strata::ze::malloc_device(rR.size() * 4);
+        dN = (float*) strata::ze::malloc_device(rnorm.size() * 4);
+        dD = (uint16_t*) strata::ze::malloc_device(qd.size() * 2);
+        dU = (uint16_t*) strata::ze::malloc_device(qu.size() * 2);
+        dJ = (uint16_t*) strata::ze::malloc_device(qi.size() * 2);
+        dM = (float*) strata::ze::malloc_device((size_t)rn * 4);
+        dI = (float*) strata::ze::malloc_device((size_t)rhc * 4);
+        memcpy_sync(dR, rR.data(), rR.size() * 4);
+        memcpy_sync(dN, rnorm.data(), rnorm.size() * 4);
+        memcpy_sync(dD, qd.data(), qd.size() * 2);
+        memcpy_sync(dU, qu.data(), qu.size() * 2);
+        memcpy_sync(dJ, qi.data(), qi.size() * 2);
 
         const strata::kernels::GrShapes rsh{rn, rhc, rlr};
         void* rws_raw = nullptr;
-        check(DPCT_CHECK_ERROR(rws_raw = (void *)sycl::malloc_device(
-                                   strata::kernels::gr_workspace_bytes(rsh),
-                                   dpct::get_in_order_queue())),
-              "m rws");
+        rws_raw = strata::ze::malloc_device(strata::kernels::gr_workspace_bytes(rsh));
         strata::kernels::GrWorkspace rws;
         strata::kernels::gr_workspace_init(rsh, rws_raw, rws);
         for (int mode = 0; mode < 3; ++mode) {
             select_activation_mode(mode);
             strata::kernels::gr_read(dR, dN, dD, dU, dJ, eps, rsh, rws, dM, dI, nullptr);
             std::vector<float> gm((size_t) rn), gi((size_t) rhc);
-            check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                       .memcpy(gm.data(), dM, gm.size() * 4)
-                                       .wait()),
-                  "cgm");
-            check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                       .memcpy(gi.data(), dI, gi.size() * 4)
-                                       .wait()),
-                  "cgi");
+            memcpy_sync(gm.data(), dM, gm.size() * 4);
+            memcpy_sync(gi.data(), dI, gi.size() * 4);
 
             Opts precision;
             precision.round_activation = mode == 0;
@@ -1267,14 +811,14 @@ int main(int argc, char** argv) {
         }
         bad += fused_multi_lds_parity(dN, dD, dU, dJ, eps);
         select_activation_mode(0);
-        sycl::free(rws_raw, dpct::get_in_order_queue());
-        sycl::free(dR, dpct::get_in_order_queue());
-            sycl::free(dN, dpct::get_in_order_queue());
-            sycl::free(dD, dpct::get_in_order_queue());
-            sycl::free(dU, dpct::get_in_order_queue());
-            sycl::free(dJ, dpct::get_in_order_queue());
-            sycl::free(dM, dpct::get_in_order_queue());
-            sycl::free(dI, dpct::get_in_order_queue());
+        strata::ze::free(rws_raw);
+        strata::ze::free(dR);
+        strata::ze::free(dN);
+        strata::ze::free(dD);
+        strata::ze::free(dU);
+        strata::ze::free(dJ);
+        strata::ze::free(dM);
+        strata::ze::free(dI);
     }
 
     bad += scalar_activation_contract();

@@ -4214,11 +4214,9 @@ void grouped_kernel(int ty, bool gu, const sycl::half* X, float* Y, Grp gp, int 
             jm::joint_matrix<sycl::sub_group, sycl::half, jm::use::a, 8, 16, jm::layout::row_major> am[C::MT];
             jm::joint_matrix<sycl::sub_group, sycl::half, jm::use::b, 16, TN, jm::layout::col_major> bm[C::NT];
             for (int i = 0; i < C::MT; ++i)
-                jm::joint_matrix_load(sg, am[i], sa +
-                                                     (sgm * C::MT * 8 + i * 8) * LDA + kk, LDA);
+                jm::joint_matrix_load(sg, am[i], sa + (sgm * C::MT * 8 + i * 8) * LDA + kk, LDA);
             for (int j = 0; j < C::NT; ++j)
-                jm::joint_matrix_load(sg, bm[j], sb +
-                                                     (sgn * C::NT * TN + j * TN) * LDB + kk, LDB);
+                jm::joint_matrix_load(sg, bm[j], sb + (sgn * C::NT * TN + j * TN) * LDB + kk, LDB);
             for (int i = 0; i < C::MT; ++i)
                 for (int j = 0; j < C::NT; ++j) jm::joint_matrix_mad(sg, acc[i][j], am[i], bm[j], acc[i][j]);
         }

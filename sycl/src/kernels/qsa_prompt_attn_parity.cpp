@@ -9,9 +9,8 @@
 // then times both over a prompt chunk (the old one in batches of 32, as prefill.cpp calls it).
 // HIP builds (S6): the same checks for the RDNA4 matrix-core kernel (STRATA_HIP_WMMA), skipped (77) off gfx12.
 // Usage: qsa_prompt_attn_parity [context=32768] [queries=2048] [reps=5]
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
+#include "strata/ze/ze.hpp"
+#include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/qsa_prompt_attn.hpp"
@@ -28,56 +27,23 @@
 namespace k = strata::kernels;
 
 namespace {
-void ck(dpct::err0 e, const char *w) {
-    /*
-    DPCT1009: SYCL reports errors using exceptions and does not use error
-    codes. Please replace the "get_error_string_dummy(...)" with a real
-    error-handling function.
-    */
-}
-template <typename T> T* up(const std::vector<T>& h) {
-    T* d = nullptr;
-    ck(DPCT_CHECK_ERROR(
-           d = (T *)sycl::malloc_device(h.size() * sizeof(T) + 64,
-                                        dpct::get_in_order_queue())),
-       "malloc");
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming
-    in the original code the source host memory is pageable memory. If the
-    memory is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-           d, h.data(), h.size() * sizeof(T)).wait()),
-       "upload");
-    return d;
-}
-float h2f(uint16_t b) {
-    sycl::half h; *reinterpret_cast<uint16_t *>(&h) = b;
-    return sycl::vec<sycl::half, 1>(h)
-        .convert<float, sycl::rounding_mode::automatic>()[0];
-}
-uint16_t f2h(float f) {
-    sycl::half h =
-        sycl::vec<float, 1>(f)
-            .convert<sycl::half, sycl::rounding_mode::automatic>()[0];
-    return *reinterpret_cast<uint16_t *>(&h);
+/// cudaMemcpy: after the device's queued work, complete on return.
+void memcpy_sync(void* dst, const void* src, size_t bytes) {
+    strata::ze::device_sync();
+    strata::ze::default_stream().memcpy(dst, src, bytes);
+    strata::ze::default_stream().sync();
 }
 
+template <typename T> T* up(const std::vector<T>& h) {
+    T* d = nullptr;
+    d = (T*) strata::ze::malloc_device(h.size() * sizeof(T) + 64);
+    memcpy_sync(d, h.data(), h.size() * sizeof(T));
+    return d;
+}
+float h2f(uint16_t b) { return k::f32_from_f16(b); }
+uint16_t f2h(float f) { return k::f16_from_f32(f); }
+
 int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2 q4_0
-#if !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
-    if (fmt == 2) {   // mode 4 (Q4_0 KV) runs on sm_80 and newer only: below that the dispatcher keeps the old kernel
-        int dev = 0, major = 0;
-        ck(DPCT_CHECK_ERROR(dev = dpct::get_current_device_id()), "device");
-        ck(DPCT_CHECK_ERROR(major = dpct::get_device(dev).get_major_version()),
-           "cc");
-        if (major < 8) {
-            std::printf("SKIP q4_0 ctx %lld: the tensor-core kernel takes Q4_0 KV on sm_80+ only (this device: sm_%d)\n",
-                        (long long) ctx, major);
-            return 0;
-        }
-    }
-#endif
     const k::QsaShapes s = k::qsa_real_shapes();
     const int64_t HD = s.head_dim, NKV = s.n_head_kv, NH = s.n_head, PS = s.page_size;
     const int64_t pages = (ctx + PS - 1) / PS, rows = pages * NKV * PS;
@@ -226,17 +192,9 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
     const float* d_q = up(q);
     float *d_old = nullptr, *d_new = nullptr, *scratch = nullptr;
     const int64_t batch = 32;
-    ck(DPCT_CHECK_ERROR(d_old = (float *)sycl::malloc_device(
-                            nq * NH * HD * 4, dpct::get_in_order_queue())),
-       "malloc");
-    ck(DPCT_CHECK_ERROR(d_new = (float *)sycl::malloc_device(
-                            nq * NH * HD * 4, dpct::get_in_order_queue())),
-       "malloc");
-    ck(DPCT_CHECK_ERROR(
-           scratch = (float *)sycl::malloc_device(
-               batch * k::qsa_decode_attn_scratch_floats(cap, s) * 4,
-               dpct::get_in_order_queue())),
-       "malloc");
+    d_old = (float*) strata::ze::malloc_device(nq * NH * HD * 4);
+    d_new = (float*) strata::ze::malloc_device(nq * NH * HD * 4);
+    scratch = (float*) strata::ze::malloc_device(batch * k::qsa_decode_attn_scratch_floats(cap, s) * 4);
     auto old_run = [&]() {
         for (int64_t t0 = 0; t0 < nq; t0 += batch)
             k::qsa_decode_attn_batch(d_q + t0 * NH * HD, pl, d_ids + t0 * cap, d_steps + t0 * k::kStepCount, cap, s,
@@ -250,17 +208,10 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
     };
     old_run();
     new_run();
-    ck(DPCT_CHECK_ERROR(dpct::get_current_device().queues_wait_and_throw()),
-       "run");
+    strata::ze::device_sync();
     std::vector<float> o((size_t) (nq * NH * HD)), nw(o.size());
-    ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                            .memcpy(o.data(), d_old, o.size() * 4)
-                            .wait()),
-       "down");
-    ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                            .memcpy(nw.data(), d_new, nw.size() * 4)
-                            .wait()),
-       "down");
+    memcpy_sync(o.data(), d_old, o.size() * 4);
+    memcpy_sync(nw.data(), d_new, nw.size() * 4);
     {   // a hash of the new kernel's output bits (bitwise A/B of two builds / switches)
         uint64_t hh = 1469598103934665603ull;
         for (float x : nw) { uint32_t u; std::memcpy(&u, &x, 4); hh = (hh ^ u) * 1099511628211ull; }
@@ -311,53 +262,46 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
         scale = std::max(scale, (double) std::fabs(o[i]));
     }
     // 3. speed
-    dpct::event_ptr e0, e1;
-    e0 = new sycl::event();
-    e1 = new sycl::event();
+    strata::ze::Event* e0 = new strata::ze::Event(true);
+    strata::ze::Event* e1 = new strata::ze::Event(true);
     float ms_old = 0, ms_new = 0;
-    dpct::sync_barrier(e0);
+    strata::ze::default_stream().record(*e0);
     for (int r = 0; r < reps; ++r) old_run();
-    dpct::sync_barrier(e1);
-    ck(DPCT_CHECK_ERROR(e1->wait_and_throw()), "time");
-    ms_old =
-        (e1->get_profiling_info<sycl::info::event_profiling::command_end>() -
-         e0->get_profiling_info<sycl::info::event_profiling::command_start>()) /
-        1000000.0f;
-    dpct::sync_barrier(e0);
+    strata::ze::default_stream().record(*e1);
+    e1->sync();
+    ms_old = e1->elapsed_ms_since(*e0);
+    strata::ze::default_stream().record(*e0);
     for (int r = 0; r < reps; ++r) new_run();
-    dpct::sync_barrier(e1);
-    ck(DPCT_CHECK_ERROR(e1->wait_and_throw()), "time");
-    ms_new =
-        (e1->get_profiling_info<sycl::info::event_profiling::command_end>() -
-         e0->get_profiling_info<sycl::info::event_profiling::command_start>()) /
-        1000000.0f;
+    strata::ze::default_stream().record(*e1);
+    e1->sync();
+    ms_new = e1->elapsed_ms_since(*e0);
     const bool ok1 = err_new <= std::max(4.0 * err_old, 1e-6 * ref_scale);
     const bool ok2 = diff <= 1e-4 * scale;
     std::printf("%s %s ctx %lld, %lld queries: vs FP64 old %.3g new %.3g (output scale %.3g); new vs old %.3g (%.2g of "
                 "scale); %.3f -> %.3f ms per chunk (%.2fx)\n",
                 ok1 && ok2 ? "PASS" : "FAIL", fmt == 2 ? "q4_0" : fmt == 1 ? "int8" : "fp16", (long long) ctx, (long long) nq, err_old,
                 err_new, ref_scale, diff, diff / scale, ms_old / reps, ms_new / reps, ms_old / ms_new);
-    sycl::free((void *)d_ids, dpct::get_in_order_queue());
-        sycl::free((void *)d_steps, dpct::get_in_order_queue());
-        sycl::free((void *)d_q, dpct::get_in_order_queue());
-        sycl::free((void *)d_old, dpct::get_in_order_queue());
-        sycl::free((void *)d_new, dpct::get_in_order_queue());
-    sycl::free((void *)scratch, dpct::get_in_order_queue());
-    sycl::free((void *)pl.k_q, dpct::get_in_order_queue());
-        sycl::free((void *)pl.v_q, dpct::get_in_order_queue());
-        sycl::free((void *)pl.k_scale, dpct::get_in_order_queue());
-        sycl::free((void *)pl.v_scale, dpct::get_in_order_queue());
-    sycl::free((void *)pl.k_pool, dpct::get_in_order_queue());
-        sycl::free((void *)pl.v_pool, dpct::get_in_order_queue());
-        sycl::free((void *)pl.page_table, dpct::get_in_order_queue());
-    sycl::free((void *)pl.k_q4, dpct::get_in_order_queue());
-        sycl::free((void *)pl.v_q4, dpct::get_in_order_queue());
+    strata::ze::free((void*) d_ids);
+    strata::ze::free((void*) d_steps);
+    strata::ze::free((void*) d_q);
+    strata::ze::free((void*) d_old);
+    strata::ze::free((void*) d_new);
+    strata::ze::free((void*) scratch);
+    strata::ze::free((void*) pl.k_q);
+    strata::ze::free((void*) pl.v_q);
+    strata::ze::free((void*) pl.k_scale);
+    strata::ze::free((void*) pl.v_scale);
+    strata::ze::free((void*) pl.k_pool);
+    strata::ze::free((void*) pl.v_pool);
+    strata::ze::free((void*) pl.page_table);
+    strata::ze::free((void*) pl.k_q4);
+    strata::ze::free((void*) pl.v_q4);
     return ok1 && ok2 ? 0 : 1;
 }
 }  // namespace
 
 int main(int argc, char** argv) {
-    setenv("STRATA_PROMPT_ATTN_XMX", "1", 0);   // SYCL port: the batched kernel under test is the XMX one (opt-in in the engine)
+    setenv("STRATA_PROMPT_ATTN_XMX", "1", 0);   // the batched kernel under test is the XMX one (opt-in in the engine)
 #if defined(__HIP_PLATFORM_AMD__)
     // S6: on AMD the kernel under test is the RDNA4 matrix-core one (opt-in in the engine); other cards skip
     {

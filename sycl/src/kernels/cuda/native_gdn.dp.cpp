@@ -80,7 +80,8 @@ step(float *__restrict__ state, const float *__restrict__ q,
         state[(size_t(i) * h_v + head) * S + col] = s_shard[r];
     }
 }
+}
 
 #include "native_gdn.kern.inc"
-}
+
 } // namespace strata::kernels

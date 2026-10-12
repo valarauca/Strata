@@ -14,9 +14,7 @@
 //   2. THE SCALAR GATE.  `ffn_gate_inp_shexp` is (n_embd,) and yields ONE value per token; the two rival
 //      readings are a per-dimension elementwise gate and a per-expert gate.  The elementwise reading is
 //      checked the same way - it is computed and required to differ.
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
+#include "strata/ze/ze.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/quantize_act.hpp"
@@ -33,7 +31,11 @@
 
 namespace {
 
-void check(dpct::err0 e, const char *what) {
+/// cudaMemcpy: after the device's queued work, complete on return.
+void memcpy_sync(void* dst, const void* src, size_t bytes) {
+    strata::ze::device_sync();
+    strata::ze::default_stream().memcpy(dst, src, bytes);
+    strata::ze::default_stream().sync();
 }
 
 // THE CONVERSIONS COME FROM `f16_bits.hpp`, and this test used to carry its own copies.  The private
@@ -193,130 +195,27 @@ int main(int argc, char** argv) {
     uint16_t *d_xb = nullptr, *d_ginpb = nullptr;
     uint8_t *d_gc = nullptr, *d_uc = nullptr, *d_dc = nullptr;
     float *d_gs = nullptr, *d_us = nullptr, *d_ds = nullptr, *d_ginp = nullptr, *d_out = nullptr;
-    check(DPCT_CHECK_ERROR(d_x = sycl::malloc_device<uint16_t>(
-                               hx.size(), dpct::get_in_order_queue())),
-          "m x");
-    check(DPCT_CHECK_ERROR(d_gc = (uint8_t *)sycl::malloc_device(
-                               gc.size(), dpct::get_in_order_queue())),
-          "m gc");
-    check(DPCT_CHECK_ERROR(d_uc = (uint8_t *)sycl::malloc_device(
-                               uc.size(), dpct::get_in_order_queue())),
-          "m uc");
-    check(DPCT_CHECK_ERROR(d_dc = (uint8_t *)sycl::malloc_device(
-                               dc.size(), dpct::get_in_order_queue())),
-          "m dc");
-    check(DPCT_CHECK_ERROR(d_gs = sycl::malloc_device<float>(
-                               gs.size(), dpct::get_in_order_queue())),
-          "m gs");
-    check(DPCT_CHECK_ERROR(d_us = sycl::malloc_device<float>(
-                               us.size(), dpct::get_in_order_queue())),
-          "m us");
-    check(DPCT_CHECK_ERROR(d_ds = sycl::malloc_device<float>(
-                               ds.size(), dpct::get_in_order_queue())),
-          "m ds");
-    check(DPCT_CHECK_ERROR(d_ginp = sycl::malloc_device<float>(
-                               ginp.size(), dpct::get_in_order_queue())),
-          "m ginp");
-    check(DPCT_CHECK_ERROR(d_xb = sycl::malloc_device<uint16_t>(
-                               hx_bf16.size(), dpct::get_in_order_queue())),
-          "m xb");
-    check(DPCT_CHECK_ERROR(d_ginpb = sycl::malloc_device<uint16_t>(
-                               hginp_bf16.size(), dpct::get_in_order_queue())),
-          "m ginpb");
-    check(DPCT_CHECK_ERROR(d_out = sycl::malloc_device<float>(
-                               (size_t)n_embd, dpct::get_in_order_queue())),
-          "m out");
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming in
-    the original code the source host memory is pageable memory. If the memory
-    is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-              d_x, hx.data(), hx.size() * sizeof(uint16_t)).wait()),
-          "c x");
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming in
-    the original code the source host memory is pageable memory. If the memory
-    is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    check(DPCT_CHECK_ERROR(
-              (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(d_gc, gc.data(), gc.size()).wait()),
-          "c gc");
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming in
-    the original code the source host memory is pageable memory. If the memory
-    is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    check(DPCT_CHECK_ERROR(
-              (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(d_uc, uc.data(), uc.size()).wait()),
-          "c uc");
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming in
-    the original code the source host memory is pageable memory. If the memory
-    is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    check(DPCT_CHECK_ERROR(
-              (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(d_dc, dc.data(), dc.size()).wait()),
-          "c dc");
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming in
-    the original code the source host memory is pageable memory. If the memory
-    is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-              d_gs, gs.data(), gs.size() * sizeof(float)).wait()),
-          "c gs");
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming in
-    the original code the source host memory is pageable memory. If the memory
-    is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-              d_us, us.data(), us.size() * sizeof(float)).wait()),
-          "c us");
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming in
-    the original code the source host memory is pageable memory. If the memory
-    is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-              d_ds, ds.data(), ds.size() * sizeof(float)).wait()),
-          "c ds");
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming in
-    the original code the source host memory is pageable memory. If the memory
-    is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-              d_ginp, ginp.data(), ginp.size() * sizeof(float)).wait()),
-          "c ginp");
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming in
-    the original code the source host memory is pageable memory. If the memory
-    is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-              d_xb, hx_bf16.data(), hx_bf16.size() * sizeof(uint16_t)).wait()),
-          "c xb");
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming in
-    the original code the source host memory is pageable memory. If the memory
-    is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    check(
-        DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-            d_ginpb, hginp_bf16.data(), hginp_bf16.size() * sizeof(uint16_t)).wait()),
-        "c ginpb");
+    d_x = (uint16_t*) strata::ze::malloc_device(hx.size() * sizeof(uint16_t));
+    d_gc = (uint8_t*) strata::ze::malloc_device(gc.size());
+    d_uc = (uint8_t*) strata::ze::malloc_device(uc.size());
+    d_dc = (uint8_t*) strata::ze::malloc_device(dc.size());
+    d_gs = (float*) strata::ze::malloc_device(gs.size() * sizeof(float));
+    d_us = (float*) strata::ze::malloc_device(us.size() * sizeof(float));
+    d_ds = (float*) strata::ze::malloc_device(ds.size() * sizeof(float));
+    d_ginp = (float*) strata::ze::malloc_device(ginp.size() * sizeof(float));
+    d_xb = (uint16_t*) strata::ze::malloc_device(hx_bf16.size() * sizeof(uint16_t));
+    d_ginpb = (uint16_t*) strata::ze::malloc_device(hginp_bf16.size() * sizeof(uint16_t));
+    d_out = (float*) strata::ze::malloc_device((size_t)n_embd * sizeof(float));
+    memcpy_sync(d_x, hx.data(), hx.size() * sizeof(uint16_t));
+    memcpy_sync(d_gc, gc.data(), gc.size());
+    memcpy_sync(d_uc, uc.data(), uc.size());
+    memcpy_sync(d_dc, dc.data(), dc.size());
+    memcpy_sync(d_gs, gs.data(), gs.size() * sizeof(float));
+    memcpy_sync(d_us, us.data(), us.size() * sizeof(float));
+    memcpy_sync(d_ds, ds.data(), ds.size() * sizeof(float));
+    memcpy_sync(d_ginp, ginp.data(), ginp.size() * sizeof(float));
+    memcpy_sync(d_xb, hx_bf16.data(), hx_bf16.size() * sizeof(uint16_t));
+    memcpy_sync(d_ginpb, hginp_bf16.data(), hginp_bf16.size() * sizeof(uint16_t));
 
     const strata::kernels::SForm f{2, -1, 64, strata::kernels::Codebook::Affine, false, /*act_kind=*/0};
     // **THE ACTIVATION IS Q8_0, NOT FP16, AND THE FIXTURE HAS TO MATCH THE CONTRACT.**  The kernel used to take
@@ -327,47 +226,23 @@ int main(int argc, char** argv) {
     {
         float* d_xf = nullptr;
         uint8_t* d_x0 = nullptr;
-        check(DPCT_CHECK_ERROR(
-                  d_xf = (float *)sycl::malloc_device(
-                      (size_t)n_embd * 4, dpct::get_in_order_queue())),
-              "xf");
-        check(DPCT_CHECK_ERROR(d_x0 = (uint8_t *)sycl::malloc_device(
-                                   hx0.size(), dpct::get_in_order_queue())),
-              "x0");
-        /*
-        DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-        assuming in the original code the source host memory is pageable memory.
-        If the memory is not pageable, call wait() on event return by memcpy API
-        to ensure synchronization behavior.
-        */
-        check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-                  d_xf, fx.data(), (size_t)n_embd * 4).wait()),
-              "cxf");
+        d_xf = (float*) strata::ze::malloc_device((size_t)n_embd * 4);
+        d_x0 = (uint8_t*) strata::ze::malloc_device(hx0.size());
+        memcpy_sync(d_xf, fx.data(), (size_t)n_embd * 4);
         strata::kernels::quantize_q8_0(d_xf, d_x0, n_embd, nullptr);
-        check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                   .memcpy(hx0.data(), d_x0, hx0.size())
-                                   .wait()),
-              "cx0");
+        memcpy_sync(hx0.data(), d_x0, hx0.size());
         d_x_used = d_x0;
-        sycl::free(d_xf, dpct::get_in_order_queue());
+        strata::ze::free(d_xf);
     }
     // THE SCRATCH IS THE CALLER'S NOW.  It used to be four `cudaMalloc`s inside the kernel - illegal during
     // stream capture AND a token-path allocation that P2.T10 forbids.  The fixture owns it here, exactly as the
     // layer does, so the test exercises the real contract instead of a private one.
     float* d_scratch = nullptr;
-    check(
-        DPCT_CHECK_ERROR(d_scratch = (float *)sycl::malloc_device(
-                             strata::kernels::shared_expert_scratch_bytes(n_ff),
-                             dpct::get_in_order_queue())),
-        "m scratch");
+    d_scratch = (float*) strata::ze::malloc_device(strata::kernels::shared_expert_scratch_bytes(n_ff));
     strata::kernels::shared_expert(d_x_used, nullptr, d_xb, f, d_gc, d_gs, nullptr, f, d_uc, d_us, nullptr, f,
                                    d_dc, d_ds, nullptr, d_ginpb, d_scratch, d_out, n_embd, n_ff, tpr, nullptr);
     std::vector<float> got((size_t) n_embd);
-    check(DPCT_CHECK_ERROR(
-              (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                  .memcpy(got.data(), d_out, got.size() * sizeof(float))
-                  .wait()),
-          "c out");
+    memcpy_sync(got.data(), d_out, got.size() * sizeof(float));
 
     int bad = 0;
     const std::vector<float> want = reference(false, false);
@@ -463,82 +338,28 @@ int main(int argc, char** argv) {
         std::vector<uint16_t> witness_bf16((size_t) n_embd, 0);
         witness_bf16[0] = bf16_from_f32(witness[0]);
         float* d_witness = nullptr;
-        check(DPCT_CHECK_ERROR(d_witness = sycl::malloc_device<float>(
-                                   witness.size(), dpct::get_in_order_queue())),
-              "native shared x");
-        /*
-        DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-        assuming in the original code the source host memory is pageable memory.
-        If the memory is not pageable, call wait() on event return by memcpy API
-        to ensure synchronization behavior.
-        */
-        check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-                  d_witness, witness.data(), witness.size() * sizeof(float)).wait()),
-              "native shared upload x");
+        d_witness = (float*) strata::ze::malloc_device(witness.size() * sizeof(float));
+        memcpy_sync(d_witness, witness.data(), witness.size() * sizeof(float));
         auto run = [&](void* stream, const float* x_float = nullptr) {
             shared_expert(d_x_used, nullptr, d_xb, f, d_gc, d_gs, nullptr, f, d_uc, d_us, nullptr, f,
                           d_dc, d_ds, nullptr, d_ginpb, d_scratch, d_out, n_embd, n_ff, tpr, stream, x_float);
         };
-        /*
-        DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-        assuming in the original code the source host memory is pageable memory.
-        If the memory is not pageable, call wait() on event return by memcpy API
-        to ensure synchronization behavior.
-        */
-        check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-                  d_ginpb, zeros.data(), zeros.size() * sizeof(uint16_t)).wait()),
-              "zero shared gate");
+        memcpy_sync(d_ginpb, zeros.data(), zeros.size() * sizeof(uint16_t));
         run(nullptr);
         std::vector<float> half_output((size_t) n_embd), legacy((size_t) n_embd), native((size_t) n_embd), replay((size_t) n_embd);
-        check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                   .memcpy(half_output.data(), d_out,
-                                           half_output.size() * sizeof(float))
-                                   .wait()),
-              "half shared output");
-        /*
-        DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-        assuming in the original code the source host memory is pageable memory.
-        If the memory is not pageable, call wait() on event return by memcpy API
-        to ensure synchronization behavior.
-        */
-        check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-                  d_ginpb, basis.data(), basis.size() * sizeof(uint16_t)).wait()),
-              "basis shared gate");
-        /*
-        DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-        assuming in the original code the source host memory is pageable memory.
-        If the memory is not pageable, call wait() on event return by memcpy API
-        to ensure synchronization behavior.
-        */
-        check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-                  d_xb, witness_bf16.data(),
-                  witness_bf16.size() * sizeof(uint16_t)).wait()),
-              "witness shared bf16");
+        memcpy_sync(half_output.data(), d_out, half_output.size() * sizeof(float));
+        memcpy_sync(d_ginpb, basis.data(), basis.size() * sizeof(uint16_t));
+        memcpy_sync(d_xb, witness_bf16.data(), witness_bf16.size() * sizeof(uint16_t));
         run(nullptr);
-        check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                   .memcpy(legacy.data(), d_out,
-                                           legacy.size() * sizeof(float))
-                                   .wait()),
-              "legacy witness output");
+        memcpy_sync(legacy.data(), d_out, legacy.size() * sizeof(float));
         shared_expert_set_native_bf16(true);
         bool refused_missing = false;
         try { run(nullptr); } catch (const std::invalid_argument&) { refused_missing = true; }
         if (!refused_missing) ++bad;
-        dpct::queue_ptr stream;
-        /*
-        DPCT1025: The SYCL queue is created ignoring the flag and priority
-        options.
-        */
-        check(DPCT_CHECK_ERROR(
-                  stream = dpct::get_current_device().create_queue(true)),
-              "native shared stream");
+        strata::ze::Stream* stream = new strata::ze::Stream();
         run(stream, d_witness);
-        check(DPCT_CHECK_ERROR(stream->wait()), "native shared sync");
-        check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                   .memcpy(native.data(), d_out,
-                                           native.size() * sizeof(float))
-                                   .wait()),
-              "native witness output");
+        stream->sync();
+        memcpy_sync(native.data(), d_out, native.size() * sizeof(float));
         const float expected_gate = 1.0f / (1.0f + std::exp(-witness[0]));
         double error = 0.0, magnitude = 0.0;
         for (size_t i = 0; i < native.size(); ++i) {
@@ -552,67 +373,27 @@ int main(int argc, char** argv) {
         std::printf("  native shared scalar gate: %s (ref rel %.3e, BF16 separation %.3e, missing input %s)\n",
                     correct ? "pass" : "FAIL", rel, visible, refused_missing ? "refused" : "FAIL");
         if (!correct) ++bad;
-        dpct::experimental::command_graph_ptr graph;
-        dpct::experimental::command_graph_exec_ptr executable;
-        check(DPCT_CHECK_ERROR(dpct::experimental::begin_recording(stream)),
-              "native shared capture");
+        strata::ze::Graph* graph;
+        stream->begin_capture();
         run(stream, d_witness);
-        check(
-            DPCT_CHECK_ERROR(dpct::experimental::end_recording(stream, &graph)),
-            "native shared capture end");
-        check(
-            DPCT_CHECK_ERROR(
-                executable = new sycl::ext::oneapi::experimental::command_graph<
-                    sycl::ext::oneapi::experimental::graph_state::executable>(
-                    graph->finalize())),
-            "native shared graph instantiate");
+        graph = stream->end_capture();
         shared_expert_set_native_bf16(false);
-        check(DPCT_CHECK_ERROR(stream->ext_oneapi_graph(*executable)),
-              "native shared graph replay");
-        check(DPCT_CHECK_ERROR(stream->wait()), "native shared graph sync");
-        check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                   .memcpy(replay.data(), d_out,
-                                           replay.size() * sizeof(float))
-                                   .wait()),
-              "native shared graph read");
+        stream->launch(*graph);
+        stream->sync();
+        memcpy_sync(replay.data(), d_out, replay.size() * sizeof(float));
         const bool captured = std::memcmp(native.data(), replay.data(), native.size() * sizeof(float)) == 0;
         std::printf("  native shared captured selection: %s\n", captured ? "byte-identical" : "FAIL");
         if (!captured) ++bad;
-        check(DPCT_CHECK_ERROR(delete (executable)),
-              "native shared graph exec destroy");
-        check(DPCT_CHECK_ERROR(delete (graph)), "native shared graph destroy");
-        check(
-            DPCT_CHECK_ERROR(dpct::get_current_device().destroy_queue(stream)),
-            "native shared stream destroy");
-        /*
-        DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-        assuming in the original code the source host memory is pageable memory.
-        If the memory is not pageable, call wait() on event return by memcpy API
-        to ensure synchronization behavior.
-        */
-        check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-                  d_ginpb, hginp_bf16.data(),
-                  hginp_bf16.size() * sizeof(uint16_t)).wait()),
-              "restore shared gate");
-        /*
-        DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-        assuming in the original code the source host memory is pageable memory.
-        If the memory is not pageable, call wait() on event return by memcpy API
-        to ensure synchronization behavior.
-        */
-        check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-                  d_xb, hx_bf16.data(), hx_bf16.size() * sizeof(uint16_t)).wait()),
-              "restore shared bf16");
+        delete graph;
+        delete stream;
+        memcpy_sync(d_ginpb, hginp_bf16.data(), hginp_bf16.size() * sizeof(uint16_t));
+        memcpy_sync(d_xb, hx_bf16.data(), hx_bf16.size() * sizeof(uint16_t));
         run(nullptr);
-        check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                   .memcpy(replay.data(), d_out,
-                                           replay.size() * sizeof(float))
-                                   .wait()),
-              "restored shared output");
+        memcpy_sync(replay.data(), d_out, replay.size() * sizeof(float));
         const bool restored = std::memcmp(got.data(), replay.data(), got.size() * sizeof(float)) == 0;
         std::printf("  restored shared default: %s\n", restored ? "byte-identical" : "FAIL");
         if (!restored) ++bad;
-        sycl::free(d_witness, dpct::get_in_order_queue());
+        strata::ze::free(d_witness);
     }
 
     // ================= moe_combine: the two readings it exists to pin =================
@@ -652,54 +433,16 @@ int main(int argc, char** argv) {
         const std::vector<float> want = ref(true, false);
 
         float *d_p = nullptr, *d_w = nullptr, *d_s = nullptr, *d_y = nullptr;
-        check(
-            DPCT_CHECK_ERROR(d_p = (float *)sycl::malloc_device(
-                                 parts.size() * 4, dpct::get_in_order_queue())),
-            "mc p");
-        check(DPCT_CHECK_ERROR(d_w = (float *)sycl::malloc_device(
-                                   w.size() * 4, dpct::get_in_order_queue())),
-              "mc w");
-        check(DPCT_CHECK_ERROR(
-                  d_s = (float *)sycl::malloc_device(
-                      shared.size() * 4, dpct::get_in_order_queue())),
-              "mc s");
-        check(DPCT_CHECK_ERROR(
-                  d_y = (float *)sycl::malloc_device(
-                      (size_t)n_embd2 * 4, dpct::get_in_order_queue())),
-              "mc y");
-        /*
-        DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-        assuming in the original code the source host memory is pageable memory.
-        If the memory is not pageable, call wait() on event return by memcpy API
-        to ensure synchronization behavior.
-        */
-        check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-                  d_p, parts.data(), parts.size() * 4).wait()),
-              "mc cp");
-        /*
-        DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-        assuming in the original code the source host memory is pageable memory.
-        If the memory is not pageable, call wait() on event return by memcpy API
-        to ensure synchronization behavior.
-        */
-        check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(d_w, w.data(),
-                                                                 w.size() * 4).wait()),
-              "mc cw");
-        /*
-        DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-        assuming in the original code the source host memory is pageable memory.
-        If the memory is not pageable, call wait() on event return by memcpy API
-        to ensure synchronization behavior.
-        */
-        check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-                  d_s, shared.data(), shared.size() * 4).wait()),
-              "mc cs");
+        d_p = (float*) strata::ze::malloc_device(parts.size() * 4);
+        d_w = (float*) strata::ze::malloc_device(w.size() * 4);
+        d_s = (float*) strata::ze::malloc_device(shared.size() * 4);
+        d_y = (float*) strata::ze::malloc_device((size_t)n_embd2 * 4);
+        memcpy_sync(d_p, parts.data(), parts.size() * 4);
+        memcpy_sync(d_w, w.data(), w.size() * 4);
+        memcpy_sync(d_s, shared.data(), shared.size() * 4);
         strata::kernels::moe_combine(d_p, d_w, d_s, d_y, n_embd2, k2, nullptr);
         std::vector<float> got((size_t) n_embd2);
-        check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                   .memcpy(got.data(), d_y, got.size() * 4)
-                                   .wait()),
-              "mc cy");
+        memcpy_sync(got.data(), d_y, got.size() * 4);
 
         for (const auto& trap : {std::make_pair(false, false), std::make_pair(true, true)}) {
             const std::vector<float> wrong = ref(trap.first, trap.second);
@@ -718,19 +461,16 @@ int main(int argc, char** argv) {
 
         // a null `shared` must mean "no shared expert", not "add nothing but leave it undefined"
         strata::kernels::moe_combine(d_p, d_w, nullptr, d_y, n_embd2, k2, nullptr);
-        check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                   .memcpy(got.data(), d_y, got.size() * 4)
-                                   .wait()),
-              "mc cy2");
+        memcpy_sync(got.data(), d_y, got.size() * 4);
         const double rel_no_shared = rel_l1(want, got);
         const bool differs = rel_no_shared > 0.05;
         std::printf("  %-42s %s (%.2f%% apart - null shared really omits it)\n",
                     "a null `shared` is observable", differs ? "yes" : "*** NO ***", rel_no_shared * 100);
         if (!differs) ++bad;
-        sycl::free(d_p, dpct::get_in_order_queue());
-            sycl::free(d_w, dpct::get_in_order_queue());
-            sycl::free(d_s, dpct::get_in_order_queue());
-            sycl::free(d_y, dpct::get_in_order_queue());
+        strata::ze::free(d_p);
+        strata::ze::free(d_w);
+        strata::ze::free(d_s);
+        strata::ze::free(d_y);
     }
 
     std::printf("\nshared_expert: %d failures\n", bad);

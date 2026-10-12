@@ -383,10 +383,10 @@ struct Stager {
         pinned.assign((size_t) kRing, 0);
         dma_done.assign((size_t) kRing, nullptr);
         want.assign((size_t) kRing, 0);
-        done_seq = (uint64_t*) strata::ze::malloc_host(((size_t) kRing) * sizeof(uint64_t));
+        done_seq = (uint64_t*) strata::ze::malloc_host((size_t) kRing * sizeof(uint64_t));
         if (done_seq == nullptr) return false;
         for (int i = 0; i < kRing; ++i) done_seq[i] = 0;
-        src_seq = (uint64_t*) strata::ze::malloc_host(((size_t) 4 * kRing) * sizeof(uint64_t));
+        src_seq = (uint64_t*) strata::ze::malloc_host((size_t) 4 * kRing * sizeof(uint64_t));
         if (src_seq == nullptr) return false;
         for (int i = 0; i < 4 * kRing; ++i) src_seq[i] = 0;
         pageable.resize(kRing);
@@ -2387,10 +2387,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                     if (staged) {
                         pt.mark(kPfKvStage, cs);
                         if (kv_pending == qsa_index) {
-                            if (((void) (cs->wait(*m.kv_ready)), 0) != 0) {
-                                err = "prefill: waiting for KV prefetch";
-                                return false;
-                            }
+                            cs->wait(*m.kv_ready);
                             kv_pending = -1;
                         } else strata::kernels::kv_stage_from_host(pools_of(m.stage, m.ident_table), st.host,
                                                             core::qsa_kv_format(st),
@@ -2515,9 +2512,9 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                         static long long queries = 0, same = 0, sel_queries = 0;
                         const int64_t rows = st.idx_pooled_rows;
                         if (pooled16 == nullptr &&
-                            (((void) (pooled16 = (float *)strata::ze::malloc_device((size_t)rows * s.idx_dim * 4)), 0) != 0 ||
-                             ((void) (dead16 = (float *)strata::ze::malloc_device((size_t)s.idx_dim * 4)), 0) != 0 ||
-                             ((void) (ids16 = (int32_t *)strata::ze::malloc_device((size_t)(m.T * m.cap) * 4)), 0) != 0)) {
+                            ((pooled16 = (float*) strata::ze::malloc_device((size_t) rows * s.idx_dim * 4)) == nullptr ||
+                             (dead16 = (float*) strata::ze::malloc_device((size_t) s.idx_dim * 4)) == nullptr ||
+                             (ids16 = (int32_t*) strata::ze::malloc_device((size_t) (m.T * m.cap) * 4)) == nullptr)) {
                             err = "STRATA_IDX_FP16_CHECK: no room for its buffers";
                             return false;
                         }
@@ -2851,16 +2848,14 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                             int prevd = 0;
                             prevd = strata::ze::current_device();
                             strata::ze::set_device(P.dev);
-                            const strata::ze::Stream* ps = P.s;
+                            strata::ze::Stream* const ps = P.s;
                             ps->wait(*P.ev_in);
                             if (P.out_pending) {
                                 ps->wait(*P.ev_done);
                                 P.out_pending = false;
                             }
                             pe.mark(kPeMoeIn, ps);
-                            if (P.p2p) dpct::async_dpct_memcpy(
-                                P.mixed, P.dev, m.mixed, prevd,
-                                (size_t)T * N * 4, *ps);
+                            if (P.p2p) ps->memcpy(P.mixed, m.mixed, (size_t) T * N * 4);
                             else copy_f32_wide(P.mixed, P.host_x, T * N, ps);
                             P.back_at = rows_local;
                             P.back_rows = rows_peer;
@@ -2969,11 +2964,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                     (ps)->record(*(P.ev_grp[g2 % PeerPrefill::kGrpEv]));
                                     (P.s_out)->wait(*P.ev_grp[g2 % PeerPrefill::kGrpEv]);
                                     if (P.p2p)
-                                        dpct::async_dpct_memcpy(
-                                            m.Dm +
-                                                (size_t)(rows_local + r0) * N,
-                                            prevd, P.Dm_b[b], P.dev,
-                                            (size_t)nr * N * 4, *(P.s_out));
+                                        P.s_out->memcpy(m.Dm + (size_t) (rows_local + r0) * N, P.Dm_b[b], (size_t) nr * N * 4);
                                     else   // the primary reads them when it combines (below)
                                         P.s_out->memcpy(
                                             P.host_rows + (size_t)r0 * N,
@@ -3033,13 +3024,10 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                     dn.ld_dst = N;
                                     P.run_ctx->run(dn, ps);
                                     if (P.out_pipe && nr > 0) {   // this group's rows go back while the next group computes
-                                        (ps)->record(*(P.ev_grp[g2]));
-                                        (P.s_out)->wait(*P.ev_grp[g2]);
-                                        dpct::async_dpct_memcpy(
-                                            m.Dm +
-                                                (size_t)(rows_local + r0) * N,
-                                            prevd, P.Dm + (size_t)r0 * N, P.dev,
-                                            (size_t)nr * N * 4, *(P.s_out));
+                                        ps->record(*P.ev_grp[g2]);
+                                        P.s_out->wait(*P.ev_grp[g2]);
+                                        P.s_out->memcpy(m.Dm + (size_t) (rows_local + r0) * N, P.Dm + (size_t) r0 * N,
+                                                        (size_t) nr * N * 4);
                                     }
                                 }
                             }
@@ -3048,10 +3036,8 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                 (P.s_out)->record(*(P.ev_done));
                                 P.out_pending = true;
                             } else {
-                                dpct::async_dpct_memcpy(
-                                    m.Dm + (size_t)rows_local * N, prevd, P.Dm,
-                                    P.dev, (size_t)rows_peer * N * 4, *ps);
-                                (ps)->record(*(P.ev_done));
+                                ps->memcpy(m.Dm + (size_t) rows_local * N, P.Dm, (size_t) rows_peer * N * 4);
+                                ps->record(*P.ev_done);
                             }
                             pe.mark(kPeIdle, ps);
                             strata::ze::set_device(prevd);
@@ -3078,7 +3064,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                 if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
                                 if (m.src->pinned(l, e)) continue;
                                 job_of[j] = (int) js.size();
-                                if (gsrc != nullptr) {   // SYCL port: --stream-experts - the stager's thread reads it from the GGUF
+                                if (gsrc != nullptr) {   // --stream-experts: the stager's thread reads it from the GGUF
                                 js.push_back({nullptr, (size_t) lay.blob_bytes(l), nullptr, (int32_t) l, e, gsrc});
                                 continue;
                             }
@@ -3094,8 +3080,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                         }
                         StagerDone stager_done{stream_all ? nullptr : m.stager.get()};
                         auto stage_one = [&](size_t j) -> bool {
-                            try {
-                        const int32_t e = order[j];
+                            const int32_t e = order[j];
                             const bool resident = m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
                             if (resident) return true;
                             const int sl = stage_next;
@@ -3106,33 +3091,22 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                             if (pinned && !b) { err = "prefill: expert source has no blob"; return false; }
                             if (pinned) {
                                 // DMA straight from the page-locked arena: the copy stream only waits for the slot
-                                if (m.stage_live[sl])(m.copy)
-                                    ->wait(*m.used[m.used_of[sl]]);
-                                m.copy->memcpy(m.stage_dev[sl], b,
-                                               (size_t)lay.blob_bytes(l));
+                                if (m.stage_live[sl]) m.copy->wait(*m.used[m.used_of[sl]]);
+                                m.copy->memcpy(m.stage_dev[sl], b, (size_t) lay.blob_bytes(l));
                                 ++stats_.experts_dma;
                             } else {
                                 // copied to a pinned buffer by the stager (waits only if it is behind), then DMA
                                 const uint8_t* hb = m.stager->wait(job_of[j]);
-                                if (m.stage_live[sl])(m.copy)
-                                    ->wait(*m.used[m.used_of[sl]]);
-                                m.copy->memcpy(m.stage_dev[sl], hb,
-                                               (size_t)lay.blob_bytes(l));
+                                if (m.stage_live[sl]) m.copy->wait(*m.used[m.used_of[sl]]);
+                                m.copy->memcpy(m.stage_dev[sl], hb, (size_t) lay.blob_bytes(l));
                                 m.stager->issued_one(job_of[j], m.copy);
                             }
-                            (m.copy)->record(*(m.copied[sl]));
+                            m.copy->record(*m.copied[sl]);
                             m.stage_live[sl] = true;
                             stage_of[j] = sl;
                             stats_.ms_experts_host += ms_since(th);
                             ++stats_.experts_streamed;
                             return true;
-                        }
-                        catch (sycl::exception const &exc) {
-                          std::cerr << exc.what()
-                                    << "Exception caught at file:" << __FILE__
-                                    << ", line:" << __LINE__ << std::endl;
-                          std::exit(1);
-                        }
                         };
                         // In the streamed walk an MMQ group is gathered in ONE launch, after ONE wait on its last
                         // streamed copy (the copy stream is in order), and its ring slots are released by ONE event.  A
@@ -3151,12 +3125,11 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                         int gg_slots[MMQ_GROUP];
                         int gg_nslots = 0;   // ring slots gathered by the next flush
                         auto flush = [&]() {
-                            try {
-                        if (gg.n <= gg.first) return;
+                            if (gg.n <= gg.first) return;
                             const auto& f = lay.fmt[(size_t) l];
                             if (gg_nslots > 0) {   // the copies land in order: the last one covers the others
                                 pt.mark(kPfWaitCopy, cs);
-                                (m.cs)->wait(*m.copied[gg_slots[gg_nslots - 1]]);
+                                m.cs->wait(*m.copied[gg_slots[gg_nslots - 1]]);
                                 pt.mark(kPfDequant, cs);
                             }
                             if (!mmq::gather_native_group(gg, f.up_off, mmq_gub / 2, f.down_off, mmq_db, m.grp_gu, mmq_gub,
@@ -3169,18 +3142,11 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                             }
                             if (gg_nslots > 0) {
                                 const int rel = gg_slots[gg_nslots - 1];
-                                (m.cs)->record(*(m.used[rel]));
+                                m.cs->record(*m.used[rel]);
                                 for (int i = 0; i < gg_nslots; ++i) m.used_of[gg_slots[i]] = rel;
                             }
                             gg_nslots = 0;
                             gg.first = gg.n;
-                        }
-                        catch (sycl::exception const &exc) {
-                          std::cerr << exc.what()
-                                    << "Exception caught at file:" << __FILE__
-                                    << ", line:" << __LINE__ << std::endl;
-                          std::exit(1);
-                        }
                         };
                         // A770 port, STRATA_PF_XMX=2 (streamed walk, native pack, FP16 path): the experts' quantized
                         // blobs are held until a group of kXmxGroupMax, then each product runs over the group in one
@@ -3252,7 +3218,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                             }
                             if (xg_ns > 0) {
                                 const int rel = xg_slots[xg_ns - 1];
-                                (m.cs)->record(*(m.used[rel]));
+                                m.cs->record(*m.used[rel]);
                                 for (int i = 0; i < xg_ns; ++i) m.used_of[xg_slots[i]] = rel;
                             }
                             xg_n = 0;
@@ -3262,8 +3228,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                         // expert) is released once the blob is read
                         auto compute = [&](size_t j, const uint8_t *blob_dev,
                                            int slot) -> bool {
-                            try {
-                        const int32_t e = order[j];
+                            const int32_t e = order[j];
                             pt.mark(kPfDequant, cs);
                             if (use_mmq) {
                                 // gather the expert into its group slot (GGUF blocks, unchanged or converted)
@@ -3283,7 +3248,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                     mmq::gather_strata_q2(blob_dev, m.grp_gu + q * mmq_gub, m.grp_d + q * mmq_db, m.cs);
                                 }
                                 if (slot >= 0 && !group_gather) {
-                                    (m.cs)->record(*(m.used[slot]));
+                                    m.cs->record(*m.used[slot]);
                                     m.used_of[slot] = slot;
                                 }
                                 if (q + 1 < MMQ_GROUP && j + 1 < order.size()) return true;
@@ -3295,10 +3260,8 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                 for (size_t i = j0; i <= j; ++i) maxr = std::max<int64_t>(maxr, m.cnt[(size_t) order[i]]);
                                 pt.mark(kPfGemmGU, cs);
                                 // the zeroed tail after the group's last expert (see MMQ_TAIL)
-                                m.cs->memset(m.grp_gu + (size_t)ngx * mmq_gub,
-                                             0, MMQ_TAIL);
-                                m.cs->memset(m.grp_d + (size_t)ngx * mmq_db, 0,
-                                             MMQ_TAIL);
+                                m.cs->memset(m.grp_gu + (size_t) ngx * mmq_gub, 0, MMQ_TAIL);
+                                m.cs->memset(m.grp_d + (size_t) ngx * mmq_db, 0, MMQ_TAIL);
                                 mmq::Product gu;
                                 gu.w = m.grp_gu; gu.type = mmq_gt; gu.w_rows = 1280; gu.w_cols = N; gu.expert_bytes = mmq_gub;
                                 gu.n = ngx; gu.xq = m.Xq; gu.bounds = m.bounds_dev + j0; gu.ids = m.ids_identity;
@@ -3347,7 +3310,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                 blob_dequant_f16(blob_dev, m.dq_gu[q], m.dq_d[q], m.cs);
                             }
                             if (slot >= 0) {
-                                (m.cs)->record(*(m.used[slot]));
+                                m.cs->record(*m.used[slot]);
                                 m.used_of[slot] = slot;
                             }
                             if (xmx_on) {
@@ -3394,13 +3357,6 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                             pt.mark(kPfGemmD, cs);
                             m.gemm.f16(m.Hh + o0 * 640, m.dq_d[q], m.Dm + o0 * N, ne, N, 640);
                             return true;
-                        }
-                        catch (sycl::exception const &exc) {
-                          std::cerr << exc.what()
-                                    << "Exception caught at file:" << __FILE__
-                                    << ", line:" << __LINE__ << std::endl;
-                          std::exit(1);
-                        }
                         };
                         if (!stream_all) {
                             size_t staged = 0;
@@ -3416,7 +3372,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                     if (!compute(j, m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e]), -1)) return false;
                                 } else {
                                     pt.mark(kPfWaitCopy, cs);
-                                    (m.cs)->wait(*m.copied[stage_of[j]]);
+                                    m.cs->wait(*m.copied[stage_of[j]]);
                                     if (!compute(j, m.stage_dev[stage_of[j]], stage_of[j])) return false;
                                 }
                             }
@@ -3426,24 +3382,15 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                             size_t k = seq_start[(size_t) l];
                             const size_t kend = seq_start[(size_t) l + 1];
                             auto release_to = [&](int32_t e_stop) {
-                                try {
-                            while (k < kend && seq[k].e < e_stop) {
+                                while (k < kend && seq[k].e < e_stop) {
                                     if (gg_nslots > 0) flush();   // the open group's slots get their event first
                                     if (xg_n > 0) xflush();   // the open group's slots get their event first
                                     const int sl = (int) (k % (size_t) m.ring);
-                                    (m.cs)->record(*(m.used[sl]));
+                                    m.cs->record(*m.used[sl]);
                                     m.used_of[sl] = sl;
                                     consumed = ++k;
                                     give_back(consumed);
                                 }
-                            }
-                            catch (sycl::exception const &exc) {
-                              std::cerr
-                                  << exc.what()
-                                  << "Exception caught at file:" << __FILE__
-                                  << ", line:" << __LINE__ << std::endl;
-                              std::exit(1);
-                            }
                             };
                             for (size_t j = 0; j < order.size(); ++j) {
                                 const int32_t e = order[j];
@@ -3453,7 +3400,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                     wait_issued(k);
                                     if (!group_gather) {
                                         pt.mark(kPfWaitCopy, cs);
-                                        (m.cs)->wait(*m.copied[sl]);
+                                        m.cs->wait(*m.copied[sl]);
                                     }
                                     if (!compute(j, m.stage_dev[sl], sl)) return false;
                                     consumed = ++k;
@@ -3475,7 +3422,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                     }
                     pt.mark(kPfCombine, cs);
                     if (peer_now) {   // multi-GPU: the peer's rows are in Dm (or, without P2P, in host memory)
-                        (m.cs)->wait(*m.pp->ev_done);
+                        m.cs->wait(*m.pp->ev_done);
                         if (!m.pp->p2p)
                             copy_f32_wide(m.Dm + (size_t) m.pp->back_at * N, m.pp->host_rows, m.pp->back_rows * N, m.cs);
                     }
@@ -3484,21 +3431,12 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                     if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg) {
                         m.cs->sync();
                         auto bad = [&](const float *d, int64_t n) {
-                            try {
-                        std::vector<float> h((size_t)n);
-                            strata::ze::default_stream()
-                                .memcpy(h.data(), d, (size_t)n * 4)
-                                .wait();
+                            std::vector<float> h((size_t)n);
+                            strata::ze::default_stream().memcpy(h.data(), d, (size_t) n * 4);
+                            strata::ze::default_stream().sync();
                             int64_t c = 0;
                             for (float v : h) c += !std::isfinite(v);
                             return c;
-                        }
-                        catch (sycl::exception const &exc) {
-                          std::cerr << exc.what()
-                                    << "Exception caught at file:" << __FILE__
-                                    << ", line:" << __LINE__ << std::endl;
-                          std::exit(1);
-                        }
                         };
                         // (fused: GU and H hold the grouping tables and int8 rows, not floats)
                         const int64_t bgu = fused_l ? 0 : bad(m.GU, T * K * 1280), bdm = bad(m.Dm, T * K * N),
@@ -3508,7 +3446,8 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                         // gate/up (non-finite count, largest finite magnitude)
                         auto bad16 = [&](const uint16_t* d, int64_t n, double& mx) {
                             std::vector<uint16_t> h((size_t) n);
-                            (strata::ze::default_stream().memcpy(h.data(), d, (size_t) n * 2), strata::ze::default_stream().sync());
+                            strata::ze::default_stream().memcpy(h.data(), d, (size_t) n * 2);
+                            strata::ze::default_stream().sync();
                             int64_t c = 0;
                             mx = 0;
                             for (uint16_t v : h) {
@@ -3561,9 +3500,9 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                         --checks;
                         float *Rc = nullptr, *rc = nullptr;
                         uint16_t* xc = nullptr;
-                        Rc = (float *)strata::ze::malloc_device((size_t)T * D * 4);
-                            rc = (float *)strata::ze::malloc_device((size_t)T * HC * 4);
-                        xc = (uint16_t *)strata::ze::malloc_device((size_t)T * D * 2);
+                        Rc = (float*) strata::ze::malloc_device((size_t) T * D * 4);
+                        rc = (float*) strata::ze::malloc_device((size_t) T * HC * 4);
+                        xc = (uint16_t*) strata::ze::malloc_device((size_t) T * D * 2);
                         m.cs->memcpy(Rc, m.R, (size_t)T * D * 4);
                         gr_write(Rc, m.bo, m.inj, HC, T, m.cs);
                         strata::kernels::cvec_apply(Rc, l, T, D, nullptr, 0, nullptr, 0, false, m.cs);
@@ -3581,8 +3520,8 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                         m.cs->memcpy(xb.data(), xc, xb.size() * 2);
                         m.cs->sync();
                         strata::ze::free(Rc);
-                            strata::ze::free(rc);
-                            strata::ze::free(xc);
+                        strata::ze::free(rc);
+                        strata::ze::free(xc);
                         std::fprintf(stderr, "strata: STRATA_CVEC_FUSE_CHECK layer %lld T %lld: R %s, rs %s, xn16 %s\n",
                                      (long long) l, (long long) T,
                                      std::memcmp(a.data(), b.data(), a.size() * 4) ? "DIFFERS" : "identical",
@@ -3617,13 +3556,8 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
         if (next_ != nullptr) {
             // The current hand-off slot was used two chunks ago.
             float* h = m.hand[hand_buf_];
-            if (((void) (m.cs->memcpy(h, m.R, (size_t)T * D * 4)), 0) !=
-                    0 ||
-                ((void) (m.cs->sync()), 0) != 0) {
-                err = std::string("prefill: the layer split's hand-off: ") +
-                      "error";
-                return false;
-            }
+            m.cs->memcpy(h, m.R, (size_t) T * D * 4);
+            m.cs->sync();
             // Wait only for the DIRECT successor's previous chunk. That successor
             // may already have forwarded its older chunk to later GPUs.
             if (on_stage_chunk && !on_stage_chunk(p0 + T, err)) return false;
@@ -3642,9 +3576,8 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
             if (std::FILE* f = std::fopen(dump, c0 == 0 ? "wb" : "ab")) {
                 std::vector<float> row((size_t) D);
                 for (int64_t t = (64 - p0 % 64) % 64; t < T; t += 64) {
-                    strata::ze::default_stream()
-                        .memcpy(row.data(), m.R + t * D, (size_t)D * 4)
-                        .wait();
+                    strata::ze::default_stream().memcpy(row.data(), m.R + t * D, (size_t) D * 4);
+                    strata::ze::default_stream().sync();
                     const int64_t pos = p0 + t;
                     std::fwrite(&pos, sizeof pos, 1, f);
                     std::fwrite(row.data(), 4, row.size(), f);
@@ -3662,9 +3595,8 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                 std::vector<uint16_t> out((size_t) (kRows * D));
                 for (int64_t t0 = 0; t0 < T; t0 += kRows) {
                     const int64_t nr = std::min<int64_t>(kRows, T - t0);
-                    strata::ze::default_stream()
-                        .memcpy(rows.data(), m.R + t0 * D, (size_t)(nr * D) * 4)
-                        .wait();
+                    strata::ze::default_stream().memcpy(rows.data(), m.R + t0 * D, (size_t) (nr * D) * 4);
+                    strata::ze::default_stream().sync();
                     for (int64_t i = 0; i < nr * D; ++i) {
                         uint32_t u;
                         std::memcpy(&u, &rows[(size_t) i], 4);
@@ -3678,11 +3610,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
         }
         if (on_chunk || on_stage_chunk) {
             const auto toc = Clock::now();
-            if (((void) (m.cs->sync()), 0) != 0) {
-                err =
-                    std::string("prefill: ") + "error";
-                return false;
-            }
+            m.cs->sync();
             const auto toc2 = Clock::now();
             if (on_stage_chunk && !on_stage_chunk(p0 + T, err)) return false;
             if (on_chunk && !on_chunk(m.R, T, p0, err)) return false;
@@ -3697,21 +3625,13 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
     if (std::getenv("STRATA_DBG_NAN") != nullptr) {   // debug: the state the prompt leaves for the token path
         m.cs->sync();
         auto bad = [&](const float *d, int64_t n) {
-            try {
-        std::vector<float> h((size_t)n);
-            strata::ze::default_stream()
-                .memcpy(h.data(), d, (size_t)n * 4)
-                .wait();
+            std::vector<float> h((size_t)n);
+            strata::ze::default_stream().memcpy(h.data(), d, (size_t) n * 4);
+            strata::ze::default_stream().sync();
             int64_t c = 0;
             double mx = 0;
             for (float v : h) { c += !std::isfinite(v); if (std::isfinite(v)) mx = std::max(mx, (double) std::fabs(v)); }
             std::fprintf(stderr, " %lld non-finite (max |x| %.3g)", (long long) c, mx);
-        }
-        catch (sycl::exception const &exc) {
-          std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-                    << ", line:" << __LINE__ << std::endl;
-          std::exit(1);
-        }
         };
         const int64_t last = (n - 1) % m.T;
         std::fprintf(stderr, "strata dbg: prompt end: last residual row");
@@ -3721,23 +3641,11 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
         bad(ss.gdn_state, 64 * 1024);
         std::fprintf(stderr, "\n");
     }
-    if (((void) (m.cs->sync()), 0) != 0) {
-        err = std::string("prefill: ") + "error";
-        return false;
-    }
+    m.cs->sync();
     // (PR #121) an expert copy that failed on the copy stream surfaces here, not in the next request
-    if (const int cst = ((void) (m.copy->sync()), 0); cst != 0) {
-        err = std::string("prefill: expert copy stream: ") +
-              "error";
-        return false;
-    }
+    m.copy->sync();
     if (kv_prefetch) {
-        if (const int cst = ((void) (m.kv_copy->sync()), 0);
-            cst != 0) {
-            err = std::string("prefill: KV prefetch stream: ") +
-                  "error";
-            return false;
-        }
+        m.kv_copy->sync();
         std::fprintf(stderr, "strata KV prefetch: %lld layer prefixes, single existing staging pool\n",
                      (long long) kv_prefetches);
     }
@@ -3782,10 +3690,8 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
         std::string line;
         char h[8];
         for (int64_t i = 0; i < ss.gdn_alloc; ++i) {
-            strata::ze::default_stream()
-                .memcpy(b.data(), ss.gdn_state + (size_t)i * gdn_floats,
-                        b.size())
-                .wait();
+            strata::ze::default_stream().memcpy(b.data(), ss.gdn_state + (size_t) i * gdn_floats, b.size());
+            strata::ze::default_stream().sync();
             uint64_t x = 1469598103934665603ull;
             for (uint8_t c : b) x = (x ^ c) * 1099511628211ull;
             std::snprintf(h, sizeof(h), "%04llx ", (unsigned long long) (x & 0xffff));

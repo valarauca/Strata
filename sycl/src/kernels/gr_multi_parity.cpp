@@ -4,9 +4,7 @@
 // Real geometry (n_embd 2560, hc 4, hc_lr 320), the pinned native MMVF path, every T = 1..8, with and without an
 // injection weight (a layer read vs the final mixer), and the write both out of place and in place (R_out == R).
 // Each output of the multi call must equal the token-by-token one bit for bit. GPU, synthetic, no model.
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
+#include "strata/ze/ze.hpp"
 #include "strata/kernels/gr.hpp"
 
 #include <cstdint>
@@ -19,44 +17,38 @@
 namespace k = strata::kernels;
 
 namespace {
-void ck(dpct::err0 e, const char *w) {
+/// cudaMemcpy: after the device's queued work, complete on return.
+void memcpy_sync(void* dst, const void* src, size_t bytes) {
+    strata::ze::device_sync();
+    strata::ze::default_stream().memcpy(dst, src, bytes);
+    strata::ze::default_stream().sync();
 }
+
+/// cudaMemset: after the device's queued work, complete on return.
+void memset_sync(void* dst, int value, size_t bytes) {
+    strata::ze::device_sync();
+    strata::ze::default_stream().memset(dst, value, bytes);
+    strata::ze::default_stream().sync();
+}
+
 template <typename T>
 T* up(const std::vector<T>& h) {
     void* p = nullptr;
-    ck(DPCT_CHECK_ERROR(
-           p = (void *)sycl::malloc_device(h.size() * sizeof(T) + 64,
-                                           dpct::get_in_order_queue())),
-       "malloc");
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming in
-    the original code the source host memory is pageable memory. If the memory
-    is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-           p, h.data(), h.size() * sizeof(T)).wait()),
-       "h2d");
+    p = strata::ze::malloc_device(h.size() * sizeof(T) + 64);
+    memcpy_sync(p, h.data(), h.size() * sizeof(T));
     return (T*) p;
 }
 template <typename T>
 T* dev(size_t n) {
     void* p = nullptr;
-    ck(DPCT_CHECK_ERROR(p = (void *)sycl::malloc_device(
-                            n * sizeof(T) + 64, dpct::get_in_order_queue())),
-       "malloc");
-    ck(DPCT_CHECK_ERROR(
-           (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memset(p, 0, n * sizeof(T) + 64).wait()),
-       "memset");
+    p = strata::ze::malloc_device(n * sizeof(T) + 64);
+    memset_sync(p, 0, n * sizeof(T) + 64);
     return (T*) p;
 }
 template <typename T>
 std::vector<T> down(const T* d, size_t n) {
     std::vector<T> h(n);
-    ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                            .memcpy(h.data(), d, n * sizeof(T))
-                            .wait()),
-       "d2h");
+    memcpy_sync(h.data(), d, n * sizeof(T));
     return h;
 }
 uint16_t bf16_of(float f) {
@@ -84,10 +76,7 @@ int main() {
 
     const k::GrShapes sh{n_embd, hc, hc_lr};
     void* ws_raw = nullptr;
-    ck(DPCT_CHECK_ERROR(
-           ws_raw = (void *)sycl::malloc_device(k::gr_workspace_bytes(sh),
-                                                dpct::get_in_order_queue())),
-       "ws");
+    ws_raw = strata::ze::malloc_device(k::gr_workspace_bytes(sh));
     k::GrWorkspace ws;
     k::gr_workspace_init(sh, ws_raw, ws);
 
@@ -112,9 +101,7 @@ int main() {
             for (int t = 0; t < T; ++t)
                 k::gr_read(d_R + (size_t) t * hc_dim, d_norm, d_down, d_up, wi, eps, sh, ws, d_mixed_s + (size_t) t * n_embd,
                            with_inj ? d_inject_s + (size_t) t * hc : nullptr, nullptr);
-            ck(DPCT_CHECK_ERROR(
-                   dpct::get_current_device().queues_wait_and_throw()),
-               "sync");
+            strata::ze::device_sync();
             bool ok = std::memcmp(down(d_mixed_m, (size_t) T * n_embd).data(), down(d_mixed_s, (size_t) T * n_embd).data(),
                                   (size_t) T * n_embd * 4) == 0;
             if (with_inj)
@@ -125,10 +112,10 @@ int main() {
                 std::printf("    *** gr_read_multi T=%d %s differs from gr_read ***\n", T, with_inj ? "with injection" : "final mixer");
                 ++bad;
             }
-            sycl::free(d_mixed_m, dpct::get_in_order_queue());
-                sycl::free(d_mixed_s, dpct::get_in_order_queue());
-                sycl::free(d_inject_m, dpct::get_in_order_queue());
-                sycl::free(d_inject_s, dpct::get_in_order_queue());
+            strata::ze::free(d_mixed_m);
+            strata::ze::free(d_mixed_s);
+            strata::ze::free(d_inject_m);
+            strata::ze::free(d_inject_s);
         }
 
         // the write: R_out[t] = R[t] + block_out[t] * 2 sigmoid(inject[t] / hc)
@@ -146,9 +133,7 @@ int main() {
             for (int t = 0; t < T; ++t)
                 k::gr_write(d_Rs + (size_t) t * hc_dim, d_bo + (size_t) t * n_embd, d_in + (size_t) t * hc, sh,
                             d_os + (size_t) t * hc_dim, nullptr);
-            ck(DPCT_CHECK_ERROR(
-                   dpct::get_current_device().queues_wait_and_throw()),
-               "sync");
+            strata::ze::device_sync();
             const bool ok = std::memcmp(down(d_om, (size_t) T * hc_dim).data(), down(d_os, (size_t) T * hc_dim).data(),
                                         (size_t) T * hc_dim * 4) == 0;
             ++cases;
@@ -156,19 +141,19 @@ int main() {
                 std::printf("    *** gr_write_multi T=%d %s differs from gr_write ***\n", T, inplace ? "in place" : "out of place");
                 ++bad;
             }
-            sycl::free(d_Rm, dpct::get_in_order_queue());
-                sycl::free(d_Rs, dpct::get_in_order_queue());
+            strata::ze::free(d_Rm);
+            strata::ze::free(d_Rs);
             if (!inplace) {
-                sycl::free(d_om, dpct::get_in_order_queue());
-                sycl::free(d_os, dpct::get_in_order_queue());
+                strata::ze::free(d_om);
+                strata::ze::free(d_os);
             }
         }
-        sycl::free(d_R, dpct::get_in_order_queue());
-            sycl::free(d_xn, dpct::get_in_order_queue());
-            sycl::free(d_lo, dpct::get_in_order_queue());
-            sycl::free(d_g, dpct::get_in_order_queue());
-            sycl::free(d_bo, dpct::get_in_order_queue());
-            sycl::free(d_in, dpct::get_in_order_queue());
+        strata::ze::free(d_R);
+        strata::ze::free(d_xn);
+        strata::ze::free(d_lo);
+        strata::ze::free(d_g);
+        strata::ze::free(d_bo);
+        strata::ze::free(d_in);
     }
     std::printf("gr_multi: %d cases, %d failures\n", cases, bad);
     if (bad) return 1;

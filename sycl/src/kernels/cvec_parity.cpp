@@ -5,9 +5,7 @@
 //      (fused_gr_read with apply), which is what keeps a loaded-but-off vector identical to the stock engine.
 //   4. a layer without a direction is untouched.
 
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
+#include "strata/ze/ze.hpp"
 #include "strata/kernels/cvec.hpp"
 #include "strata/kernels/fused_gr.hpp"
 
@@ -24,37 +22,28 @@ namespace {
 
 int g_fail = 0;
 
-void ck(dpct::err0 e, const char *w) {
+/// cudaMemcpy: after the device's queued work, complete on return.
+void memcpy_sync(void* dst, const void* src, size_t bytes) {
+    strata::ze::device_sync();
+    strata::ze::default_stream().memcpy(dst, src, bytes);
+    strata::ze::default_stream().sync();
 }
 
 template <typename T>
 T* dalloc(size_t n) {
     T* p = nullptr;
-    ck(DPCT_CHECK_ERROR(p = (T *)sycl::malloc_device(
-                            n * sizeof(T), dpct::get_in_order_queue())),
-       "malloc");
+    p = (T*) strata::ze::malloc_device(n * sizeof(T));
     return p;
 }
 
 template <typename T>
-/*
-DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming in the
-original code the source host memory is pageable memory. If the memory is not
-pageable, call wait() on event return by memcpy API to ensure synchronization
-behavior.
-*/
 void up(T *d, const std::vector<T> &h) {
-    ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-           d, h.data(), h.size() * sizeof(T)).wait()),
-       "up");
+    memcpy_sync(d, h.data(), h.size() * sizeof(T));
 }
 template <typename T>
 std::vector<T> down(const T* d, size_t n) {
     std::vector<T> h(n);
-    ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                            .memcpy(h.data(), d, n * sizeof(T))
-                            .wait()),
-       "down");
+    memcpy_sync(h.data(), d, n * sizeof(T));
     return h;
 }
 
@@ -99,8 +88,7 @@ int main() {
     std::printf("project\n");
     up(dR, R);
     k::cvec_apply(dR, kLayer, T, D, nullptr, 0, nullptr, 0, false, nullptr);
-    ck(DPCT_CHECK_ERROR(dpct::get_current_device().queues_wait_and_throw()),
-       "project");
+    strata::ze::device_sync();
     {
         const auto got = down(dR, R.size());
         double worst = 0.0, worst_dot = 0.0;
@@ -129,8 +117,7 @@ int main() {
     if (!k::cvec_upload(dir, s, 0, 4, 44, N, HC, err)) return 2;
     up(dR, R);
     k::cvec_apply(dR, kLayer, T, D, nullptr, 0, nullptr, 0, false, nullptr);
-    ck(DPCT_CHECK_ERROR(dpct::get_current_device().queues_wait_and_throw()),
-       "project s=1");
+    strata::ze::device_sync();
     {
         const auto got = down(dR, R.size());
         double worst = 0.0;
@@ -147,8 +134,7 @@ int main() {
     // ---- 4. a layer without a direction
     up(dR, R);
     k::cvec_apply(dR, kOff, T, D, nullptr, 0, nullptr, 0, false, nullptr);
-    ck(DPCT_CHECK_ERROR(dpct::get_current_device().queues_wait_and_throw()),
-       "off layer");
+    strata::ze::device_sync();
     check(std::memcmp(down(dR, R.size()).data(), R.data(), R.size() * 4) == 0, "a layer without a direction is untouched");
 
     // ---- 3. switched off
@@ -157,8 +143,7 @@ int main() {
     check(!k::cvec_enabled(), "cvec_enabled() follows the switch");
     up(dR, R);
     k::cvec_apply(dR, kLayer, T, D, nullptr, 0, nullptr, 0, false, nullptr);
-    ck(DPCT_CHECK_ERROR(dpct::get_current_device().queues_wait_and_throw()),
-       "off");
+    strata::ze::device_sync();
     check(std::memcmp(down(dR, R.size()).data(), R.data(), R.size() * 4) == 0, "off, no pending write: R unchanged");
     {
         // the fused read's folded write, one token at a time, against the kernel's write-only pass
@@ -190,8 +175,7 @@ int main() {
         }
         up(dR, R);
         k::cvec_apply(dR, kLayer, T, D, dbo, N, dinj, HC, true, nullptr);
-        ck(DPCT_CHECK_ERROR(dpct::get_current_device().queues_wait_and_throw()),
-           "write only");
+        strata::ze::device_sync();
         const auto fused = down(dF, R.size()), mine = down(dR, R.size());
         check(std::memcmp(fused.data(), mine.data(), R.size() * 4) == 0,
               "off, pending write: bitwise the fused read's folded write");
@@ -199,8 +183,7 @@ int main() {
         // on, with the write: the write, then the projection (reference from the fused result)
         up(dR, R);
         k::cvec_apply(dR, kLayer, T, D, dbo, N, dinj, HC, true, nullptr);
-        ck(DPCT_CHECK_ERROR(dpct::get_current_device().queues_wait_and_throw()),
-           "write+project");
+        strata::ze::device_sync();
         const auto both = down(dR, R.size());
         double worst = 0.0;
         for (int64_t t = 0; t < T; ++t)
@@ -223,8 +206,7 @@ int main() {
     if (!k::cvec_upload(dir, s, /*add*/ 1, 4, 44, N, HC, err)) return 2;
     up(dR, R);
     k::cvec_apply(dR, kLayer, T, D, nullptr, 0, nullptr, 0, false, nullptr);
-    ck(DPCT_CHECK_ERROR(dpct::get_current_device().queues_wait_and_throw()),
-       "add");
+    strata::ze::device_sync();
     {
         const auto got = down(dR, R.size());
         bool same = true;

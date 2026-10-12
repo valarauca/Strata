@@ -8,9 +8,7 @@
 // So this builds a fixture where that happens, computes the greedy pick under BOTH orders, and requires them to
 // DIFFER - then requires the kernel to agree with the specified one.  Without the first half, the test would
 // pass against either order.
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
+#include "strata/ze/ze.hpp"
 #include "strata/kernels/sampler.hpp"
 
 #include <algorithm>
@@ -25,7 +23,18 @@
 
 namespace {
 
-void check(dpct::err0 e, const char *what) {
+/// cudaMemcpy: after the device's queued work, complete on return.
+void memcpy_sync(void* dst, const void* src, size_t bytes) {
+    strata::ze::device_sync();
+    strata::ze::default_stream().memcpy(dst, src, bytes);
+    strata::ze::default_stream().sync();
+}
+
+/// cudaMemset: after the device's queued work, complete on return.
+void memset_sync(void* dst, int value, size_t bytes) {
+    strata::ze::device_sync();
+    strata::ze::default_stream().memset(dst, value, bytes);
+    strata::ze::default_stream().sync();
 }
 
 // The host reference for the specified order: top_k -> top_p -> temperature -> argmax.
@@ -102,59 +111,29 @@ int run(const char* name, const std::vector<float>& logits, int n_tokens, const 
         const std::vector<int>& want, const std::vector<int>& hist = {}, int hist_len = 0) {
     float* d_l = nullptr;
     int* d_o = nullptr;
-    check(DPCT_CHECK_ERROR(d_l = sycl::malloc_device<float>(
-                               logits.size(), dpct::get_in_order_queue())),
-          "malloc logits");
-    check(DPCT_CHECK_ERROR(d_o = sycl::malloc_device<int>(
-                               (size_t)n_tokens, dpct::get_in_order_queue())),
-          "malloc out");
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming
-    in the original code the source host memory is pageable memory. If the
-    memory is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-              d_l, logits.data(), logits.size() * sizeof(float)).wait()),
-          "copy");
+    d_l = (float*) strata::ze::malloc_device(logits.size() * sizeof(float));
+    d_o = (int*) strata::ze::malloc_device((size_t)n_tokens * sizeof(int));
+    memcpy_sync(d_l, logits.data(), logits.size() * sizeof(float));
     // -1 in every output slot first: a row the kernel leaves unwritten can never match (a verify window reads
     // every row, so "no output" is a wrong answer, not a skipped one)
-    check(
-        DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                             .memset(d_o, 0xFF, (size_t)n_tokens * sizeof(int))
-                             .wait()),
-        "fill out");
+    memset_sync(d_o, 0xFF, (size_t)n_tokens * sizeof(int));
     int* d_h = nullptr;
     if (hist_len > 0) {
-        check(DPCT_CHECK_ERROR(d_h = sycl::malloc_device<int>(
-                                   hist.size(), dpct::get_in_order_queue())),
-              "malloc hist");
-        /*
-        DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-        assuming in the original code the source host memory is pageable memory.
-        If the memory is not pageable, call wait() on event return by memcpy API
-        to ensure synchronization behavior.
-        */
-        check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-                  d_h, hist.data(), hist.size() * sizeof(int)).wait()),
-              "copy hist");
+        d_h = (int*) strata::ze::malloc_device(hist.size() * sizeof(int));
+        memcpy_sync(d_h, hist.data(), hist.size() * sizeof(int));
     }
     strata::kernels::sample_tokens(d_l, n_tokens, (int) (logits.size() / n_tokens), d_h, hist_len, p, d_o,
                                    nullptr);
     std::vector<int> got((size_t) n_tokens);
-    check(
-        DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                             .memcpy(got.data(), d_o, got.size() * sizeof(int))
-                             .wait()),
-        "back");
+    memcpy_sync(got.data(), d_o, got.size() * sizeof(int));
     int bad = 0;
     for (int t = 0; t < n_tokens; ++t) if (got[(size_t) t] != want[(size_t) t]) ++bad;
     std::printf("  %-34s %s (%d of %d differ)", name, bad ? "*** WRONG ***" : "matches", bad, n_tokens);
     if (bad) std::printf("   first: want %d got %d", want[0], got[0]);
     std::printf("\n");
-    sycl::free(d_l, dpct::get_in_order_queue());
-    sycl::free(d_o, dpct::get_in_order_queue());
-    if (d_h) sycl::free(d_h, dpct::get_in_order_queue());
+    strata::ze::free(d_l);
+    strata::ze::free(d_o);
+    if (d_h) strata::ze::free(d_h);
     return bad;
 }
 
@@ -381,61 +360,28 @@ struct DeviceRows {
     int n_tokens = 0, nv = 0, hist_len = 0;
     DeviceRows(const std::vector<float>& logits, int n_tokens_, const std::vector<int>& hist, int hist_len_)
         : n_tokens(n_tokens_), nv((int) (logits.size() / (size_t) n_tokens_)), hist_len(hist_len_) {
-        check(DPCT_CHECK_ERROR(l = sycl::malloc_device<float>(
-                                   logits.size(), dpct::get_in_order_queue())),
-              "malloc logits");
-        check(
-            DPCT_CHECK_ERROR(o = sycl::malloc_device<int>(
-                                 (size_t)n_tokens, dpct::get_in_order_queue())),
-            "malloc out");
-        /*
-        DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-        assuming in the original code the source host memory is pageable memory.
-        If the memory is not pageable, call wait() on event return by memcpy API
-        to ensure synchronization behavior.
-        */
-        check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-                  l, logits.data(), logits.size() * sizeof(float)).wait()),
-              "copy");
+        l = (float*) strata::ze::malloc_device(logits.size() * sizeof(float));
+        o = (int*) strata::ze::malloc_device((size_t)n_tokens * sizeof(int));
+        memcpy_sync(l, logits.data(), logits.size() * sizeof(float));
         if (hist_len > 0) {
-            check(
-                DPCT_CHECK_ERROR(h = sycl::malloc_device<int>(
-                                     hist.size(), dpct::get_in_order_queue())),
-                "malloc hist");
-            /*
-            DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-            assuming in the original code the source host memory is pageable
-            memory. If the memory is not pageable, call wait() on event return
-            by memcpy API to ensure synchronization behavior.
-            */
-            check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-                      h, hist.data(), hist.size() * sizeof(int)).wait()),
-                  "copy hist");
+            h = (int*) strata::ze::malloc_device(hist.size() * sizeof(int));
+            memcpy_sync(h, hist.data(), hist.size() * sizeof(int));
         }
     }
     DeviceRows(const DeviceRows&) = delete;
     DeviceRows& operator=(const DeviceRows&) = delete;
     ~DeviceRows() {
-        sycl::free(l, dpct::get_in_order_queue());
-        sycl::free(o, dpct::get_in_order_queue());
-        if (h) sycl::free(h, dpct::get_in_order_queue());
+        strata::ze::free(l);
+        strata::ze::free(o);
+        if (h) strata::ze::free(h);
     }
-    std::vector<int> sample(const strata::kernels::SamplerParams &p,
-                            dpct::queue_ptr stream) {
-        check(DPCT_CHECK_ERROR(
-                  (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                      .memset(o, 0xFF, (size_t)n_tokens * sizeof(int))
-                      .wait()),
-              "fill out");
+    std::vector<int> sample(const strata::kernels::SamplerParams& p, strata::ze::Stream* stream) {
+        memset_sync(o, 0xFF, (size_t)n_tokens * sizeof(int));
         strata::kernels::sample_tokens(l, n_tokens, nv, h, hist_len, p, o, stream);
-        if (stream != &dpct::get_in_order_queue())
-            check(DPCT_CHECK_ERROR(stream->wait()), "stream sync");
+        if (stream != &strata::ze::default_stream())
+            stream->sync();
         std::vector<int> got((size_t) n_tokens);
-        check(DPCT_CHECK_ERROR(
-                  (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                      .memcpy(got.data(), o, got.size() * sizeof(int))
-                      .wait()),
-              "back");
+        memcpy_sync(got.data(), o, got.size() * sizeof(int));
         return got;
     }
 };
@@ -451,9 +397,7 @@ std::vector<int> window_of(const std::vector<int>& hist, int hist_len, int t, in
 // `--bench`: the sampled path alone at the engine's vocabulary, per call, on the path the environment selects.
 void bench_sampled() {
     const int NV = 248320;
-    dpct::queue_ptr s = &dpct::get_in_order_queue();
-    check(DPCT_CHECK_ERROR(s = dpct::get_current_device().create_queue(true)),
-          "stream");
+    strata::ze::Stream* s = new strata::ze::Stream();
     std::mt19937 rng(20);
     std::normal_distribution<float> g(0.0f, 3.0f);
     for (int T : {1, 4, 8}) {
@@ -461,66 +405,35 @@ void bench_sampled() {
         for (auto& v : l) v = g(rng);
         float* d_l = nullptr;
         int* d_o = nullptr;
-        check(DPCT_CHECK_ERROR(d_l = sycl::malloc_device<float>(
-                                   l.size(), dpct::get_in_order_queue())),
-              "bench logits");
-        check(DPCT_CHECK_ERROR(d_o = sycl::malloc_device<int>(
-                                   (size_t)T, dpct::get_in_order_queue())),
-              "bench out");
-        /*
-        DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-        assuming in the original code the source host memory is pageable memory.
-        If the memory is not pageable, call wait() on event return by memcpy API
-        to ensure synchronization behavior.
-        */
-        check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-                  d_l, l.data(), l.size() * sizeof(float)).wait()),
-              "bench copy");
+        d_l = (float*) strata::ze::malloc_device(l.size() * sizeof(float));
+        d_o = (int*) strata::ze::malloc_device((size_t)T * sizeof(int));
+        memcpy_sync(d_l, l.data(), l.size() * sizeof(float));
         for (int k : {20, 64}) {
             strata::kernels::SamplerParams p;
             p.top_k = k; p.top_p = 0.95f; p.temperature = 0.7f; p.seed = 1;
             for (int w = 0; w < 3; ++w) strata::kernels::sample_tokens(d_l, T, NV, nullptr, 0, p, d_o, s);
-            check(DPCT_CHECK_ERROR(s->wait()), "bench warmup");
-            dpct::event_ptr e0, e1;
-            check(DPCT_CHECK_ERROR(e0 = new sycl::event()), "event");
-            check(DPCT_CHECK_ERROR(e1 = new sycl::event()), "event");
+            s->sync();
+            strata::ze::Event* e0 = new strata::ze::Event(true);
+            strata::ze::Event* e1 = new strata::ze::Event(true);
             const int iters = 50;
-            /*
-            DPCT1024: The original code returned the error code that was
-            further consumed by the program logic. This original code was
-            replaced with 0. You may need to rewrite the program logic consuming
-            the error code.
-            */
-            check(DPCT_CHECK_ERROR(dpct::sync_barrier(e0, s)), "record");
+            s->record(*e0);
             for (int it = 0; it < iters; ++it) {
                 p.counter = (uint64_t) it;
                 strata::kernels::sample_tokens(d_l, T, NV, nullptr, 0, p, d_o, s);
             }
-            /*
-            DPCT1024: The original code returned the error code that was
-            further consumed by the program logic. This original code was
-            replaced with 0. You may need to rewrite the program logic consuming
-            the error code.
-            */
-            check(DPCT_CHECK_ERROR(dpct::sync_barrier(e1, s)), "record");
-            check(DPCT_CHECK_ERROR(e1->wait_and_throw()), "bench sync");
+            s->record(*e1);
+            e1->sync();
             float ms = 0.0f;
-            check(DPCT_CHECK_ERROR(
-                      ms = (e1->get_profiling_info<
-                                sycl::info::event_profiling::command_end>() -
-                            e0->get_profiling_info<
-                                sycl::info::event_profiling::command_start>()) /
-                           1000000.0f),
-                  "elapsed");
+            ms = e1->elapsed_ms_since(*e0);
             std::printf("  bench: n_vocab %d, rows %d, top_k %2d, top_p 0.95: %8.1f us per call\n", NV, T, k,
                         1000.0 * (double) ms / iters);
-            dpct::destroy_event(e0);
-            dpct::destroy_event(e1);
+            delete e0;
+            delete e1;
         }
-        sycl::free(d_l, dpct::get_in_order_queue());
-        sycl::free(d_o, dpct::get_in_order_queue());
+        strata::ze::free(d_l);
+        strata::ze::free(d_o);
     }
-    dpct::get_current_device().destroy_queue(s);
+    delete s;
 }
 
 }  // namespace
@@ -606,37 +519,15 @@ int main(int argc, char** argv) {
         std::vector<int> wa((size_t) NT);
         for (int t = 0; t < NT; ++t) wa[(size_t) t] = reference_pick({l.begin() + (size_t) t * NV, l.begin() + (size_t) (t + 1) * NV}, a, false);
         float* d_l = nullptr; int *d_a = nullptr, *d_b = nullptr;
-        check(DPCT_CHECK_ERROR(d_l = sycl::malloc_device<float>(
-                                   l.size(), dpct::get_in_order_queue())),
-              "m1");
-        check(DPCT_CHECK_ERROR(d_a = sycl::malloc_device<int>(
-                                   (size_t)NT, dpct::get_in_order_queue())),
-              "m2");
-        check(DPCT_CHECK_ERROR(d_b = sycl::malloc_device<int>(
-                                   (size_t)NT, dpct::get_in_order_queue())),
-              "m3");
-        /*
-        DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-        assuming in the original code the source host memory is pageable memory.
-        If the memory is not pageable, call wait() on event return by memcpy API
-        to ensure synchronization behavior.
-        */
-        check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-                  d_l, l.data(), l.size() * sizeof(float)).wait()),
-              "c1");
+        d_l = (float*) strata::ze::malloc_device(l.size() * sizeof(float));
+        d_a = (int*) strata::ze::malloc_device((size_t)NT * sizeof(int));
+        d_b = (int*) strata::ze::malloc_device((size_t)NT * sizeof(int));
+        memcpy_sync(d_l, l.data(), l.size() * sizeof(float));
         strata::kernels::sample_tokens(d_l, NT, NV, nullptr, 0, a, d_a, nullptr);
         strata::kernels::sample_tokens(d_l, NT, NV, nullptr, 0, b, d_b, nullptr);
         std::vector<int> ga((size_t) NT), gb((size_t) NT);
-        check(DPCT_CHECK_ERROR(
-                  (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                      .memcpy(ga.data(), d_a, ga.size() * sizeof(int))
-                      .wait()),
-              "g1");
-        check(DPCT_CHECK_ERROR(
-                  (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                      .memcpy(gb.data(), d_b, gb.size() * sizeof(int))
-                      .wait()),
-              "g2");
+        memcpy_sync(ga.data(), d_a, ga.size() * sizeof(int));
+        memcpy_sync(gb.data(), d_b, gb.size() * sizeof(int));
         int mismatch = 0, wrong = 0;
         for (int t = 0; t < NT; ++t) {
             if (ga[(size_t) t] != gb[(size_t) t]) ++mismatch;
@@ -646,9 +537,9 @@ int main(int argc, char** argv) {
                     "greedy ignores the seed", (!mismatch && !wrong) ? "matches" : "*** WRONG ***", mismatch,
                     wrong);
         bad += mismatch + wrong;
-        sycl::free(d_l, dpct::get_in_order_queue());
-            sycl::free(d_a, dpct::get_in_order_queue());
-            sycl::free(d_b, dpct::get_in_order_queue());
+        strata::ze::free(d_l);
+        strata::ze::free(d_a);
+        strata::ze::free(d_b);
     }
 
 
@@ -1118,52 +1009,28 @@ int main(int argc, char** argv) {
         std::vector<float> uniform(count * vocab, 0.0f);
         float* input = nullptr;
         int* output = nullptr;
-        check(DPCT_CHECK_ERROR(input = sycl::malloc_device<float>(
-                                   uniform.size(), dpct::get_in_order_queue())),
-              "counter logits");
-        check(DPCT_CHECK_ERROR(output = sycl::malloc_device<int>(
-                                   count, dpct::get_in_order_queue())),
-              "counter output");
-        /*
-        DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-        assuming in the original code the source host memory is pageable memory.
-        If the memory is not pageable, call wait() on event return by memcpy API
-        to ensure synchronization behavior.
-        */
-        check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-                  input, uniform.data(), uniform.size() * sizeof(float)).wait()),
-              "counter upload");
+        input = (float*) strata::ze::malloc_device(uniform.size() * sizeof(float));
+        output = (int*) strata::ze::malloc_device(count * sizeof(int));
+        memcpy_sync(input, uniform.data(), uniform.size() * sizeof(float));
         strata::kernels::SamplerParams p;
         p.top_k = vocab; p.top_p = 1.0f; p.seed = 123; p.counter = (uint64_t(1) << 32) + 7;
         strata::kernels::sample_tokens(input, count, vocab, nullptr, 0, p, output, nullptr);
         std::vector<int> batch(count), singles(count), repeated(count);
-        check(DPCT_CHECK_ERROR(
-                  (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                      .memcpy(batch.data(), output, count * sizeof(int))
-                      .wait()),
-              "counter batch");
+        memcpy_sync(batch.data(), output, count * sizeof(int));
         for (int i = 0; i < count; ++i) {
             auto one = p; one.counter += i;
             strata::kernels::sample_tokens(input, 1, vocab, nullptr, 0, one, output + i, nullptr);
         }
-        check(DPCT_CHECK_ERROR(
-                  (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                      .memcpy(singles.data(), output, count * sizeof(int))
-                      .wait()),
-              "counter singles");
+        memcpy_sync(singles.data(), output, count * sizeof(int));
         strata::kernels::sample_tokens(input, count, vocab, nullptr, 0, p, output, nullptr);
-        check(DPCT_CHECK_ERROR(
-                  (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                      .memcpy(repeated.data(), output, count * sizeof(int))
-                      .wait()),
-              "counter repeated");
+        memcpy_sync(repeated.data(), output, count * sizeof(int));
         bool varies = false;
         for (int i = 1; i < count; ++i) varies |= batch[i] != batch[0];
         const bool valid = batch == singles && batch == repeated && varies;
         std::printf("  sampler draw counter segmentation/repeat: %s\n", valid ? "PASS" : "FAIL");
         bad += !valid;
-        sycl::free(input, dpct::get_in_order_queue());
-            sycl::free(output, dpct::get_in_order_queue());
+        strata::ze::free(input);
+        strata::ze::free(output);
     }
 
     // ---- fixture 16: THE WHOLE top_k LIST, POSITION BY POSITION, UNDER TIES.  A pick shows the list
@@ -1241,7 +1108,7 @@ int main(int argc, char** argv) {
                 p.counter = (uint64_t) top_k;
                 const int k = sampled_k(p.top_k, nv);
                 const std::vector<int> got =
-                    rows.sample(p, &dpct::get_in_order_queue());
+                    rows.sample(p, &strata::ze::default_stream());
                 for (int t = 0; t < T; ++t) {
                     const int want = lists[(size_t) t].ids[(size_t) (k - 1)];
                     sentinels += (t == 2 && k > 11);
@@ -1269,10 +1136,7 @@ int main(int argc, char** argv) {
     // with another kept token, or the tie rule would go untested.
     {
         const int T = 17, H = 64;
-        dpct::queue_ptr cs = &dpct::get_in_order_queue();
-        check(DPCT_CHECK_ERROR(
-                  cs = dpct::get_current_device().create_queue(true)),
-              "fixture 17 stream");
+        strata::ze::Stream* cs = new strata::ze::Stream();
         int wrong = 0, draws = 0, tied = 0;
         for (int nv : {248320, 512}) {
             std::mt19937 rng((unsigned) (1700 + nv));
@@ -1307,9 +1171,7 @@ int main(int argc, char** argv) {
                 for (int top_k : {1, 20, 64})
                     for (float top_p : {0.9f, 1.0f})
                         for (float min_p : {0.0f, 0.05f})
-                            for (dpct::queue_ptr st :
-                                 {(dpct::queue_ptr)&dpct::get_in_order_queue(),
-                                  cs}) {
+                            for (strata::ze::Stream* st : {&strata::ze::default_stream(), cs}) {
                                 strata::kernels::SamplerParams p = base;
                                 p.top_k = top_k; p.top_p = top_p; p.min_p = min_p;
                                 p.counter = (uint64_t) (1000 * ++config);
@@ -1337,7 +1199,7 @@ int main(int argc, char** argv) {
                             }
             }
         }
-        dpct::get_current_device().destroy_queue(cs);
+        delete cs;
         std::printf("  %-34s %s (%d of %d draws differ; %d picks tie with another kept token)\n",
                     "sampled draws under ties", wrong || !tied ? "*** WRONG ***" : "matches", wrong, draws, tied);
         bad += wrong + (tied == 0);
@@ -1383,49 +1245,23 @@ int main(int argc, char** argv) {
             for (int t = 0; t < T; ++t)
                 lists.push_back(mirror_select(l.data() + (size_t) t * nv, nv, window_of(hist, H, t, H), p, k));
             DeviceRows rows(l, T, hist, H);
-            dpct::queue_ptr cs = &dpct::get_in_order_queue();
-            check(DPCT_CHECK_ERROR(
-                      cs = dpct::get_current_device().create_queue(true)),
-                  "fixture 18 stream");
-            check(DPCT_CHECK_ERROR(
-                      (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                          .memset(rows.o, 0xFF, (size_t)T * sizeof(int))
-                          .wait()),
-                  "fixture 18 fill");
-            dpct::experimental::command_graph_ptr graph = nullptr;
-            dpct::experimental::command_graph_exec_ptr exec = nullptr;
-            check(DPCT_CHECK_ERROR(dpct::experimental::begin_recording(cs)),
-                  "begin capture");
+            strata::ze::Stream* cs = new strata::ze::Stream();
+            memset_sync(rows.o, 0xFF, (size_t)T * sizeof(int));
+            strata::ze::Graph* graph = nullptr;
+            cs->begin_capture();
             strata::kernels::sample_tokens(rows.l, T, nv, rows.h, H, p, rows.o, cs);
-            check(
-                DPCT_CHECK_ERROR(dpct::experimental::end_recording(cs, &graph)),
-                "end capture");
-            check(DPCT_CHECK_ERROR(
-                      exec = new sycl::ext::oneapi::experimental::command_graph<
-                          sycl::ext::oneapi::experimental::graph_state::
-                              executable>(graph->finalize())),
-                  "instantiate");
+            graph = cs->end_capture();
             for (int replay = 0; replay < 2; ++replay) {
-                check(DPCT_CHECK_ERROR(
-                          (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                              .memset(rows.o, 0xFF, (size_t)T * sizeof(int))
-                              .wait()),
-                      "fixture 18 refill");
-                check(DPCT_CHECK_ERROR(cs->ext_oneapi_graph(*exec)),
-                      "graph launch");
-                check(DPCT_CHECK_ERROR(cs->wait()), "graph sync");
+                memset_sync(rows.o, 0xFF, (size_t)T * sizeof(int));
+                cs->launch(*graph);
+                cs->sync();
                 std::vector<int> got((size_t) T);
-                check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                           .memcpy(got.data(), rows.o,
-                                                   got.size() * sizeof(int))
-                                           .wait()),
-                      "back");
+                memcpy_sync(got.data(), rows.o, got.size() * sizeof(int));
                 compare("captured graph", got, lists, k, p);
             }
-            delete (exec);
-            delete (graph);
+            delete graph;
             compare("same stream, uncaptured", rows.sample(p, cs), lists, k, p);
-            dpct::get_current_device().destroy_queue(cs);
+            delete cs;
         }
         for (int T : {64, 70}) {
             const int nv = 512;
@@ -1439,7 +1275,7 @@ int main(int argc, char** argv) {
             for (int t = 0; t < T; ++t) lists.push_back(mirror_select(l.data() + (size_t) t * nv, nv, {}, p, k));
             DeviceRows rows(l, T, hist, 0);
             compare(T > 64 ? "70 rows (one block)" : "64 rows (split)",
-                    rows.sample(p, &dpct::get_in_order_queue()), lists, k, p);
+                    rows.sample(p, &strata::ze::default_stream()), lists, k, p);
         }
         std::printf("  %-34s %s (%d of %d draws differ)\n", "fallbacks: graph capture, row cap",
                     wrong ? "*** WRONG ***" : "matches", wrong, draws);

@@ -9,9 +9,7 @@
 // logit distributions including ties (where the "smallest index wins" rule is the only thing that decides) and
 // near-ties (where a float difference decides).  It also asserts that the 2**-14 CLAMP CANNOT TRIGGER for this
 // model's geometry - see below - so the absence of a clamp test is a proven fact rather than an omission.
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
+#include "strata/ze/ze.hpp"
 #include "strata/kernels/router_top10.hpp"
 
 #include <algorithm>
@@ -24,7 +22,11 @@
 
 namespace {
 
-void check(dpct::err0 e, const char *what) {
+/// cudaMemcpy: after the device's queued work, complete on return.
+void memcpy_sync(void* dst, const void* src, size_t bytes) {
+    strata::ze::device_sync();
+    strata::ze::default_stream().memcpy(dst, src, bytes);
+    strata::ze::default_stream().sync();
 }
 
 constexpr double RENORM_CLAMP = 6.103515625e-05;      // 2**-14
@@ -69,35 +71,13 @@ int run_case(const char* name, const std::vector<float>& logits, int n_tokens, i
     float* d_l = nullptr;
     int* d_ids = nullptr;
     float* d_w = nullptr;
-    check(DPCT_CHECK_ERROR(d_l = sycl::malloc_device<float>(
-                               logits.size(), dpct::get_in_order_queue())),
-          "malloc logits");
-    check(DPCT_CHECK_ERROR(d_ids = sycl::malloc_device<int>(
-                               h_ids.size(), dpct::get_in_order_queue())),
-          "malloc ids");
-    check(DPCT_CHECK_ERROR(d_w = sycl::malloc_device<float>(
-                               h_w.size(), dpct::get_in_order_queue())),
-          "malloc w");
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming
-    in the original code the source host memory is pageable memory. If the
-    memory is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-              d_l, logits.data(), logits.size() * sizeof(float)).wait()),
-          "copy");
+    d_l = (float*) strata::ze::malloc_device(logits.size() * sizeof(float));
+    d_ids = (int*) strata::ze::malloc_device(h_ids.size() * sizeof(int));
+    d_w = (float*) strata::ze::malloc_device(h_w.size() * sizeof(float));
+    memcpy_sync(d_l, logits.data(), logits.size() * sizeof(float));
     strata::kernels::router_top10(d_l, n_tokens, n_expert, k, d_ids, d_w, nullptr);
-    check(DPCT_CHECK_ERROR(
-              (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                  .memcpy(h_ids.data(), d_ids, h_ids.size() * sizeof(int))
-                  .wait()),
-          "back ids");
-    check(DPCT_CHECK_ERROR(
-              (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                  .memcpy(h_w.data(), d_w, h_w.size() * sizeof(float))
-                  .wait()),
-          "back w");
+    memcpy_sync(h_ids.data(), d_ids, h_ids.size() * sizeof(int));
+    memcpy_sync(h_w.data(), d_w, h_w.size() * sizeof(float));
 
     long long id_bad = 0, w_bad = 0;
     double worst = 0;
@@ -120,9 +100,9 @@ int run_case(const char* name, const std::vector<float>& logits, int n_tokens, i
     }
     std::printf("  %-26s ids %s (%lld bad)   weights worst rel %.3e (%lld over tol)   |sum-1| %.1e\n", name,
                 id_bad ? "*** WRONG ***" : "exact", id_bad, worst, w_bad, worst_sum);
-    sycl::free(d_l, dpct::get_in_order_queue());
-    sycl::free(d_ids, dpct::get_in_order_queue());
-    sycl::free(d_w, dpct::get_in_order_queue());
+    strata::ze::free(d_l);
+    strata::ze::free(d_ids);
+    strata::ze::free(d_w);
     return (int) (id_bad + w_bad);
 }
 

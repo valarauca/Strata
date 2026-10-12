@@ -10,9 +10,7 @@
 //   4. a ring (the MTP drafter's layout) restored from the host copy reads the same values as the resident pool.
 // INT8, FP16, Q4_0 (PR #21) and hybrid K8V4 pools; K8V4's appends are the engine's folded calls (layer.cpp), its host
 // copy written through kv_hybrid_k_half / kv_hybrid_v_half.
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
+#include "strata/ze/ze.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/kv_stream.hpp"
@@ -31,36 +29,32 @@ namespace k = strata::kernels;
 
 namespace {
 int g_fail = 0;
-void ck(dpct::err0 e, const char *w) {
-    /*
-    DPCT1009: SYCL reports errors using exceptions and does not use error
-    codes. Please replace the "get_error_string_dummy(...)" with a real
-    error-handling function.
-    */
+/// cudaMemcpy: after the device's queued work, complete on return.
+void memcpy_sync(void* dst, const void* src, size_t bytes) {
+    strata::ze::device_sync();
+    strata::ze::default_stream().memcpy(dst, src, bytes);
+    strata::ze::default_stream().sync();
 }
+
+/// cudaMemset: after the device's queued work, complete on return.
+void memset_sync(void* dst, int value, size_t bytes) {
+    strata::ze::device_sync();
+    strata::ze::default_stream().memset(dst, value, bytes);
+    strata::ze::default_stream().sync();
+}
+
 template <typename T> T* dalloc(size_t n) {
     T* p = nullptr;
-    ck(DPCT_CHECK_ERROR(p = (T *)sycl::malloc_device(
-                            n * sizeof(T) + 64, dpct::get_in_order_queue())),
-       "malloc");
-    ck(DPCT_CHECK_ERROR(
-           (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memset(p, 0, n * sizeof(T) + 64).wait()),
-       "memset");
+    p = (T*) strata::ze::malloc_device(n * sizeof(T) + 64);
+    memset_sync(p, 0, n * sizeof(T) + 64);
     return p;
 }
 template <typename T> T* halloc(size_t n) {   // pinned, mapped; returns the device pointer
     void* h = nullptr;
     void* d = nullptr;
-    /*
-    DPCT1048: The original value cudaHostAllocMapped is not meaningful in the
-    migrated code and was removed or replaced with 0. You may need to check the
-    migrated code.
-    */
-    ck(DPCT_CHECK_ERROR(h = (void *)sycl::malloc_host(
-                            n * sizeof(T) + 64, dpct::get_in_order_queue())),
-       "hostalloc");
+    h = strata::ze::malloc_host(n * sizeof(T) + 64);
     std::memset(h, 0, n * sizeof(T) + 64);
-    ck(DPCT_CHECK_ERROR(d = (void *)h), "devptr");
+    d = (void *)h;
     return (T*) d;
 }
 
@@ -147,15 +141,7 @@ bool run(int fmt) {
     {
         std::vector<int32_t> t(n_blocks);
         for (int64_t i = 0; i < n_blocks; ++i) t[i] = (int32_t) i;
-        /*
-        DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-        assuming in the original code the source host memory is pageable memory.
-        If the memory is not pageable, call wait() on event return by memcpy API
-        to ensure synchronization behavior.
-        */
-        ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(ident, t.data(),
-                                                              n_blocks * 4).wait()),
-           "ident");
+        memcpy_sync(ident, t.data(), n_blocks * 4);
     }
     k::KvStreamMap m;
     m.page_table = dalloc<int32_t>(n_blocks);
@@ -183,33 +169,9 @@ bool run(int fmt) {
         for (auto& x : hk) x = nd(rng) * ((pos % 17 == 0) ? 30.f : 1.f);
         for (auto& x : hv) x = nd(rng);
         const int32_t st[4] = {(int32_t) pos, (int32_t) (pos + 1), (int32_t) ((pos + 1) / 4), 0};
-        /*
-        DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-        assuming in the original code the source host memory is pageable memory.
-        If the memory is not pageable, call wait() on event return by memcpy API
-        to ensure synchronization behavior.
-        */
-        ck(DPCT_CHECK_ERROR(
-               (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(kc, hk.data(), hk.size() * 4).wait()),
-           "k");
-        /*
-        DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-        assuming in the original code the source host memory is pageable memory.
-        If the memory is not pageable, call wait() on event return by memcpy API
-        to ensure synchronization behavior.
-        */
-        ck(DPCT_CHECK_ERROR(
-               (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(vc, hv.data(), hv.size() * 4).wait()),
-           "v");
-        /*
-        DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-        assuming in the original code the source host memory is pageable memory.
-        If the memory is not pageable, call wait() on event return by memcpy API
-        to ensure synchronization behavior.
-        */
-        ck(DPCT_CHECK_ERROR(
-               (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(step, st, sizeof(st)).wait()),
-           "step");
+        memcpy_sync(kc, hk.data(), hk.size() * 4);
+        memcpy_sync(vc, hv.data(), hv.size() * 4);
+        memcpy_sync(step, st, sizeof(st));
         append(ref, ident, step, kc, vc, s, fmt, nullptr);
         append(slots, m.page_table, step, kc, vc, s, fmt, &host.p);
         if (pos % 131 != 130 && pos != N - 1) continue;
@@ -226,60 +188,21 @@ bool run(int fmt) {
             hst[t * 4 + 3] = (int32_t) width;
         }
         for (auto& x : hq) x = nd(rng);
-        /*
-        DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-        assuming in the original code the source host memory is pageable memory.
-        If the memory is not pageable, call wait() on event return by memcpy API
-        to ensure synchronization behavior.
-        */
-        ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(ids, hids.data(),
-                                                              hids.size() * 4).wait()),
-           "ids");
-        /*
-        DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-        assuming in the original code the source host memory is pageable memory.
-        If the memory is not pageable, call wait() on event return by memcpy API
-        to ensure synchronization behavior.
-        */
-        ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(steps, hst.data(),
-                                                              hst.size() * 4).wait()),
-           "steps");
-        /*
-        DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-        assuming in the original code the source host memory is pageable memory.
-        If the memory is not pageable, call wait() on event return by memcpy API
-        to ensure synchronization behavior.
-        */
-        ck(DPCT_CHECK_ERROR(
-               (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(q, hq.data(), hq.size() * 4).wait()),
-           "q");
+        memcpy_sync(ids, hids.data(), hids.size() * 4);
+        memcpy_sync(steps, hst.data(), hst.size() * 4);
+        memcpy_sync(q, hq.data(), hq.size() * 4);
         k::qsa_decode_attn_batch(q, ref.attn(ident), ids, steps, cap, s, scratch, out_ref, n_q, nullptr);
         k::kv_stream_resolve(m, slots.attn(m.page_table), host.p, fmt, ids, steps, n_q, cap, s, nullptr);
         k::qsa_decode_attn_batch(q, slots.attn(m.page_table), ids, steps, cap, s, scratch, out_str, n_q, nullptr);
-        ck(DPCT_CHECK_ERROR(dpct::get_current_device().queues_wait_and_throw()),
-           "batch");
-        ck(DPCT_CHECK_ERROR(
-               (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                   .memcpy(a.data(), out_ref, (size_t)n_q * NH * D * 4)
-                   .wait()),
-           "a");
-        ck(DPCT_CHECK_ERROR(
-               (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                   .memcpy(b2.data(), out_str, (size_t)n_q * NH * D * 4)
-                   .wait()),
-           "b");
+        strata::ze::device_sync();
+        memcpy_sync(a.data(), out_ref, (size_t)n_q * NH * D * 4);
+        memcpy_sync(b2.data(), out_str, (size_t)n_q * NH * D * 4);
         if (std::memcmp(a.data(), b2.data(), (size_t) n_q * NH * D * 4) != 0) {
             if (bad++ < 5) std::fprintf(stderr, "  %s pos %lld n_q %d: streamed attention differs\n", name, (long long) pos, n_q);
         }
         // the map inverts itself
-        ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                .memcpy(pt.data(), m.page_table, n_blocks * 4)
-                                .wait()),
-           "pt");
-        ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                .memcpy(sb.data(), m.slot_block, n_slots * 4)
-                                .wait()),
-           "sb");
+        memcpy_sync(pt.data(), m.page_table, n_blocks * 4);
+        memcpy_sync(sb.data(), m.slot_block, n_slots * 4);
         int64_t resident = 0;
         for (int64_t bk = 0; bk < n_blocks; ++bk) {
             if (pt[bk] < -1 || pt[bk] >= n_slots || (pt[bk] >= 0 && sb[pt[bk]] != bk)) {
@@ -309,36 +232,13 @@ bool run(int fmt) {
         const int64_t width = cap;
         std::vector<int32_t> hids((size_t) cap), hst = {(int32_t) (N - 1), (int32_t) N, (int32_t) (N / 4), (int32_t) width};
         for (int64_t i = 0; i < width; ++i) hids[i] = (int32_t) (N - width + i);   // the window's last cells
-        /*
-        DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-        assuming in the original code the source host memory is pageable memory.
-        If the memory is not pageable, call wait() on event return by memcpy API
-        to ensure synchronization behavior.
-        */
-        ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(ids, hids.data(),
-                                                              hids.size() * 4).wait()),
-           "ids");
-        /*
-        DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-        assuming in the original code the source host memory is pageable memory.
-        If the memory is not pageable, call wait() on event return by memcpy API
-        to ensure synchronization behavior.
-        */
-        ck(DPCT_CHECK_ERROR(
-               (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(steps, hst.data(), 16).wait()),
-           "steps");
+        memcpy_sync(ids, hids.data(), hids.size() * 4);
+        memcpy_sync(steps, hst.data(), 16);
         k::qsa_decode_attn_batch(q, ref.attn(ident), ids, steps, cap, s, scratch, out_ref, 1, nullptr);
         k::qsa_decode_attn_batch(q, ring.attn(rt), ids, steps, cap, s, scratch, out_str, 1, nullptr);
-        ck(DPCT_CHECK_ERROR(dpct::get_current_device().queues_wait_and_throw()),
-           "ring");
-        ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                .memcpy(a.data(), out_ref, (size_t)NH * D * 4)
-                                .wait()),
-           "a");
-        ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                .memcpy(b2.data(), out_str, (size_t)NH * D * 4)
-                                .wait()),
-           "b");
+        strata::ze::device_sync();
+        memcpy_sync(a.data(), out_ref, (size_t)NH * D * 4);
+        memcpy_sync(b2.data(), out_str, (size_t)NH * D * 4);
         const bool ok = std::memcmp(a.data(), b2.data(), (size_t) NH * D * 4) == 0;
         std::printf("  %s ring restore: %s\n", name, ok ? "identical" : "DIFFERS");
         if (!ok) ++bad;

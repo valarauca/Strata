@@ -146,7 +146,7 @@ MtpDrafter::~MtpDrafter() {
     if (h_cparams_) strata::ze::free(h_cparams_);
     if (h_chist_) strata::ze::free(h_chist_);
     if (cs_) delete cs_;
-    if (side_) delete side_;
+    if (side_ && side_ != &strata::ze::default_stream(side_->device())) delete side_;
     if (sh_fork_) delete (sh_fork_);
     if (sh_join_) delete (sh_join_);
     if (owns_weights_ && dense_) strata::ze::free(dense_);

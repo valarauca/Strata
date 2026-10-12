@@ -9,9 +9,7 @@
 // then the plan is untouched) and without one (the all-resident graph: a non-resident expert gives an empty plan and
 // sets *plan_err).
 // Every word of the plan the host pool would read is compared with memcmp. GPU, synthetic, no model.
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
+#include "strata/ze/ze.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 
 #include <cstdint>
@@ -24,8 +22,20 @@
 namespace k = strata::kernels;
 
 namespace {
-void ck(dpct::err0 e, const char *w) {
+/// cudaMemcpy: after the device's queued work, complete on return.
+void memcpy_sync(void* dst, const void* src, size_t bytes) {
+    strata::ze::device_sync();
+    strata::ze::default_stream().memcpy(dst, src, bytes);
+    strata::ze::default_stream().sync();
 }
+
+/// cudaMemset: after the device's queued work, complete on return.
+void memset_sync(void* dst, int value, size_t bytes) {
+    strata::ze::device_sync();
+    strata::ze::default_stream().memset(dst, value, bytes);
+    strata::ze::default_stream().sync();
+}
+
 }  // namespace
 
 int main() {
@@ -40,48 +50,20 @@ int main() {
     int32_t *d_ids, *d_res, *d_plan;
     unsigned long long* d_off;
     uint32_t* d_skip;
-    ck(DPCT_CHECK_ERROR(d_ids = (int32_t *)sycl::malloc_device(
-                            128 * 4, dpct::get_in_order_queue())),
-       "ids");
-    ck(DPCT_CHECK_ERROR(d_res = (int32_t *)sycl::malloc_device(
-                            NE * 4, dpct::get_in_order_queue())),
-       "res");
-    ck(DPCT_CHECK_ERROR(d_off = (unsigned long long *)sycl::malloc_device(
-                            1024 * 8, dpct::get_in_order_queue())),
-       "off");
-    ck(DPCT_CHECK_ERROR(d_plan = (int32_t *)sycl::malloc_device(
-                            plan_words * 4, dpct::get_in_order_queue())),
-       "plan");
-    ck(DPCT_CHECK_ERROR(d_skip = (uint32_t *)sycl::malloc_device(
-                            4, dpct::get_in_order_queue())),
-       "skip");
+    d_ids = (int32_t*) strata::ze::malloc_device(128 * 4);
+    d_res = (int32_t*) strata::ze::malloc_device(NE * 4);
+    d_off = (unsigned long long*) strata::ze::malloc_device(1024 * 8);
+    d_plan = (int32_t*) strata::ze::malloc_device(plan_words * 4);
+    d_skip = (uint32_t*) strata::ze::malloc_device(4);
     uint32_t* d_err = nullptr;
-    ck(DPCT_CHECK_ERROR(d_err = (uint32_t *)sycl::malloc_device(
-                            4, dpct::get_in_order_queue())),
-       "err");
+    d_err = (uint32_t*) strata::ze::malloc_device(4);
 
     std::vector<int32_t> res(NE);
     for (int e = 0; e < NE; ++e) res[e] = (e * 37 + 11) % 1000;      // distinct slots, not the identity
     std::vector<unsigned long long> off(1024);
     for (int s = 0; s < 1024; ++s) off[s] = (unsigned long long) s * 4096 + (s % 7) * 64;
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming
-    in the original code the source host memory is pageable memory. If the
-    memory is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    ck(DPCT_CHECK_ERROR(
-           (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(d_res, res.data(), NE * 4).wait()),
-       "res");
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming
-    in the original code the source host memory is pageable memory. If the
-    memory is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    ck(DPCT_CHECK_ERROR(
-           (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(d_off, off.data(), 1024 * 8).wait()),
-       "off");
+    memcpy_sync(d_res, res.data(), NE * 4);
+    memcpy_sync(d_off, off.data(), 1024 * 8);
 
     int cases = 0, bad = 0;
     for (int n = 1; n <= 80; ++n) {
@@ -90,15 +72,7 @@ int main() {
             std::vector<int32_t> ids(n);
             for (int i = 0; i < n; ++i) ids[i] = (int32_t) ((rng() % pool) * (512 / pool));
             const bool use_off = (n + variant) % 2 == 1;
-            /*
-            DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-            assuming in the original code the source host memory is pageable
-            memory. If the memory is not pageable, call wait() on event return
-            by memcpy API to ensure synchronization behavior.
-            */
-            ck(DPCT_CHECK_ERROR(
-                   (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(d_ids, ids.data(), n * 4).wait()),
-               "ids");
+            memcpy_sync(d_ids, ids.data(), n * 4);
 
             // host replay
             std::vector<int32_t> counts = {0, n, 0}, start, dst(n), tok(n);
@@ -124,32 +98,16 @@ int main() {
             start[groups] = n;
 
             for (int mode = 0; mode < 2; ++mode) {   // 0: general kernel with a skip word, 1: all resident
-                ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                        .memset(d_plan, 0xAB, plan_words * 4)
-                                        .wait()),
-                   "fill");
-                ck(DPCT_CHECK_ERROR(
-                       (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memset(d_skip, 0, 4).wait()),
-                   "skip0");
-                ck(DPCT_CHECK_ERROR(
-                       (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memset(d_err, 0, 4).wait()),
-                   "err0");
+                memset_sync(d_plan, 0xAB, plan_words * 4);
+                memset_sync(d_skip, 0, 4);
+                memset_sync(d_err, 0, 4);
                 k::resident_plan(d_ids, n, K, d_res, NE, cache_base, use_off ? d_off : nullptr, blob, d_plan, capx,
                                  mode == 0 ? d_skip : nullptr, 7u, nullptr, d_err);
-                ck(DPCT_CHECK_ERROR(
-                       dpct::get_current_device().queues_wait_and_throw()),
-                   "sync");
+                strata::ze::device_sync();
                 std::vector<int32_t> plan(plan_words);
-                ck(DPCT_CHECK_ERROR(
-                       (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                           .memcpy(plan.data(), d_plan, plan_words * 4)
-                           .wait()),
-                   "plan");
+                memcpy_sync(plan.data(), d_plan, plan_words * 4);
                 uint32_t skip = 0;
-                ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                        .memcpy(&skip, d_skip, 4)
-                                        .wait()),
-                   "skipr");
+                memcpy_sync(&skip, d_skip, 4);
                 bool ok = mode == 1 || skip == 7u;
                 ok = ok && std::memcmp(plan.data(), counts.data(), 3 * 4) == 0;
                 ok = ok && std::memcmp(plan.data() + 4, start.data(), (size_t) (groups + 1) * 4) == 0;
@@ -172,45 +130,18 @@ int main() {
     {
         std::vector<int32_t> res2 = res;
         res2[5] = -1;
-        /*
-        DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-        assuming in the original code the source host memory is pageable memory.
-        If the memory is not pageable, call wait() on event return by memcpy API
-        to ensure synchronization behavior.
-        */
-        ck(DPCT_CHECK_ERROR(
-               (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(d_res, res2.data(), NE * 4).wait()),
-           "res2");
+        memcpy_sync(d_res, res2.data(), NE * 4);
         const int32_t ids[10] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
-        /*
-        DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-        assuming in the original code the source host memory is pageable memory.
-        If the memory is not pageable, call wait() on event return by memcpy API
-        to ensure synchronization behavior.
-        */
-        ck(DPCT_CHECK_ERROR(
-               (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(d_ids, ids, sizeof ids).wait()),
-           "ids");
-        ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                .memset(d_plan, 0xAB, plan_words * 4)
-                                .wait()),
-           "fill");
+        memcpy_sync(d_ids, ids, sizeof ids);
+        memset_sync(d_plan, 0xAB, plan_words * 4);
         const uint32_t seven = 7;
-        ck(DPCT_CHECK_ERROR(
-               (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(d_skip, &seven, 4).wait()),
-           "skip7");
+        memcpy_sync(d_skip, &seven, 4);
         k::resident_plan(d_ids, 10, K, d_res, NE, cache_base, nullptr, blob, d_plan, capx, d_skip, 7u, nullptr, d_err);
-        ck(DPCT_CHECK_ERROR(dpct::get_current_device().queues_wait_and_throw()),
-           "sync");
+        strata::ze::device_sync();
         std::vector<int32_t> plan(plan_words);
-        ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                .memcpy(plan.data(), d_plan, plan_words * 4)
-                                .wait()),
-           "plan");
+        memcpy_sync(plan.data(), d_plan, plan_words * 4);
         uint32_t skip = 99;
-        ck(DPCT_CHECK_ERROR(
-               (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(&skip, d_skip, 4).wait()),
-           "skipr");
+        memcpy_sync(&skip, d_skip, 4);
         bool untouched = true;
         for (int32_t w : plan) untouched = untouched && (uint32_t) w == 0xABABABABu;
         ++cases;

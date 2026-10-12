@@ -34,7 +34,7 @@
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/expert_source.hpp"
 #include "strata/core/gguf_expert_source.hpp"
-namespace strata::prefill { void set_nonresident_share(double share); }   // SYCL port: prefill.cpp
+namespace strata::prefill { void set_nonresident_share(double share); }   // prefill.cpp
 #include "strata/kernels/resident_plan_mirror.hpp"
 #include "strata/core/pinned.hpp"
 #include "strata/core/remote_experts.hpp"
@@ -420,7 +420,7 @@ struct Options {
     bool mmap_experts = false;    ///< R2.1: opt OUT of the resident arena, back to MapViewOfFile
     std::string shared_expert_arena; ///< Linux: optional file backing for the resident arena shared by processes
     bool resident_cpu_experts = false; ///< mmap-backed static-cache misses copied into ordinary RAM
-    bool stream_experts = false;  ///< SYCL port: no host arena; blobs read from the GGUF on demand (all experts in VRAM)
+    bool stream_experts = false;  ///< no host arena; blobs read from the GGUF on demand (all experts in VRAM)
     /// `--resident-experts` (the low-RAM PC's resident mode, chosen by setup): `--resident-cpu-experts` with the copy
     /// page-locked when the driver allows (else locked in the working set), 4 GiB of RAM headroom, and plain mmap
     /// (with a warning) when even the experts no slot holds do not fit.
@@ -1558,7 +1558,7 @@ int main(int argc, char **argv) {
 #endif
     }
     Options o;
-    bool borrow_explicit = false;   // SYCL port: --prefill-borrow / --no-prefill-borrow given (else chosen by context)
+    bool borrow_explicit = false;   // --prefill-borrow / --no-prefill-borrow given (else chosen by context)
     bool have_tokens = false;
     bool have_logits_stride = false;
     for (int i = 1; i < argc; ++i) {
@@ -2054,7 +2054,7 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "strata generate: layer split across %zu GPUs: CUDA0, then CUDA%s (split %s)\n",
                      split_devs.size() + 1, devs.c_str(), o.layer_split.c_str());
     }
-    // SYCL port (the B70, 2026-09-30): lending cache slots to the prompt path costs ~1 s per prompt (2,184 tokens:
+    // The B70 (2026-09-30): lending cache slots to the prompt path costs ~1 s per prompt (2,184 tokens:
     // 610 vs 792 tok/s) but is what keeps every expert in VRAM at a long context - 80,000 tokens without it: the
     // reserve for the KV and the chunk buffers evicts ~1,900 experts, prompt 790 tok/s and decode 2 tok/s after it;
     // with it: 1,062 tok/s and 39.5 tok/s after it. So by default only above a 32K context; the flags still decide.
@@ -2442,7 +2442,7 @@ int main(int argc, char **argv) {
             std::fprintf(stderr, "strata generate: PCIe probe failed -> pcie_frac default %.2f\n", base);
         }
     }
-    // SYCL port, Arc on the xe driver (Arc Pro B60/B65/B70, B580): the GPU page-faults when a kernel reads ordinary
+    // Arc on the xe driver (Arc Pro B60/B65/B70, B580): the GPU page-faults when a kernel reads ordinary
     // (pageable) host memory, and the card times the job out (seen on a B70: Timedout job, Fault response -EINVAL,
     // faulted address in the CPU's mmap range). Without --stream-experts the experts outside the VRAM cache stay in a
     // pageable arena that the PCIe share (--pcie-frac) hands to the GPU. Recommend, never force: the default share
@@ -3756,10 +3756,8 @@ int main(int argc, char **argv) {
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - head_t0).count());
     }
     std::vector<float> logits((size_t) n_vocab);
-    float* d_logits = nullptr;
-    d_logits = (float *)strata::ze::malloc_device((size_t)n_vocab * 4);
+    float* d_logits = (float*) strata::ze::malloc_device((size_t) n_vocab * 4);
     if (d_logits == nullptr) {
-        (void)0;
         std::fprintf(stderr, "strata generate: the logits buffer failed%s\n", vram_free_note().c_str());
         return 1;
     }
@@ -3846,7 +3844,7 @@ int main(int argc, char **argv) {
     strata::core::GgufExpertSource gguf_src;
     strata::core::ExpertSource* srcp = nullptr;
     if (o.stream_experts && !o.mmap_experts) {
-        // the SYCL port: a card that holds every expert needs no host copy of them, and a 23 GiB machine cannot
+        // a card that holds every expert needs no host copy of them, and a 23 GiB machine cannot
         // hold one. The profile fill reads each blob once from the shard; nothing reads from here afterwards
         // unless a slot is lent to the prefill and refilled (the experts no slot holds: the pinned host mirror).
         if (!native_pack || o.native_preset.empty()) {
@@ -4294,7 +4292,7 @@ int main(int argc, char **argv) {
                                        : std::min<int64_t>((int64_t) profile.size(), xcache.slots());
         const auto tfill = std::chrono::steady_clock::now();
         uint64_t fill_bytes = 0;
-        // SYCL port: from the GGUF (--stream-experts) the fill is a pipeline. The serial form read each expert's three
+        // From the GGUF (--stream-experts) the fill is a pipeline. The serial form read each expert's three
         // slices, copied it, and waited for the copy before the next read (~18,000 experts, neither the SSD nor PCIe
         // kept busy). Here the slots are admitted first (the same profile order, so the same placement), the reads go
         // in file order by worker threads into page-locked batches, and a batch's copies run while the next batch is
@@ -4456,7 +4454,7 @@ int main(int argc, char **argv) {
                      (long long) prefilled, (long long) (per_layer ? xcache.slots() : want), fill_s,
                      fill_s > 0 ? (double) fill_bytes / 1e6 / fill_s : 0.0);
     }
-    // SYCL port, plan item 2: the experts that did not fit VRAM, mirrored once in pinned host memory the GPU reads
+    // Plan item 2: the experts that did not fit VRAM, mirrored once in pinned host memory the GPU reads
     // over PCIe (--stream-experts has no host copy otherwise: each routed miss was an SSD read). The share of misses
     // the GPU takes is --pcie-frac; STRATA_MIRROR_MIB caps the mirror (default: MemAvailable less 4 GiB), 0 = off.
     unsigned long long* mirror_table_d = nullptr;   // [n_layers][n_expert] device-readable mirror addresses (0 = none)
@@ -5451,7 +5449,7 @@ int main(int argc, char **argv) {
                 if (srcp->pinned(l, e)) pinned += b;
             }
         strata::prefill::Prefill::set_pinned_share(total ? (double) pinned / (double) total : 1.0);
-        // SYCL port: the pairs outside the VRAM cache decide the prompt path's stream-all walk (prefill.cpp ring_slots)
+        // the pairs outside the VRAM cache decide the prompt path's stream-all walk (prefill.cpp ring_slots)
         int64_t nonres = 0;
         for (const int32_t r : host_res) nonres += r < 0;
         strata::prefill::set_nonresident_share(host_res.empty() ? 1.0 : (double) nonres / (double) host_res.size());
@@ -6284,15 +6282,12 @@ int main(int argc, char **argv) {
                 if (c < o.prefill_chunk) { next = c; break; }
             if (r == 2 && next > 0) {
                 std::fprintf(stderr, "strata serve: %s: trying a %lld-token chunk\n", err.c_str(), (long long) next);
-                // start the prompt paths over (a failed init may hold buffers), and consume the failed allocation's
-                // error: it is sticky, and the next launch check would report "out of memory" for a kernel
+                // start the prompt paths over (a failed init may hold buffers)
                 for (auto& stp : stages) {
                     const strata::core::OnDevice on(stp->dev);
                     stp->sp.reset();
-                    (void)0;
                 }
                 sp.reset();
-                (void)0;
                 o.prefill_chunk = next;
                 if (any_loan) {                  // smaller loans for the smaller chunk
                     for (PfPart& p : pf_parts)
@@ -8424,7 +8419,7 @@ int main(int argc, char **argv) {
             float req_min_p = 0.0f, req_penalty_repeat = 1.0f, req_penalty_freq = 0.0f, req_penalty_present = 0.0f;
             int req_penalty_last_n = 0;
             int req_cvec = 1;   // cvec=0|1: a loaded control vector for this request (on when absent)
-            // SYCL port: logprobs=K (0..20) - after each "T id" an "LP logprob id:logprob ..." line with the token's
+            // logprobs=K (0..20) - after each "T id" an "LP logprob id:logprob ..." line with the token's
             // log-probability and the K most likely tokens', from the verify window's head logits (before sampling,
             // penalties and temperature). -1 (absent): no LP lines; a server that does not ask never sees one.
             int req_logprobs = -1;
@@ -9075,7 +9070,7 @@ int main(int argc, char **argv) {
                                                             : p.cache->fill_slot_queued(slot, b, e, nb)))
                         return false;
                     host_res[(size_t) i] = slot;
-                    // SYCL port: drain before GgufExpertSource's 512-buffer blob ring can wrap onto a queued copy
+                    // drain before GgufExpertSource's 512-buffer blob ring can wrap onto a queued copy
                     if (!refill_blocking() && ++queued % 256 == 0 && !p.cache->sync_queued(e)) return false;
                 }
                 return true;
@@ -9365,13 +9360,6 @@ int main(int argc, char **argv) {
                     if (yielded_at < 0 && (batch_fatal || !stop_req.load())) {
                         std::fprintf(stderr, "strata serve: %s\n", err.c_str());
                         std::printf("ERR %s\n", err.c_str());
-                        // #224: a CUDA fault (an illegal address) poisons the context for the whole process, and
-                        // unwinding the destructors on it could hang until the 60 s watchdog: leave at once
-                        if (0 != 0) {
-                            std::fflush(stdout);
-                            std::fflush(stderr);
-                            std::_Exit(1);
-                        }
                         return 1;
                     }
                     cancelled = true;   // stopped while reading the prompt: refill the lent slots below, then DONE cancel
@@ -9758,12 +9746,7 @@ int main(int argc, char **argv) {
                     if (doomed && D.finished) {
                         {
                             const strata::core::OnDevice on(dev0);
-                            if (((void) (s0->memcpy(
-                                    ss.gdn_state,
-                                    pl_snap2[pl_snap_overlap ? (undo_w.seq & 1)
-                                                             : 0],
-                                    pl_snap_bytes)), 0) != 0)
-                                return die("restoring the GDN snapshot failed");
+                            s0->memcpy(ss.gdn_state, pl_snap2[pl_snap_overlap ? (undo_w.seq & 1) : 0], pl_snap_bytes);
                         }
                         ss.ple_prev[0] = undo_ple[0];
                         ss.ple_prev[1] = undo_ple[1];
@@ -9869,13 +9852,8 @@ int main(int argc, char **argv) {
                         if (B.p_on >= theta && B.p + B.T <= o.max_context) {
                             {
                                 const strata::core::OnDevice on(dev0);
-                                if (pl_snap_overlap
-                                        ? ((void) (s0->wait(*pl_snap_ev[A.seq & 1])), 0) !=
-                                              0
-                                        : ((void) (s0->memcpy(
-                                              pl_snap2[0], ss.gdn_state,
-                                              pl_snap_bytes)), 0) != 0)
-                                    return die("the GDN snapshot failed");
+                                if (pl_snap_overlap) s0->wait(*pl_snap_ev[A.seq & 1]);
+                                else s0->memcpy(pl_snap2[0], ss.gdn_state, pl_snap_bytes);
                             }
                             undo_ple[0] = ss.ple_prev[0];
                             undo_ple[1] = ss.ple_prev[1];
@@ -10106,10 +10084,8 @@ int main(int argc, char **argv) {
                     strata::kernels::penalty_rows(consumed.data(), (int64_t) consumed.size(), window.data(), T,
                                                   hist_n, hist_stage.data());
                     const strata::core::OnDevice on_h(hist_dev);
-                    strata::ze::default_stream()
-                        .memcpy(d_hist, hist_stage.data(),
-                                (size_t)T * (size_t)hist_n * sizeof(int32_t))
-                        .wait();
+                    strata::ze::default_stream().memcpy(d_hist, hist_stage.data(), (size_t)T * (size_t)hist_n * sizeof(int32_t));
+                    strata::ze::default_stream().sync();
                 }
                 // the elastic K/V: the window's cells and the drafter's beyond them
                 if (kvg.on && p + T + 64 > kvg.cells &&
@@ -10264,15 +10240,8 @@ int main(int argc, char **argv) {
                     for (size_t offset = 0; hash_ok && offset < bytes;) {
                         const size_t n = std::min(hash_buffer.size(), bytes - offset);
                         // VRAM or a streamed host copy, with fixed diagnostic workspace.
-                        if (((void) (strata::ze::default_stream()
-                                    .memcpy(hash_buffer.data(),
-                                            static_cast<const uint8_t *>(p) +
-                                                offset,
-                                            n)
-                                    .wait()), 0) != 0) {
-                            hash_ok = false;
-                            break;
-                        }
+                        strata::ze::default_stream().memcpy(hash_buffer.data(), static_cast<const uint8_t*>(p) + offset, n);
+                        strata::ze::default_stream().sync();
                         h = fnv1a(hash_buffer.data(), n, h);
                         offset += n;
                     }
@@ -10528,7 +10497,7 @@ int main(int argc, char **argv) {
                              remote_experts[(size_t) r].ms_wait() - wait_before[(size_t) r]);
         }
         save_profile("exit");   // #477: QUIT, or the server closed stdin
-        // SYCL port: the requests are done and their output written; leave without unwinding the GPU objects (the OS
+        // The requests are done and their output written; leave without unwinding the GPU objects (the OS
         // reclaims them). Their destructors ran against a runtime already shutting down and aborted (exit 139).
         try {
             strata::ze::device_sync();
@@ -10640,7 +10609,7 @@ int main(int argc, char **argv) {
                     return 1;
                 }
                 host_res[(size_t) i] = slot;
-                // SYCL port: GgufExpertSource::blob() hands out a ring of 512 buffers, valid until the next blob()
+                // GgufExpertSource::blob() hands out a ring of 512 buffers, valid until the next blob()
                 // call; a queued copy reads its buffer later, so drain before the ring can wrap onto one (938 lent
                 // slots refilled through 512 buffers gave ~426 slots another expert's bytes)
                 if (!refill_blocking() && ++queued % 256 == 0 && !xcache.sync_queued(err)) {
@@ -10761,10 +10730,8 @@ int main(int argc, char **argv) {
             }
         }
         if (final_r != nullptr) {
-            strata::ze::default_stream()
-                .memcpy(final_r_host.data(), ss.R,
-                        final_r_host.size() * sizeof(float))
-                .wait();
+            strata::ze::default_stream().memcpy(final_r_host.data(), ss.R, final_r_host.size() * sizeof(float));
+            strata::ze::default_stream().sync();
             const int64_t posrec[2] = {pos, tok};
             std::fwrite(posrec, sizeof posrec, 1, final_r);
             std::fwrite(final_r_host.data(), sizeof(float), final_r_host.size(), final_r);
@@ -10795,15 +10762,7 @@ int main(int argc, char **argv) {
         // memory access" at a plane offset that has nothing to do with the fault, and the layer that actually
         // faulted had completed its own error checks successfully - because its kernels had not run yet.  A
         // sticky error surfaces at the next SYNCHRONISING call, which is whatever happens to come next.
-        if (!o.stream_token &&
-            ((void) (strata::ze::device_sync()), 0) != 0) {
-            std::fprintf(
-                stderr,
-                "strata generate: the device faulted in lm_head at position "
-                "%lld: %s\n",
-                (long long)pos, "error");
-            return 1;
-        }
+        if (!o.stream_token) strata::ze::device_sync();
         {
             const Clock::time_point n = Clock::now();
             ms_head += std::chrono::duration<double, std::milli>(n - tp).count();
@@ -10812,12 +10771,9 @@ int main(int argc, char **argv) {
         const bool emit_logits = dump != nullptr &&
             strata::program::logits_selection::selected(pos, dump_positions, o.logits_stride);
         const bool read_logits = !o.stream_token || o.check_logits || emit_logits;
-        if (read_logits &&
-            (((void) (strata::ze::stream_of(token_stream)->memcpy(
-                 logits.data(), d_logits, (size_t)n_vocab * 4)), 0) != 0 ||
-             ((void) (strata::ze::stream_of(token_stream)->sync()), 0) != 0)) {
-            std::fprintf(stderr, "strata generate: reading the logits back failed\n");
-            return 1;
+        if (read_logits) {
+            strata::ze::stream_of(token_stream)->memcpy(logits.data(), d_logits, (size_t) n_vocab * 4);
+            strata::ze::stream_of(token_stream)->sync();
         }
         int bad = 0;
         if (read_logits) for (float v : logits) if (!std::isfinite(v)) ++bad;
@@ -10855,15 +10811,8 @@ int main(int argc, char **argv) {
         // the same text whether a token comes from this path or from the speculative loop below.
         sp.counter = (uint64_t) pos;
         strata::kernels::sample_tokens(d_logits, 1, (int) n_vocab, nullptr, 0, sp, d_next, token_stream);
-        if (((void) (strata::ze::stream_of(token_stream)->memcpy(
-                &next, d_next, sizeof(int))), 0) != 0 ||
-            ((void) (strata::ze::stream_of(token_stream)->sync()), 0) != 0) {
-            std::fprintf(
-                stderr,
-                "strata generate: reading the sampled token back failed: %s\n",
-                "error");
-            return 1;
-        }
+        strata::ze::stream_of(token_stream)->memcpy(&next, d_next, sizeof(int));
+        strata::ze::stream_of(token_stream)->sync();
         // The sampled-token synchronization also completes every captured QSA
         // status readback. Retain one status per layer so a later layer cannot
         // hide an earlier failure; no extra synchronization or token allocation.
@@ -11004,12 +10953,7 @@ int main(int argc, char **argv) {
         int64_t swaps_total = 0;
         double ms_adapt = 0;
         strata::ze::Stream* adapt_stream = &strata::ze::default_stream();
-        if (!drive.d.usage.empty() &&
-            ((void) (adapt_stream = new strata::ze::Stream()), 0) !=
-                0) {
-            std::fprintf(stderr, "strata generate: cannot create the refill stream\n");
-            return 1;
-        }
+        if (!drive.d.usage.empty()) adapt_stream = new strata::ze::Stream();
         // plan v0.3 P6: swaps in flight - (residency index, slot) admitted when adapt_ev has completed
         std::vector<std::pair<int32_t, int32_t>> pending;
         int pending_age = 0;   // the windows the pending swaps have waited (adapt_lag)
@@ -11021,9 +10965,7 @@ int main(int argc, char **argv) {
             // STRATA_TRACE_ADAPT=1: whether a round's copies had landed when the next window read the table
             static const bool trace_pending = std::getenv("STRATA_TRACE_ADAPT") != nullptr;
             if (wait) adapt_ev->sync();
-            else if (adapt_ev->get_info<
-                         sycl::info::event::command_execution_status>() !=
-                     sycl::info::event_command_status::complete) {
+            else if (!adapt_ev->query()) {
                 if (trace_pending)
                     std::fprintf(stderr, "strata: PENDING not landed, %zu stay non-resident this window\n",
                                  pending.size());
@@ -11149,7 +11091,7 @@ int main(int argc, char **argv) {
         // plan v0.3 P6: with a native pack the first window is the last prompt token alone (it produces the first
         // generated token and the MTP's first cell); otherwise the token loop already did that.
         bool first_window = native_pack;
-        // SYCL port: every window graph and the drafter's graphs are captured here, once, instead of on first use in
+        // Every window graph and the drafter's graphs are captured here, once, instead of on first use in
         // the loop below (STRATA_WARM_GRAPHS=0: as before). A server pays this once per process, not per request.
         {
             static const bool warm_on = [] { const char* v = std::getenv("STRATA_WARM_GRAPHS"); return !(v && v[0] == '0'); }();
@@ -11269,10 +11211,8 @@ int main(int argc, char **argv) {
             if (hashes != nullptr) {   // FNV-1a over the window's final residual rows (a test path: a plain copy)
                 const size_t n_floats = (size_t) T * (size_t) (g.hc * g.n_embd);
                 hash_rows.resize(n_floats);
-                strata::ze::default_stream()
-                    .memcpy(hash_rows.data(), ver.final_R_all(),
-                            n_floats * sizeof(float))
-                    .wait();
+                strata::ze::default_stream().memcpy(hash_rows.data(), ver.final_R_all(), n_floats * sizeof(float));
+                strata::ze::default_stream().sync();
                 uint64_t h = 1469598103934665603ull;
                 const auto* bytes = (const uint8_t*) hash_rows.data();
                 for (size_t i = 0; i < n_floats * sizeof(float); ++i) h = (h ^ bytes[i]) * 1099511628211ull;
@@ -11567,13 +11507,8 @@ int main(int argc, char **argv) {
                     prefill_ms > 0 ? 1000.0 * (double) (n_prompt - 1) / prefill_ms : 0.0, ttft_ms);
     if (!o.dump_mixed.empty()) {
         std::vector<float> mx((size_t) g.n_embd);
-        if (((void) (strata::ze::default_stream()
-                                 .memcpy(mx.data(), ss.block.mixed,
-                                         mx.size() * sizeof(float))
-                                 .wait()), 0) != 0) {
-            std::fprintf(stderr, "strata generate: reading mixed back failed\n");
-            return 1;
-        }
+        strata::ze::default_stream().memcpy(mx.data(), ss.block.mixed, mx.size() * sizeof(float));
+        strata::ze::default_stream().sync();
         std::FILE* mf = std::fopen(o.dump_mixed.c_str(), "wb");
         if (mf == nullptr) {
             std::fprintf(stderr, "strata generate: cannot write %s\n", o.dump_mixed.c_str());
@@ -11590,12 +11525,8 @@ int main(int argc, char **argv) {
     // ---- the residual, for bisecting the head against the layers (see `dump_residual`'s note)
     if (!o.dump_residual.empty()) {
         std::vector<float> R((size_t) g.hc * g.n_embd);
-        if (((void) (strata::ze::default_stream()
-                    .memcpy(R.data(), ss.R, R.size() * sizeof(float))
-                    .wait()), 0) != 0) {
-            std::fprintf(stderr, "strata generate: reading R back failed\n");
-            return 1;
-        }
+        strata::ze::default_stream().memcpy(R.data(), ss.R, R.size() * sizeof(float));
+        strata::ze::default_stream().sync();
         std::FILE* rf = std::fopen(o.dump_residual.c_str(), "wb");
         if (rf == nullptr) {
             std::fprintf(stderr, "strata generate: cannot write %s\n", o.dump_residual.c_str());

@@ -235,8 +235,12 @@ strata_resolve(_main src/program/generate.cpp)
 add_executable(strata ${_main})
 target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec)
 
+# the prompt path's XMX GEMM against a double-precision CPU product at the model's shapes (--bench: its speed)
+add_executable(xgemm_parity ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill/xgemm_parity.cpp)
+target_link_libraries(xgemm_parity PRIVATE strata_prefill)
+
 # --- the kernel parity self-tests (each runs on the card and compares against a CPU reference) ---------------------
-option(STRATA_SYCL_PARITY "Build the kernel parity tests" OFF)
+option(STRATA_SYCL_PARITY "Build the kernel parity tests" ON)
 if(STRATA_SYCL_PARITY)
   enable_testing()
   foreach(p IN ITEMS dequant_s2 s2_gemv shared_expert gr gdn s2_gemv_q8 sampler rope quantize_act router_top10
@@ -322,7 +326,10 @@ if(STRATA_SYCL_PARITY)
     add_test(NAME ${p}_parity COMMAND ${p}_parity)
   endforeach()
   # not built here: qsa_topk_parity / qsa_topk_active_parity (the sm_90 thread-block-cluster QSA top-k has no SYCL
-  # counterpart: the callers take the plain kernels), route_window_parity and fused_gr_bench (no migrated copy yet)
+  # counterpart: the callers take the plain kernels), route_window_parity and fused_gr_bench (no migrated copy yet);
+  # on the SYCL runtime still, not moved to Level Zero: native_expert_parity, q5_projection_parity, the benches
+  # (dequant_bench, mmvq_bench, mmvq_sg_bench, q6k_align_bench, gr_bench) and the probes (sycl_router_fast,
+  # sycl_payload_pairs); xmx_gemm_bench and xmx_group_parity take their reference from oneMKL, which is gone
   # (upstream PR #413's gdn_rec_parity is an SM-holding NVIDIA bench - PTX timers, __nanosleep - not built here; the
   # key-head kernel is checked through the engine: output hashes with STRATA_GDN_KEYHEAD=1 and without)
   # the conversation snapshots (#216) against the engine, as upstream's STRATA_BUILD_CONVERSATION_TESTS
@@ -342,33 +349,8 @@ if(STRATA_SYCL_PARITY)
   add_executable(kv_hybrid_parity ${_src})
   target_include_directories(kv_hybrid_parity PRIVATE ${STRATA_ROOT}/src/kernels)
   target_link_libraries(kv_hybrid_parity PRIVATE strata_kernels)
-  add_executable(dequant_bench ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/dequant_bench.cpp)   # prompt-path expert dequant timing + output hash
-  target_link_libraries(dequant_bench PRIVATE strata_kernels)
-  add_executable(mmvq_bench ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/mmvq_bench.cpp)   # dense mmvq timing
-  target_link_libraries(mmvq_bench PRIVATE strata_kernels)
-  add_executable(mmvq_sg_bench ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/mmvq_sg_bench.cpp)   # SIMD16 vs 32 decode mmvq
-  target_link_libraries(mmvq_sg_bench PRIVATE strata_kernels)
-  add_executable(q6k_align_bench ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/q6k_align_bench.cpp)   # Q6_K block alignment
-  target_link_libraries(q6k_align_bench PRIVATE strata_kernels)
-  add_executable(gr_bench ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/gr_bench.cpp)   # fused GR read timing
-  target_link_libraries(gr_bench PRIVATE strata_kernels)
-  add_executable(sycl_router_fast ${CMAKE_CURRENT_SOURCE_DIR}/probe/router_fast.cpp)
-  target_link_libraries(sycl_router_fast PRIVATE strata_kernels)
-  add_test(NAME sycl_router_fast COMMAND sycl_router_fast)
-  set_tests_properties(sycl_router_fast PROPERTIES ENVIRONMENT "STRATA_SYCL_A770_FAST=1")
-  add_executable(sycl_payload_pairs ${CMAKE_CURRENT_SOURCE_DIR}/probe/payload_pairs.cpp)
-  target_link_libraries(sycl_payload_pairs PRIVATE strata_kernels)
-  add_test(NAME sycl_payload_pairs COMMAND sycl_payload_pairs)
-  set_tests_properties(sycl_payload_pairs PROPERTIES ENVIRONMENT "STRATA_SYCL_A770_FAST=1;STRATA_DOORBELL_CHECK=1")   # opt-in paths; publish_res copies x only with the check
-  add_executable(xmx_gemm_bench ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/xmx_gemm_bench.cpp)   # XMX quantized GEMM vs dequant+oneMKL
-  target_link_libraries(xmx_gemm_bench PRIVATE strata_kernels strata_prefill)   # -qmkl for the oneMKL reference
-  add_executable(xmx_group_parity ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/xmx_group_parity.cpp)   # A770: fused grouped XMX
-  target_link_libraries(xmx_group_parity PRIVATE strata_kernels strata_prefill)
-  # one native expert three ways on real GGUF rows (ggml reference, CPU path, GPU native_expert_grouped):
-  #   native_expert_parity <shard1.gguf> [layer ...]
-  if(STRATA_NATIVE_EXPERTS)
-    add_executable(native_expert_parity ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/native_expert_parity.cpp)
-    target_include_directories(native_expert_parity PRIVATE ${STRATA_ROOT}/third_party/ggml)
-    target_link_libraries(native_expert_parity PRIVATE strata_kernels strata_kernels_cpu)
-  endif()
+  # the multi_exact contract of native_mmvq, bitwise (upstream 0.1.40). Built, not registered.
+  strata_resolve(_src src/kernels/mmvq_multi_parity.cpp)
+  add_executable(mmvq_multi_parity ${_src})
+  target_link_libraries(mmvq_multi_parity PRIVATE strata_kernels)
 endif()

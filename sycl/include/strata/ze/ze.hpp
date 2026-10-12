@@ -239,7 +239,10 @@ public:
     bool query();
     /// Host wait for the last record. Exits on DEVICE_LOST.
     void sync();
-    /// Milliseconds between two recorded timing events, both complete.
+    /// True once the event was recorded (in a stream or inside a capture).
+    bool recorded() const { return recorded_; }
+    /// Milliseconds between two recorded timing events, both complete. A timing event recorded inside a capture carries
+    /// the GPU time of the graph's last replay.
     float elapsed_ms_since(const Event& start) const;
 
 private:
@@ -283,7 +286,8 @@ void host_func(Stream& s, void (*fn)(void*), void* arg);
 /// STRATA_ZE_REPORT=1: one line of counters (allocations by kind, appends, graph replays, host waits) to stderr.
 void report(const char* when);
 
-/// Exits the process when a launch would be invalid: zero-sized geometry or a group above the device's limit.
+/// Exits the process when a launch would be invalid: an empty group or one above 1024 work-items. A grid with a zero
+/// dimension launches nothing (as in SYCL and CUDA).
 void check_geometry(const KernelBase& k, Dim3 grid, Dim3 block);
 
 template <class... P>

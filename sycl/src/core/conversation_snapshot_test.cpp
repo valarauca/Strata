@@ -1,6 +1,4 @@
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
+#include "strata/ze/ze.hpp"
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/core/conversation_file.hpp"
 #include "strata/kernels/kv_q4.hpp"
@@ -25,13 +23,6 @@ void check(bool ok, const char* label) {
     ++checks;
     if (!ok) { std::fprintf(stderr, "FAIL: %s\n", label); std::exit(1); }
 }
-void cuda_check(dpct::err0 e) {
-    /*
-    DPCT1009: SYCL reports errors using exceptions and does not use error
-    codes. Please replace the "get_error_string_dummy(...)" with a real
-    error-handling function.
-    */
-}
 struct Fixture {
     ModelGeometry g;
     QsaState state;
@@ -43,21 +34,14 @@ struct Fixture {
         if (!n) return;
         void* raw = nullptr;
         if (pinned) {
-            /*
-            DPCT1048: The original value cudaHostAllocMapped is not
-            meaningful in the migrated code and was removed or replaced with 0.
-            You may need to check the migrated code.
-            */
-            cuda_check(DPCT_CHECK_ERROR(raw = (void *)sycl::malloc_host(
-                                            n, dpct::get_in_order_queue())));
+            raw = strata::ze::malloc_host(n);
             host.push_back(raw);
             void* mapped = nullptr;
-            cuda_check(DPCT_CHECK_ERROR(mapped = (void *)raw));
+            mapped = raw;
             p = static_cast<T*>(mapped);
         } else {
-            cuda_check(DPCT_CHECK_ERROR(raw = (void *)sycl::malloc_device(
-                                            n, dpct::get_in_order_queue())));
-                device.push_back(raw); p = static_cast<T *>(raw);
+            raw = strata::ze::malloc_device(n);
+            device.push_back(raw); p = static_cast<T *>(raw);
         }
     }
     Fixture(int fmt, int mode) {
@@ -107,28 +91,26 @@ struct Fixture {
         for (size_t i=0;i<sources.size();++i) {
             std::vector<uint8_t> data(sizes[i]);
             for (size_t j=0;j<data.size();++j) data[j]=(uint8_t)(salt+i*31+j*7+j/257);
-            if (!data.empty()) cuda_check(DPCT_CHECK_ERROR(
-                dpct::get_in_order_queue()
-                    .memcpy(sources[i], data.data(), data.size())
-                    .wait()));
+            if (!data.empty()) {
+                strata::ze::default_stream().memcpy(sources[i], data.data(), data.size());
+                strata::ze::default_stream().sync();
+            }
         }
     }
     void fill_after(uint8_t salt, int64_t first_dirty) {
         for (size_t i=0;i<sources.size();++i) {
             const size_t offset = i == 4 ? size_t(first_dirty/4)*g.idx_key_dim*4
                                          : (sizes[i]/size_t(state.max_cells))*size_t((first_dirty/4)*4);
-            if (sizes[i] > offset)
-                cuda_check(DPCT_CHECK_ERROR(
-                    dpct::get_in_order_queue()
-                        .memset(static_cast<uint8_t *>(sources[i]) + offset,
-                                salt, sizes[i] - offset)
-                        .wait()));
+            if (sizes[i] > offset) {
+                strata::ze::default_stream().memset(static_cast<uint8_t *>(sources[i]) + offset, salt, sizes[i] - offset);
+                strata::ze::default_stream().sync();
+            }
         }
     }
     ~Fixture() {
         for (void *p : device)
-            DPCT_CHECK_ERROR(sycl::free(p, dpct::get_in_order_queue()));
-        for (void *p : host) DPCT_CHECK_ERROR(sycl::free(p, dpct::get_in_order_queue()));
+            strata::ze::free(p);
+        for (void *p : host) strata::ze::free(p);
     }
 };
 bool equal(const ConversationKv& a,const ConversationKv& b) {
@@ -154,25 +136,18 @@ void full_session(int fmt, int mode, int experts) {
     std::vector<ConversationImageKey> images;
     std::vector<ConversationCheckpoint> checkpoints;
     auto fill = [&](uint8_t salt) {
-        try {
-    main.fill(salt); draft.fill(salt);
+        main.fill(salt); draft.fill(salt);
         for (const auto& [p,n] : std::vector<std::pair<void*,size_t>>{
                  {ss.gdn_state,sizes.gdn},{ss.ple_hist,sizes.ple},{main.state.idx_tail,sizes.tail},
-                 {main.state.idx_dead,sizes.dead},{main.state.idx_block_pos,sizes.block_pos}})
-            cuda_check(DPCT_CHECK_ERROR(
-                dpct::get_in_order_queue().memset(p, salt, n).wait()));
+                 {main.state.idx_dead,sizes.dead},{main.state.idx_block_pos,sizes.block_pos}}) {
+            strata::ze::default_stream().memset(p, salt, n);
+            strata::ze::default_stream().sync();
+        }
         // A real indexer maintains its spare pooled row as a copy of idx_dead.
-        cuda_check(DPCT_CHECK_ERROR(dpct::get_in_order_queue().memcpy(
-            main.state.idx_pooled + (ids.size() / 4) * g.idx_key_dim,
-            main.state.idx_dead, sizes.dead).wait()));
-        cuda_check(DPCT_CHECK_ERROR(
-            dpct::get_current_device().queues_wait_and_throw()));
-    }
-    catch (sycl::exception const &exc) {
-      std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-                << ", line:" << __LINE__ << std::endl;
-      std::exit(1);
-    }
+        strata::ze::default_stream().memcpy(main.state.idx_pooled + (ids.size() / 4) * g.idx_key_dim,
+                                            main.state.idx_dead, sizes.dead);
+        strata::ze::default_stream().sync();
+        strata::ze::device_sync();
     };
     fill(13);
     ConversationCheckpoint checkpoint;
@@ -234,14 +209,13 @@ void full_session(int fmt, int mode, int experts) {
         const uint8_t* original = nullptr;
         reuse.kv[0].k.visit(0,1,[&](const uint8_t* p,size_t,size_t){original=p;return true;});
         main.fill_after(91,dirty); draft.fill_after(91,std::max<int64_t>(0,dirty-1));
-        cuda_check(DPCT_CHECK_ERROR(dpct::get_in_order_queue()
-                                        .memset(ss.gdn_state, 91, sizes.gdn)
-                                        .wait()));
+        strata::ze::default_stream().memset(ss.gdn_state, 91, sizes.gdn);
+        strata::ze::default_stream().sync();
         ids.resize(70);
         for (size_t i=65;i<ids.size();++i) ids[i]=int32_t(i+1);
-        cuda_check(DPCT_CHECK_ERROR(dpct::get_in_order_queue().memcpy(
-            main.state.idx_pooled + (ids.size() / 4) * g.idx_key_dim,
-            main.state.idx_dead, sizes.dead).wait()));
+        strata::ze::default_stream().memcpy(main.state.idx_pooled + (ids.size() / 4) * g.idx_key_dim,
+                                            main.state.idx_dead, sizes.dead);
+        strata::ze::default_stream().sync();
         SavedConversation fresh,incremental;
         check(conversation_snapshot_save(fresh,view,ss,g,draft.state,err),"full capture reference after growth or rewind");
         size_t peak=0,reused=0;
@@ -303,10 +277,8 @@ void full_session(int fmt, int mode, int experts) {
     check(conversation_snapshot_restore(a,ss,g,draft.state,err)==ConversationRestore::restored,"restore A after stage images");
     check(conversation_checkpoint_restore(a.checkpoints[0],ss,g,err),"restore early running checkpoint");
     std::vector<uint8_t> spare(sizes.dead);
-    cuda_check(DPCT_CHECK_ERROR(
-        dpct::get_in_order_queue()
-            .memcpy(spare.data(), main.state.idx_pooled, sizes.dead)
-            .wait()));
+    strata::ze::default_stream().memcpy(spare.data(), main.state.idx_pooled, sizes.dead);
+    strata::ze::default_stream().sync();
     check(spare==a.checkpoints[0].dead,"checkpoint rebuilds spare row over a later completed block");
     check(ss.ple_prev[0]==2 && ss.ple_prev[1]==3,"checkpoint PLE token window");
 }
@@ -314,8 +286,8 @@ void full_session(int fmt, int mode, int experts) {
 
 int main() {
     int devices=0;
-    if (DPCT_CHECK_ERROR(devices = dpct::device_count()) != 0 ||
-        !devices) return 77;
+    devices = strata::ze::device_count();
+    if (!devices) return 77;
     for (int fmt : std::array<int,4>{kKvF16,kKvInt8,kKvQ4,3}) for (int mode : {0,1,2}) {
         if (fmt==3 && mode!=0) continue;
         Fixture f(fmt,mode);
@@ -343,16 +315,14 @@ int main() {
             std::string err;
             f.fill(13);
             ConversationKv a,b,restored;
-            cuda_check(DPCT_CHECK_ERROR(
-                dpct::get_current_device().queues_wait_and_throw()));
+            strata::ze::device_sync();
             check(conversation_kv_save(a,f.state,f.g,upto,index,err),"save A");
             check(a.bytes()==conversation_kv_bytes(f.state,f.g,upto,index),"size estimate equals snapshot payload");
             f.fill(177);
             check(conversation_kv_save(b,f.state,f.g,upto,index,err),"save B");
             check(upto==0 || !equal(a,b),"fixture changes state");
             check(conversation_kv_restore(a,f.state,f.g,upto,index,err),"restore A over B");
-            cuda_check(DPCT_CHECK_ERROR(
-                dpct::get_current_device().queues_wait_and_throw()));
+            strata::ze::device_sync();
             check(conversation_kv_save(restored,f.state,f.g,upto,index,err),"read back restored A");
             check(equal(a,restored),"A/B/A byte-exact K/V and indexer state");
             uint64_t fingerprint = 0;
@@ -378,11 +348,8 @@ int main() {
             }
             if (mode==1) {
                 std::vector<int32_t> table((size_t)f.state.n_pages);
-                cuda_check(DPCT_CHECK_ERROR(dpct::get_in_order_queue()
-                                                .memcpy(table.data(),
-                                                        f.state.page_table,
-                                                        table.size() * 4)
-                                                .wait()));
+                strata::ze::default_stream().memcpy(table.data(), f.state.page_table, table.size() * 4);
+                strata::ze::default_stream().sync();
                 check(std::all_of(table.begin(),table.end(),[](int32_t x){return x==-1;}),"stale VRAM pages invalidated");
             }
             if (mode==2 && upto>0) {
@@ -394,13 +361,10 @@ int main() {
                 const void* slots=fmt==kKvQ4?(void*)f.state.k_q4:fmt==kKvInt8?(void*)f.state.k_q:(void*)f.state.k_pool;
                 std::vector<uint8_t> got(code_block);
                 for (int64_t page=b0;page<b1;++page) {
-                    cuda_check(DPCT_CHECK_ERROR(
-                        dpct::get_in_order_queue()
-                            .memcpy(got.data(),
-                                    (const uint8_t *)slots +
-                                        (page % f.state.n_slots) * code_block,
-                                    code_block)
-                            .wait()));
+                    strata::ze::default_stream().memcpy(got.data(),
+                                                        (const uint8_t *)slots + (page % f.state.n_slots) * code_block,
+                                                        code_block);
+                    strata::ze::default_stream().sync();
                     std::vector<uint8_t> expected(code_block);
                     check(a.k.read(expected.data(), page*code_block, code_block),"read segmented expected draft page");
                     check(got == expected,"draft ring contains restored pages");

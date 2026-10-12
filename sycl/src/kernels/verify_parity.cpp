@@ -4,9 +4,7 @@
 // accepted exactly when greedy decode would have produced them), so every kernel here is checked against the
 // one it stands in for, on random inputs that include -0.0, denormals, NaN, -inf and large values.  The tests
 // follow eddoursul's fork (MIT; verify_parity.cpp), ported to this tree's kernels.
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
+#include "strata/ze/ze.hpp"
 #include "strata/kernels/sampler.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 
@@ -27,53 +25,45 @@
 
 namespace {
 
-void check(dpct::err0 e, const char *what) {
+/// cudaMemcpy: after the device's queued work, complete on return.
+void memcpy_sync(void* dst, const void* src, size_t bytes) {
+    strata::ze::device_sync();
+    strata::ze::default_stream().memcpy(dst, src, bytes);
+    strata::ze::default_stream().sync();
+}
+
+/// cudaMemset: after the device's queued work, complete on return.
+void memset_sync(void* dst, int value, size_t bytes) {
+    strata::ze::device_sync();
+    strata::ze::default_stream().memset(dst, value, bytes);
+    strata::ze::default_stream().sync();
 }
 
 template <typename T> T* dev(size_t n) {
     T* p = nullptr;
-    check(DPCT_CHECK_ERROR(p = (T *)sycl::malloc_device(
-                               n * sizeof(T), dpct::get_in_order_queue())),
-          "cudaMalloc");
+    p = (T*) strata::ze::malloc_device(n * sizeof(T));
     return p;
 }
 template <typename T> void up(T* d, const std::vector<T>& h) {
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming in
-    the original code the source host memory is pageable memory. If the memory
-    is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-              d, h.data(), h.size() * sizeof(T)).wait()),
-          "upload");
+    memcpy_sync(d, h.data(), h.size() * sizeof(T));
 }
 template <typename T> std::vector<T> down(const T* d, size_t n) {
     std::vector<T> h(n);
-    check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                               .memcpy(h.data(), d, n * sizeof(T))
-                               .wait()),
-          "download");
+    memcpy_sync(h.data(), d, n * sizeof(T));
     return h;
 }
 
 // argmax_rows against sample_tokens' greedy pick and row_top_prob_split against row_top_prob, bitwise: rows of both
 // vocabularies with ties at the maximum (the lowest index wins), NaN, -inf, a row with no value above -inf, and
 // launches repeated on one scratch (each must leave its counters at zero)
-int test_argmax(std::mt19937 &rng, dpct::queue_ptr s) {
+int test_argmax(std::mt19937 &rng, strata::ze::Stream* s) {
     using namespace strata::kernels;
     int bad = 0;
     std::normal_distribution<float> nd(0.0f, 4.0f);
     uint8_t* sa = dev<uint8_t>(argmax_rows_scratch_bytes(8));   // one scratch for every row count, as in the engine
     uint8_t* st = dev<uint8_t>(row_top_prob_scratch_bytes(8));
-    check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                               .memset(sa, 0, argmax_rows_scratch_bytes(8))
-                               .wait()),
-          "memset");
-    check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                               .memset(st, 0, row_top_prob_scratch_bytes(8))
-                               .wait()),
-          "memset");
+    memset_sync(sa, 0, argmax_rows_scratch_bytes(8));
+    memset_sync(st, 0, row_top_prob_scratch_bytes(8));
     for (const int n : {248320, 40525, 4097, 33}) {
         for (const int rows : {4, 8, 1, 3, 8, 2}) {
             std::vector<float> h((size_t) rows * n);
@@ -101,7 +91,7 @@ int test_argmax(std::mt19937 &rng, dpct::queue_ptr s) {
             for (int rep = 0; rep < 3; ++rep) {
                 argmax_rows(d_l, rows, n, sa, d_out, s);
                 row_top_prob_split(d_l, rows, n, d_out, d_p2, st, s);
-                check(DPCT_CHECK_ERROR(s->wait()), "argmax");
+                s->sync();
                 const std::vector<int> ref = down(d_ref, rows);
                 const std::vector<int32_t> out = down(d_out, rows);
                 const std::vector<float> p1 = down(d_p1, rows), p2 = down(d_p2, rows);
@@ -113,15 +103,15 @@ int test_argmax(std::mt19937 &rng, dpct::queue_ptr s) {
                         ++bad;
                     }
             }
-            sycl::free(d_l, dpct::get_in_order_queue());
-                sycl::free(d_ref, dpct::get_in_order_queue());
-                sycl::free(d_out, dpct::get_in_order_queue());
-                sycl::free(d_p1, dpct::get_in_order_queue());
-                sycl::free(d_p2, dpct::get_in_order_queue());
+            strata::ze::free(d_l);
+            strata::ze::free(d_ref);
+            strata::ze::free(d_out);
+            strata::ze::free(d_p1);
+            strata::ze::free(d_p2);
         }
     }
-    sycl::free(sa, dpct::get_in_order_queue());
-    sycl::free(st, dpct::get_in_order_queue());
+    strata::ze::free(sa);
+    strata::ze::free(st);
     std::printf("argmax_rows, row_top_prob_split: %s\n",
                 bad ? "MISMATCH" : "bitwise equal to the one-block kernels (ties, NaN, -inf, 1-8 rows on one scratch)");
     return bad;
@@ -137,12 +127,10 @@ int main(int argc, char** argv) {
         }
     }
     std::mt19937 rng(20260925);
-    dpct::queue_ptr s = &dpct::get_in_order_queue();
-    check(DPCT_CHECK_ERROR(s = dpct::get_current_device().create_queue(true)),
-          "stream");
+    strata::ze::Stream* s = new strata::ze::Stream();
     int bad = 0;
     bad += test_argmax(rng, s);
-    dpct::get_current_device().destroy_queue(s);
+    delete s;
     std::printf("verify_parity: %s\n", bad ? "FAIL" : "PASS");
     return bad ? 1 : 0;
 }

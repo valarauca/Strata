@@ -46,9 +46,7 @@
 //   * the attention against a reference reading the f32 keys: REPORTED and then checked against the phase's
 //     1e-3 for FP16 paths.  That difference is the FP16 CACHE's cost, not the kernel's, and it is kept
 //     separate so a kernel bug cannot hide inside it.
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
+#include "strata/ze/ze.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/native_qsa_indexer.hpp"
 
@@ -70,7 +68,18 @@ namespace {
 using strata::kernels::f16_from_f32;
 using strata::kernels::f32_from_f16;
 
-void check(dpct::err0 e, const char *what) {
+/// cudaMemcpy: after the device's queued work, complete on return.
+void memcpy_sync(void* dst, const void* src, size_t bytes) {
+    strata::ze::device_sync();
+    strata::ze::default_stream().memcpy(dst, src, bytes);
+    strata::ze::default_stream().sync();
+}
+
+/// cudaMemset: after the device's queued work, complete on return.
+void memset_sync(void* dst, int value, size_t bytes) {
+    strata::ze::device_sync();
+    strata::ze::default_stream().memset(dst, value, bytes);
+    strata::ze::default_stream().sync();
 }
 
 /// A device buffer with the boilerplate folded in.  A test that allocates twenty buffers by hand spends its
@@ -80,34 +89,20 @@ struct Dev {
     T* p = nullptr;
     Dev() = default;
     explicit Dev(size_t n) { alloc(n); }
-    ~Dev() { if (p) sycl::free(p, dpct::get_in_order_queue()); }
+    ~Dev() { if (p) strata::ze::free(p); }
     Dev(const Dev&) = delete;
     Dev& operator=(const Dev&) = delete;
     void alloc(size_t n) {
-        if (p) { sycl::free(p, dpct::get_in_order_queue()); p = nullptr; }
-        if (n) check(
-            DPCT_CHECK_ERROR(p = (T *)sycl::malloc_device(
-                                 n * sizeof(T), dpct::get_in_order_queue())),
-            "cudaMalloc");
+        if (p) { strata::ze::free(p); p = nullptr; }
+        if (n) p = (T*) strata::ze::malloc_device(n * sizeof(T));
     }
     void put(const std::vector<T>& v) {
         if (!p) alloc(v.size());
-        /*
-        DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-        assuming in the original code the source host memory is pageable memory.
-        If the memory is not pageable, call wait() on event return by memcpy API
-        to ensure synchronization behavior.
-        */
-        check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-                  p, v.data(), v.size() * sizeof(T)).wait()),
-              "H2D");
+        memcpy_sync(p, v.data(), v.size() * sizeof(T));
     }
     std::vector<T> get(size_t n) const {
         std::vector<T> v(n);
-        check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                   .memcpy(v.data(), p, n * sizeof(T))
-                                   .wait()),
-              "D2H");
+        memcpy_sync(v.data(), p, n * sizeof(T));
         return v;
     }
 };
@@ -585,17 +580,9 @@ int main(int argc, char** argv) {
         strata::kernels::QsaIndexerBuffers bufs{dtail.p, ddead.p, dpooled.p, dblockpos.p};
         Dev<float> draw((size_t) IDXD);
         for (int64_t t = 0; t < NT; ++t) {      // one cell at a time: the tail is a ring and the spare row MOVES
-            check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                       .memcpy(draw.p,
-                                               &raw_flat[(size_t)t * IDXD],
-                                               (size_t)IDXD * 4)
-                                       .wait()),
-                  "raw");
+            memcpy_sync(draw.p, &raw_flat[(size_t)t * IDXD], (size_t)IDXD * 4);
             const int32_t tpos = (int32_t) t;
-            check(
-                DPCT_CHECK_ERROR(
-                    (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(dpos.p, &tpos, 4).wait()),
-                "pos");
+            memcpy_sync(dpos.p, &tpos, 4);
             strata::kernels::indexer_key_append(draw.p, dpos.p, POS_BASE, dw_kn.p, EPS, bufs, S, dcos.p, dsin.p,
                                                 nullptr);
         }
@@ -786,24 +773,11 @@ int main(int argc, char** argv) {
         pooled.put(std::vector<float>((size_t) max_blocks * IDXD, 0.0f));
         query.put(std::vector<float>((size_t) IDXN * IDXD, 0.0f));
 
-        dpct::queue_ptr stream;
-        dpct::experimental::command_graph_ptr graph;
-        dpct::experimental::command_graph_exec_ptr exec;
-        check(DPCT_CHECK_ERROR(
-                  stream = dpct::get_current_device().create_queue(true)),
-              "tail stream");
-        check(DPCT_CHECK_ERROR(dpct::experimental::begin_recording(stream)),
-              "tail capture begin");
+        strata::ze::Stream* stream = new strata::ze::Stream();
+        stream->begin_capture();
         strata::kernels::qsa_index_step(pooled.p, query.p, nullptr, S, step.p, max_blocks, scores.p, stream);
         strata::kernels::topk_512_step(scores.p, S, cap, step.p, ids.p, stream);
-        check(
-            DPCT_CHECK_ERROR(dpct::experimental::end_recording(stream, &graph)),
-            "tail capture end");
-        check(DPCT_CHECK_ERROR(
-                  exec = new sycl::ext::oneapi::experimental::command_graph<
-                      sycl::ext::oneapi::experimental::graph_state::executable>(
-                      graph->finalize())),
-              "tail instantiate");
+        strata::ze::Graph* graph = stream->end_capture();
 
         const std::vector<int64_t> counts = {
             1, 2, 3, 4, 511, 512, 513, 2046, 2047, 2048, 2049, 2050, 2051,
@@ -823,9 +797,8 @@ int main(int argc, char** argv) {
             std::vector<int32_t> values(strata::kernels::kStepCount);
             strata::kernels::qsa_step_fill(values.data(), n - 1, S);
             step.put(values);
-            check(DPCT_CHECK_ERROR(stream->ext_oneapi_graph(*exec)),
-                  "tail replay");
-            check(DPCT_CHECK_ERROR(stream->wait()), "tail replay sync");
+            stream->launch(*graph);
+            stream->sync();
             require("tail captured n=" + std::to_string(n), ids.get((size_t) width) == want);
             const auto actual_scores = scores.get((size_t) n);
             bool exact_scores = true;
@@ -835,11 +808,8 @@ int main(int argc, char** argv) {
             }
             require("  only incomplete cells receive the bias", exact_scores);
         }
-        check(DPCT_CHECK_ERROR(delete (exec)), "tail exec destroy");
-        check(DPCT_CHECK_ERROR(delete (graph)), "tail graph destroy");
-        check(
-            DPCT_CHECK_ERROR(dpct::get_current_device().destroy_queue(stream)),
-            "tail stream destroy");
+        delete graph;
+        delete stream;
     }
 
     // ================= 4. topk_512, against an independent sort =================
@@ -1059,16 +1029,9 @@ int main(int argc, char** argv) {
         Dev<float> draw((size_t) IDXD);
         strata::kernels::QsaIndexerBuffers bufs{dptail.p, dpdead.p, dpp.p, dblockpos2.p};
         for (int64_t t = 0; t < T; ++t) {
-            check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                       .memcpy(draw.p, &praw[(size_t)t * IDXD],
-                                               (size_t)IDXD * 4)
-                                       .wait()),
-                  "raw");
+            memcpy_sync(draw.p, &praw[(size_t)t * IDXD], (size_t)IDXD * 4);
             const int32_t tpos = (int32_t) t;
-            check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                       .memcpy(dpos2.p, &tpos, 4)
-                                       .wait()),
-                  "pos2");
+            memcpy_sync(dpos2.p, &tpos, 4);
             strata::kernels::indexer_key_append(draw.p, dpos2.p, 0, dw_kn.p, EPS, bufs, S, dcos.p, dsin.p,
                                                 nullptr);
         }
@@ -1285,33 +1248,19 @@ int main(int argc, char** argv) {
         for (auto& x : qv) x = rnd(1.0);
         dq.put(qv);
 
-        auto timeit = [&](const std::string &name, int reps,
-                          const std::function<void()> &fn) {
-            try {
-        dpct::event_ptr a, b;
-            a = new sycl::event();
-            b = new sycl::event();
+        auto timeit = [&](const std::string& name, int reps, const std::function<void()>& fn) {
+            strata::ze::Event* a = new strata::ze::Event(true);
+            strata::ze::Event* b = new strata::ze::Event(true);
             fn();
-            dpct::get_current_device().queues_wait_and_throw();
-            dpct::sync_barrier(a);
+            strata::ze::device_sync();
+            strata::ze::default_stream().record(*a);
             for (int i = 0; i < reps; ++i) fn();
-            dpct::sync_barrier(b);
-            b->wait_and_throw();
-            float ms = 0;
-            ms = (b->get_profiling_info<
-                      sycl::info::event_profiling::command_end>() -
-                  a->get_profiling_info<
-                      sycl::info::event_profiling::command_start>()) /
-                 1000000.0f;
+            strata::ze::default_stream().record(*b);
+            b->sync();
+            float ms = b->elapsed_ms_since(*a);
             std::printf("  %-48s %8.1f us\n", name.c_str(), ms * 1000.0f / (float) reps);
-            dpct::destroy_event(a);
-            dpct::destroy_event(b);
-        }
-        catch (sycl::exception const &exc) {
-          std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-                    << ", line:" << __LINE__ << std::endl;
-          std::exit(1);
-        }
+            delete a;
+            delete b;
         };
         const int reps = 20;
         timeit("qsa_index  (8193 pooled rows x 4 heads)", reps,
@@ -1362,63 +1311,31 @@ int main(int argc, char** argv) {
         strata::kernels::QsaIndexerBuffers bufs2{tail2.p, dead2.p, pooled2.p, bpos2.p};
 
         // capture ONE call, on its own stream
-        dpct::queue_ptr cs = &dpct::get_in_order_queue();
-        check(DPCT_CHECK_ERROR(
-                  cs = dpct::get_current_device().create_queue(true)),
-              "cs");
-        check(DPCT_CHECK_ERROR(dpct::experimental::begin_recording(cs)),
-              "begincap");
+        strata::ze::Stream* cs = new strata::ze::Stream();
+        cs->begin_capture();
         strata::kernels::indexer_key_append(raw2d.p, pos2.p, POS_BASE, dw_kn.p, EPS, bufs2, S, dcos.p, dsin.p,
                                             (void*) cs);
-        dpct::experimental::command_graph_ptr g2 = nullptr;
-        check(DPCT_CHECK_ERROR(dpct::experimental::end_recording(cs, &g2)),
-              "endcap");
-        check(DPCT_CHECK_ERROR(dpct::get_current_device().destroy_queue(cs)),
-              "csd");
-        size_t nodes2 = 0;
-        check(DPCT_CHECK_ERROR(
-                  dpct::experimental::get_nodes(g2, nullptr, &nodes2)),
-              "nodes");
-        dpct::experimental::command_graph_exec_ptr ex2 = nullptr;
-        check(DPCT_CHECK_ERROR(
-                  ex2 = new sycl::ext::oneapi::experimental::command_graph<
-                      sycl::ext::oneapi::experimental::graph_state::executable>(
-                      g2->finalize())),
-              "inst");
+        strata::ze::Graph* g2 = cs->end_capture();
+        delete cs;
+        size_t nodes2 = g2->nodes();
 
         // replay A: cells 0..3, which completes block 0
         for (int t = 0; t < 4; ++t) {
-            check(DPCT_CHECK_ERROR(
-                      (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                          .memcpy(raw2d.p, &raw2[(size_t)t * IDXD2], IDXD2 * 4)
-                          .wait()),
-                  "r2");
+            memcpy_sync(raw2d.p, &raw2[(size_t)t * IDXD2], IDXD2 * 4);
             const int32_t tp = t;
-            check(DPCT_CHECK_ERROR(
-                      (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(pos2.p, &tp, 4).wait()),
-                  "p2");
-            check(DPCT_CHECK_ERROR(dpct::get_in_order_queue().ext_oneapi_graph(*ex2)),
-                  "launchA");
+            memcpy_sync(pos2.p, &tp, 4);
+            strata::ze::default_stream().launch(*g2);
         }
         const std::vector<float> afterA = pooled2.get((size_t) (nb2 + 2) * IDXD2);
 
         // replay B: cells 4..7 through the SAME graph, which completes block 1
         for (int t = 4; t < 8; ++t) {
-            check(DPCT_CHECK_ERROR(
-                      (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                          .memcpy(raw2d.p, &raw2[(size_t)t * IDXD2], IDXD2 * 4)
-                          .wait()),
-                  "r3");
+            memcpy_sync(raw2d.p, &raw2[(size_t)t * IDXD2], IDXD2 * 4);
             const int32_t tp = t;
-            check(DPCT_CHECK_ERROR(
-                      (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(pos2.p, &tp, 4).wait()),
-                  "p3");
-            check(DPCT_CHECK_ERROR(dpct::get_in_order_queue().ext_oneapi_graph(*ex2)),
-                  "launchB");
+            memcpy_sync(pos2.p, &tp, 4);
+            strata::ze::default_stream().launch(*g2);
         }
-        check(DPCT_CHECK_ERROR(
-                  dpct::get_current_device().queues_wait_and_throw()),
-              "sync2");
+        strata::ze::device_sync();
         const std::vector<float> afterB = pooled2.get((size_t) (nb2 + 2) * IDXD2);
 
         std::printf("  %-44s %zu nodes for one call\n", "the pooled kernel is capturable", nodes2);
@@ -1449,8 +1366,7 @@ int main(int argc, char** argv) {
         // assertions together are the negative control for the refactor.
         if (rows_differ != (int) IDXD2) ++g_bad;
 
-        check(DPCT_CHECK_ERROR(delete (ex2)), "exd");
-        check(DPCT_CHECK_ERROR(delete (g2)), "gd");
+        delete g2;
     }
 
     // ================= the NATIVE indexer's batched append vs the sequential one =================
@@ -1478,10 +1394,7 @@ int main(int argc, char** argv) {
         for (int64_t t = 0; t < NB; ++t)
             for (int64_t d = 0; d < IDXD; ++d)
                 raws[(size_t) t * IDXD + d] = (float) (gauss(rng) * std::pow(4.0, (double) (t % 4)));
-        dpct::queue_ptr cs = &dpct::get_in_order_queue();
-        check(DPCT_CHECK_ERROR(
-                  cs = dpct::get_current_device().create_queue(true)),
-              "cs");
+        strata::ze::Stream* cs = new strata::ze::Stream();
         std::vector<float> none_pooled;
         for (const Variant& var : variants) {
             strata::kernels::RopeScaling sc;
@@ -1492,43 +1405,23 @@ int main(int argc, char** argv) {
             Dev<float> pooledA(prows), deadA(IDXD), tailA(trows), pooledB(prows), deadB(IDXD), tailB(trows);
             Dev<int32_t> bposA(1), bposB(1), dpos(1);
             for (Dev<float>* dp : {&pooledA, &deadA, &tailA, &pooledB, &deadB, &tailB})
-                check(
-                    DPCT_CHECK_ERROR(
-                        (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                            .memset(dp->p, 0,
-                                    dp == &pooledA || dp == &pooledB ? prows * 4
-                                    : dp == &deadA || dp == &deadB   ? IDXD * 4
-                                                                   : trows * 4)
-                            .wait()),
-                    "zero");
-            check(DPCT_CHECK_ERROR(
-                      (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memset(bposA.p, 0, 4).wait()),
-                  "zero");
-                check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                           .memset(bposB.p, 0, 4)
-                                           .wait()),
-                      "zero");
+                memset_sync(dp->p, 0, dp == &pooledA || dp == &pooledB ? prows * 4
+                                : dp == &deadA || dp == &deadB ? IDXD * 4 : trows * 4);
+            memset_sync(bposA.p, 0, 4);
+            memset_sync(bposB.p, 0, 4);
             Dev<float> draw((size_t) IDXD), drawAll;
             drawAll.put(raws);
             strata::kernels::QsaIndexerBuffers bufsA{tailA.p, deadA.p, pooledA.p, bposA.p};
             strata::kernels::QsaIndexerBuffers bufsB{tailB.p, deadB.p, pooledB.p, bposB.p};
             for (int64_t t = 0; t < NB; ++t) {         // the sequential side: one cell, its device position
-                check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                           .memcpy(draw.p,
-                                                   &raws[(size_t)t * IDXD],
-                                                   (size_t)IDXD * 4)
-                                           .wait()),
-                      "raw");
+                memcpy_sync(draw.p, &raws[(size_t)t * IDXD], (size_t)IDXD * 4);
                 const int32_t tp = (int32_t) t;
-                check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                           .memcpy(dpos.p, &tp, 4)
-                                           .wait()),
-                      "pos");
+                memcpy_sync(dpos.p, &tp, 4);
                 strata::kernels::native_qsa_indexer_append(draw.p, dpos.p, BASE, dw_kn.p, EPS, bufsA, S, MC, sc, cs);
-                // SYCL port: cudaMemcpy on the legacy stream waited for this append before the next copy refilled
-                // `draw`; a default-queue copy does not wait for work on `cs`, so without this the next cell's raw
+                // cudaMemcpy on the legacy stream waited for this append before the next copy refilled
+                // `draw`; a default-stream copy does not wait for work on `cs`, so without this the next cell's raw
                 // keys could overwrite this one before the kernel reads them
-                check(DPCT_CHECK_ERROR(cs->wait()), "append");
+                cs->sync();
             }
             strata::kernels::native_qsa_indexer_append_batch(drawAll.p, NB, 0, BASE, dw_kn.p, EPS, bufsB, S, MC, sc, cs);
             // #783 PR-d: native_qsa_indexer_append_steps - the verify window's n cells in one launch (positions at a
@@ -1536,37 +1429,17 @@ int main(int argc, char** argv) {
             for (const int stride : {1, 5}) {
                 Dev<float> pooledC(prows), deadC(IDXD), tailC(trows);
                 Dev<int32_t> bposC(1), dposC((size_t) NB * stride);
-                check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                           .memset(pooledC.p, 0, prows * 4)
-                                           .wait()),
-                      "zero");
-                check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                           .memset(deadC.p, 0, IDXD * 4)
-                                           .wait()),
-                      "zero");
-                check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                           .memset(tailC.p, 0, trows * 4)
-                                           .wait()),
-                      "zero");
-                check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                           .memset(bposC.p, 0, 4)
-                                           .wait()),
-                      "zero");
+                memset_sync(pooledC.p, 0, prows * 4);
+                memset_sync(deadC.p, 0, IDXD * 4);
+                memset_sync(tailC.p, 0, trows * 4);
+                memset_sync(bposC.p, 0, 4);
                 std::vector<int32_t> hp((size_t) NB * stride, -1);
                 for (int64_t t = 0; t < NB; ++t) hp[(size_t) t * stride] = (int32_t) t;
-                /*
-                DPCT1114: cudaMemcpy is migrated to asynchronization
-                memcpy, assuming in the original code the source host memory is
-                pageable memory. If the memory is not pageable, call wait() on
-                event return by memcpy API to ensure synchronization behavior.
-                */
-                check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-                          dposC.p, hp.data(), hp.size() * 4).wait()),
-                      "pos");
+                memcpy_sync(dposC.p, hp.data(), hp.size() * 4);
                 strata::kernels::QsaIndexerBuffers bufsC{tailC.p, deadC.p, pooledC.p, bposC.p};
                 strata::kernels::native_qsa_indexer_append_steps(drawAll.p, dposC.p, stride, (int) NB, BASE, dw_kn.p, EPS,
                                                                  bufsC, S, MC, sc, cs);
-                check(DPCT_CHECK_ERROR(cs->wait()), "sync");
+                cs->sync();
                 const std::vector<float> pc = pooledC.get(prows), dc = deadC.get((size_t) IDXD), tc = tailC.get(trows);
                 const std::vector<int32_t> bc = bposC.get(1);
                 const std::vector<float> pa2 = pooledA.get(prows), da2 = deadA.get((size_t) IDXD), ta2 = tailA.get(trows);
@@ -1578,7 +1451,7 @@ int main(int argc, char** argv) {
                             same ? "bit-identical" : "*** WRONG ***");
                 if (!same) ++g_bad;
             }
-            check(DPCT_CHECK_ERROR(cs->wait()), "sync");
+            cs->sync();
             const std::vector<float> pa = pooledA.get(prows), pb = pooledB.get(prows);
             const std::vector<float> da = deadA.get((size_t) IDXD), db = deadB.get((size_t) IDXD);
             const std::vector<float> ta = tailA.get(trows), tbb = tailB.get(trows);
@@ -1601,8 +1474,7 @@ int main(int argc, char** argv) {
                 if (!moved) { std::printf("    *** the batched append ignored its scaling ***\n"); ++g_bad; }
             }
         }
-        check(DPCT_CHECK_ERROR(dpct::get_current_device().destroy_queue(cs)),
-              "csd");
+        delete cs;
     }
 
     // ================= the spare (position 0) under rope scaling: the table indexer vs the native one =========
@@ -1628,36 +1500,18 @@ int main(int argc, char** argv) {
         draw0.put(raw0);
         Dev<int32_t> dpos0(1);
         const int32_t zero = 0;
-        check(DPCT_CHECK_ERROR(
-                  (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(dpos0.p, &zero, 4).wait()),
-              "pos0");
-        dpct::queue_ptr cs = &dpct::get_in_order_queue();
-        check(DPCT_CHECK_ERROR(
-                  cs = dpct::get_current_device().create_queue(true)),
-              "cs");
+        memcpy_sync(dpos0.p, &zero, 4);
+        strata::ze::Stream* cs = new strata::ze::Stream();
         const size_t prows = (size_t) (MC / R + 1) * IDXD, trows = (size_t) (R - 1) * IDXD;
         // one cell at position 0 through either kernel; returns (dead, pooled[0])
-        auto spare = [&](bool native, const strata::kernels::RopeScaling &sc,
-                         std::vector<float> &dead,
-                         std::vector<float> &pooled0) {
-            try {
-                         Dev<float> pooled(prows), dd((size_t)IDXD), tail(trows);
+        auto spare = [&](bool native, const strata::kernels::RopeScaling& sc, std::vector<float>& dead,
+                         std::vector<float>& pooled0) {
+            Dev<float> pooled(prows), dd((size_t)IDXD), tail(trows);
             Dev<int32_t> bpos(1);
-            check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                       .memset(pooled.p, 0, prows * 4)
-                                       .wait()),
-                  "zero");
-            check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                       .memset(dd.p, 0, (size_t)IDXD * 4)
-                                       .wait()),
-                  "zero");
-            check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                       .memset(tail.p, 0, trows * 4)
-                                       .wait()),
-                  "zero");
-            check(DPCT_CHECK_ERROR(
-                      (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memset(bpos.p, 0, 4).wait()),
-                  "zero");
+            memset_sync(pooled.p, 0, prows * 4);
+            memset_sync(dd.p, 0, (size_t)IDXD * 4);
+            memset_sync(tail.p, 0, trows * 4);
+            memset_sync(bpos.p, 0, 4);
             strata::kernels::QsaIndexerBuffers bufs{tail.p, dd.p, pooled.p, bpos.p};
             if (native) {
                 strata::kernels::native_qsa_indexer_append(draw0.p, dpos0.p, 0, dw_kn.p, EPS, bufs, S, MC, sc, cs);
@@ -1669,16 +1523,9 @@ int main(int argc, char** argv) {
                 dsn.put(ts);
                 strata::kernels::indexer_key_append(draw0.p, dpos0.p, 0, dw_kn.p, EPS, bufs, S, dc.p, dsn.p, cs);
             }
-            check(DPCT_CHECK_ERROR(cs->wait()), "sync");
+            cs->sync();
             dead = dd.get((size_t) IDXD);
             pooled0 = pooled.get((size_t) IDXD);
-        }
-                         catch (sycl::exception const &exc) {
-                           std::cerr << exc.what()
-                                     << "Exception caught at file:" << __FILE__
-                                     << ", line:" << __LINE__ << std::endl;
-                           std::exit(1);
-                         }
         };
         std::vector<float> t_none, t_none_p, n_none, n_none_p;
         for (const Variant& var : variants) {
@@ -1720,8 +1567,7 @@ int main(int argc, char** argv) {
                         "row0 cos " + std::to_string(row0c[0]) + ", " + std::to_string(moved) + " dims moved");
             }
         }
-        check(DPCT_CHECK_ERROR(dpct::get_current_device().destroy_queue(cs)),
-              "csd");
+        delete cs;
     }
 
     std::printf("\nqsa: %d failures\n", g_bad);

@@ -8,9 +8,7 @@
 //     output, k = 9 and a null shared row take the scalar one) against a host replay of the documented contract:
 //     the first product rounds to F32, the next ones accumulate with FMA in expert order, the shared row is added
 //     once: memcmp.
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
+#include "strata/ze/ze.hpp"
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/native_router.hpp"
 
@@ -25,34 +23,31 @@
 
 namespace {
 
-void check(dpct::err0 e, const char *what) {
+/// cudaMemcpy: after the device's queued work, complete on return.
+void memcpy_sync(void* dst, const void* src, size_t bytes) {
+    strata::ze::device_sync();
+    strata::ze::default_stream().memcpy(dst, src, bytes);
+    strata::ze::default_stream().sync();
+}
+
+/// cudaMemset: after the device's queued work, complete on return.
+void memset_sync(void* dst, int value, size_t bytes) {
+    strata::ze::device_sync();
+    strata::ze::default_stream().memset(dst, value, bytes);
+    strata::ze::default_stream().sync();
 }
 
 template <typename T>
 T* up(const std::vector<T>& h) {
     void* p = nullptr;
-    check(DPCT_CHECK_ERROR(
-              p = (void *)sycl::malloc_device(h.size() * sizeof(T) + 64,
-                                              dpct::get_in_order_queue())),
-          "malloc");
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming
-    in the original code the source host memory is pageable memory. If the
-    memory is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-              p, h.data(), h.size() * sizeof(T)).wait()),
-          "h2d");
+    p = strata::ze::malloc_device(h.size() * sizeof(T) + 64);
+    memcpy_sync(p, h.data(), h.size() * sizeof(T));
     return (T*) p;
 }
 template <typename T>
 std::vector<T> down(const T* d, size_t n) {
     std::vector<T> h(n);
-    check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                               .memcpy(h.data(), d, n * sizeof(T))
-                               .wait()),
-          "d2h");
+    memcpy_sync(h.data(), d, n * sizeof(T));
     return h;
 }
 
@@ -64,9 +59,7 @@ int main(int argc, char**) {
     std::mt19937 rng(783);
     std::normal_distribution<float> gauss(0.0f, 1.0f);
     int bad = 0;
-    dpct::queue_ptr st = &dpct::get_in_order_queue();
-    check(DPCT_CHECK_ERROR(st = dpct::get_current_device().create_queue(true)),
-          "stream");
+    strata::ze::Stream* st = new strata::ze::Stream();
 
     // ---- the multi-token router
     for (int mode = 0; mode < 3; ++mode) {
@@ -82,27 +75,13 @@ int main(int argc, char**) {
             float* d_l = up(lg);
             int32_t *d_i, *d_ir;
             float *d_w, *d_wr;
-            check(DPCT_CHECK_ERROR(
-                      d_i = (int32_t *)sycl::malloc_device(
-                          (size_t)n * 10 * 4, dpct::get_in_order_queue())),
-                  "i");
-            check(DPCT_CHECK_ERROR(
-                      d_ir = (int32_t *)sycl::malloc_device(
-                          (size_t)n * 10 * 4, dpct::get_in_order_queue())),
-                  "ir");
-            check(DPCT_CHECK_ERROR(
-                      d_w = (float *)sycl::malloc_device(
-                          (size_t)n * 10 * 4, dpct::get_in_order_queue())),
-                  "w");
-            check(DPCT_CHECK_ERROR(
-                      d_wr = (float *)sycl::malloc_device(
-                          (size_t)n * 10 * 4, dpct::get_in_order_queue())),
-                  "wr");
+            d_i = (int32_t*) strata::ze::malloc_device((size_t)n * 10 * 4);
+            d_ir = (int32_t*) strata::ze::malloc_device((size_t)n * 10 * 4);
+            d_w = (float*) strata::ze::malloc_device((size_t)n * 10 * 4);
+            d_wr = (float*) strata::ze::malloc_device((size_t)n * 10 * 4);
             native_router_top10_multi(d_l, d_i, d_w, n, st);
             for (int t = 0; t < n; ++t) native_router_top10(d_l + (size_t) t * 512, d_ir + t * 10, d_wr + t * 10, st);
-            check(DPCT_CHECK_ERROR(
-                      dpct::get_current_device().queues_wait_and_throw()),
-                  "sync");
+            strata::ze::device_sync();
             const auto i1 = down(d_i, (size_t) n * 10), i2 = down(d_ir, (size_t) n * 10);
             const auto w1 = down(d_w, (size_t) n * 10), w2 = down(d_wr, (size_t) n * 10);
             ++cases;
@@ -110,11 +89,11 @@ int main(int argc, char**) {
                 std::printf("    *** native_router_top10_multi n=%d (%s) differs from native_router_top10 ***\n", n, names[mode]);
                 ++mode_bad;
             }
-            sycl::free(d_l, dpct::get_in_order_queue());
-                sycl::free(d_i, dpct::get_in_order_queue());
-                sycl::free(d_ir, dpct::get_in_order_queue());
-                sycl::free(d_w, dpct::get_in_order_queue());
-                sycl::free(d_wr, dpct::get_in_order_queue());
+            strata::ze::free(d_l);
+            strata::ze::free(d_i);
+            strata::ze::free(d_ir);
+            strata::ze::free(d_w);
+            strata::ze::free(d_wr);
         }
         std::printf("  %-52s %s (%d cases)\n", (std::string("router multi == single, ") + names[mode]).c_str(),
                     mode_bad ? "*** NO ***" : "bitwise", cases);
@@ -137,19 +116,14 @@ int main(int argc, char**) {
             float* d_w = up(w);
             float* d_s = up(sh);
             float* d_o = nullptr;
-            check(DPCT_CHECK_ERROR(
-                      d_o = (float *)sycl::malloc_device(
-                          (size_t)n * N * 4 + 64, dpct::get_in_order_queue())),
-                  "o");
+            d_o = (float*) strata::ze::malloc_device((size_t)n * N * 4 + 64);
             float* out = d_o + c.out_off;
             if (c.out_off) {
                 // a misaligned output cannot take a multi launch of rows with the 4-float stride contract either way:
                 // the rows are still n*N floats from `out`
             }
             native_moe_combine_multi(d_p, d_w, c.shared ? d_s : nullptr, out, N, c.k, n, st);
-            check(DPCT_CHECK_ERROR(
-                      dpct::get_current_device().queues_wait_and_throw()),
-                  "sync");
+            strata::ze::device_sync();
             const auto got = down(out, (size_t) n * N);
             std::vector<float> want((size_t) n * N);
             for (int t = 0; t < n; ++t)
@@ -167,14 +141,9 @@ int main(int argc, char**) {
             }
             // the single-token call is the same arithmetic
             if (n == 1) {
-                check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                           .memset(d_o, 0, (size_t)N * 4 + 64)
-                                           .wait()),
-                      "z");
+                memset_sync(d_o, 0, (size_t)N * 4 + 64);
                 native_moe_combine(d_p, d_w, c.shared ? d_s : nullptr, out, N, c.k, st);
-                check(DPCT_CHECK_ERROR(
-                          dpct::get_current_device().queues_wait_and_throw()),
-                      "sync");
+                strata::ze::device_sync();
                 const auto g1 = down(out, (size_t) N);
                 ++cases;
                 if (std::memcmp(g1.data(), want.data(), g1.size() * 4) != 0) {
@@ -182,10 +151,10 @@ int main(int argc, char**) {
                     ++cfg_bad;
                 }
             }
-            sycl::free(d_p, dpct::get_in_order_queue());
-                sycl::free(d_w, dpct::get_in_order_queue());
-                sycl::free(d_s, dpct::get_in_order_queue());
-                sycl::free(d_o, dpct::get_in_order_queue());
+            strata::ze::free(d_p);
+            strata::ze::free(d_w);
+            strata::ze::free(d_s);
+            strata::ze::free(d_o);
         }
         std::printf("  %-52s %s (%d cases)\n", (std::string("combine ") + c.name).c_str(), cfg_bad ? "*** NO ***" : "bitwise", cases);
         bad += cfg_bad;

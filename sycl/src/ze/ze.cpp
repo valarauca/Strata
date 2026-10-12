@@ -346,7 +346,7 @@ uint64_t* new_stamp() {
     Runtime& r = rt();
     std::lock_guard<std::mutex> lk(r.ev_mu);
     if (r.stamps == nullptr) {
-        constexpr uint32_t kStamps = 4096;
+        constexpr uint32_t kStamps = 65536;
         ze_host_mem_alloc_desc_t hd{ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC};
         STRATA_ZE_CHECK(zeMemAllocHost(r.ctx, &hd, kStamps * sizeof(uint64_t), 64, (void**) &r.stamps));
         std::memset(r.stamps, 0, kStamps * sizeof(uint64_t));
@@ -608,7 +608,7 @@ ze_kernel_handle_t KernelBase::create(int ordinal) const {
 
 void check_geometry(const KernelBase& k, Dim3 grid, Dim3 block) {
     const uint64_t g = (uint64_t) block.x * block.y * block.z;
-    if (grid.x == 0 || grid.y == 0 || grid.z == 0 || g == 0 || g > 1024) {
+    if (g == 0 || g > 1024) {
         std::fprintf(stderr, "strata ze: kernel %s launched with grid %ux%ux%u block %ux%ux%u\n", k.name(), grid.x, grid.y,
                      grid.z, block.x, block.y, block.z);
         std::fflush(stderr);
@@ -662,6 +662,7 @@ void Stream::after_append() {
 
 void Stream::launch(const KernelBase& k, Dim3 grid, Dim3 block, void** args) {
     check_geometry(k, grid, block);
+    if (grid.x == 0 || grid.y == 0 || grid.z == 0) return;
     std::lock_guard<std::recursive_mutex> lk(mu_);
     const int d = cap_ ? cap_->dev : dev_;
     ze_kernel_handle_t h = k.handle(d);
@@ -767,6 +768,11 @@ void Stream::write_timestamp(uint64_t* dst) {
 void Stream::record(Event& e) {
     std::lock_guard<std::recursive_mutex> lk(mu_);
     if (cap_) {
+        if (e.timing_) {
+            STRATA_ZE_CHECK(zeCommandListAppendWriteGlobalTimestamp(cap_->list_, e.stamp_, nullptr, 0, nullptr));
+            e.stamp_dev_ = cap_->dev;
+            ++cap_->nodes;
+        }
         e.captured_in_ = cap_;
         e.recorded_ = true;
         return;
