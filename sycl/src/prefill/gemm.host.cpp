@@ -47,7 +47,9 @@ void run(bool bf, const uint16_t* X, int64_t ldx, const uint16_t* W, int64_t ldw
     }
     const int acc = beta != 0.0f ? 1 : 0;
     ze::Stream* s = ze::stream_of(stream);
-    if (N < 16) {
+    const bool blockable = ldx % 4 == 0 && ldw % 4 == 0 && K % 2 == 0 && ldy % 2 == 0 && ((uintptr_t) X & 3) == 0 &&
+                           ((uintptr_t) W & 3) == 0 && ((uintptr_t) Y & 3) == 0;
+    if (N < 16 || !blockable) {
         const GemmKernel& k = bf ? xgemm::k_xgemm_narrow_bf16 : xgemm::k_xgemm_narrow_f16;
         k(s, {(uint32_t) N, (uint32_t) M, 1}, {16, 1, 1}, 0, X, ldx, W, ldw, Y, ldy, (int) M, (int) N, (int) K, acc);
         return;

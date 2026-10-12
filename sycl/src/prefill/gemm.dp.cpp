@@ -4,7 +4,10 @@
 // added to Y. Each sub-group holds an (MT x 8) by (NT x 16) block of Y in joint_matrix accumulators (Xe2: 8x16x16 on
 // sub-group 16) and walks K in steps of 16, loading its A tiles from X and its B tiles from W (W's rows are B's
 // columns: col_major with stride ldw) straight from global memory with bounds-checked 2-D block loads, which return
-// zeros past M, N and K, so any shape runs without padding. The bundle is built with the large register file.
+// zeros past M, N and K, so any shape runs without padding. A checked load names the matrix as it lies in memory:
+// (stride, rows, columns, row, column), so W's tile is (ldw, N, K, n, k) although B is K x N. Those loads need 4-byte
+// aligned bases, strides that are multiples of 8 bytes and an even K: the host sends anything else to gemm_narrow. The
+// bundle is built with the large register file.
 #include "strata/port.hpp"
 
 #include <sycl/ext/oneapi/matrix/matrix.hpp>
@@ -52,7 +55,7 @@ inline void gemm_tile(const T* X, long long ldx, const T* W, long long ldw, floa
             jmi::joint_matrix_load_checked(sg, a[i], xp, (size_t) ldx, (size_t) M, (size_t) K, (size_t) (m0 + i * TM), (size_t) k);
 #pragma unroll
         for (int j = 0; j < NT; ++j)
-            jmi::joint_matrix_load_checked(sg, b[j], wp, (size_t) ldw, (size_t) K, (size_t) N, (size_t) k, (size_t) (n0 + j * TN));
+            jmi::joint_matrix_load_checked(sg, b[j], wp, (size_t) ldw, (size_t) N, (size_t) K, (size_t) (n0 + j * TN), (size_t) k);
 #pragma unroll
         for (int i = 0; i < MT; ++i)
 #pragma unroll
