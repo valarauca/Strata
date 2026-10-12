@@ -83,18 +83,13 @@ The layer split is not a working path of the reference, so there is no two-GPU b
 
 ## Status (2026-10-11)
 
-- Builds: the engine and all parity tests build on Level Zero; `strata` NEEDs libze_loader, libstdc++, libm, libgcc_s,
-  libc only. A read-only review of every converted launch against main found no geometry, SLM or argument defect.
-- First GPU run of the new GEMM (`xgemm_parity`, 03:00.0) hit DEVICE_LOST: swapped col_major checked-load arguments,
-  fixed in 5d7c757a. GPU work is paused until the user clears it; nothing below is measured yet.
-- On 03:00.0: xgemm_parity passes all 18 shapes (dense f16 4096x2560x2560 113.7 TFLOP/s). The ctest suite: 26 of 29
-  pass, gr_parity fails its QFUSE check (main's code never writes the q8_1 images either), s2_expert_grouped_parity
-  fails old-vs-new bitwise (failing on SYCL too, docs/INTEL.md), ple_parity lacks its Q2_0 fixture.
-  conversation_snapshot_test hit DEVICE_LOST (a write one page below the device USM pool). The review found missing
-  kernel indirect access (fixed, 70fec4b3) but no line that writes there; the serialized rerun then hung the compute
-  engine. Second strike: GPU work stopped for the user.
-- Pending on the GPU: xgemm_parity, the ctest parity suite, kl-a/b/c and kl-a-mtp against `$REF`, serve perf against
-  the baseline, memory (auto and 4,096 slots), repeated inference and shutdown, the /proc maps audit.
+- Builds on Level Zero only. On 03:00.0: xgemm_parity 53 of 53, ctest 26 of 29 (gr_parity's QFUSE check and
+  s2_expert_grouped_parity fail as on SYCL, ple_parity lacks its fixture), the model's kl-a/b/c and MTP captures, warmed
+  serve, memory scaling and the process audit (results below).
+- conversation_snapshot_test: its DEVICE_LOST was a kernel writing through pointers in a by-value struct to memory
+  never made resident (indirect access, fixed in 70fec4b3); the serialized rerun's hang did not reproduce
+  (`STRATA_ZE_TRACE=1` run, 3,901 checks pass).
+- Not done: the two-B70 split (the SYCL reference has no working one; 08:00.0 needs the user's go-ahead).
 
 ## Results (L0 engine, 03:00.0, min_freq 2800)
 
