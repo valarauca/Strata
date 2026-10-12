@@ -80,3 +80,12 @@ The layer split is not a working path of the reference, so there is no two-GPU b
   kernel for N < 16 or unaligned operands. Checked by `xgemm_parity` against a double CPU product.
 - Removed with the SYCL runtime: dpct host headers, the SYCL-runtime benches and probes, the oneMKL GEMM, the
   multi-queue overlap/concurrency experiments.
+
+## Status (2026-10-11)
+
+- Builds: the engine and all parity tests build on Level Zero; `strata` NEEDs libze_loader, libstdc++, libm, libgcc_s,
+  libc only. A read-only review of every converted launch against main found no geometry, SLM or argument defect.
+- First GPU run of the new GEMM (`xgemm_parity`, 03:00.0) hit DEVICE_LOST: swapped col_major checked-load arguments,
+  fixed in 5d7c757a. GPU work is paused until the user clears it; nothing below is measured yet.
+- Pending on the GPU: xgemm_parity, the ctest parity suite, kl-a/b/c and kl-a-mtp against `$REF`, serve perf against
+  the baseline, memory (auto and 4,096 slots), repeated inference and shutdown, the /proc maps audit.
