@@ -813,15 +813,10 @@ Graph* Stream::end_capture() {
     }
     for (Stream* s : c->members) s->cap_ = nullptr;
     STRATA_ZE_CHECK(zeCommandListClose(c->list_));
-    Graph* g = nullptr;
-    if (c->nodes == 0) {
-        zeCommandListDestroy(c->list_);
-    } else {
-        g = new Graph();
-        g->list_ = c->list_;
-        g->nodes_ = c->nodes;
-        g->dev_ = c->dev;
-    }
+    Graph* g = new Graph();
+    g->list_ = c->list_;
+    g->nodes_ = c->nodes;
+    g->dev_ = c->dev;
     c->list_ = nullptr;
     c->members.clear();
     return g;

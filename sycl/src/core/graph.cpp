@@ -39,10 +39,10 @@ bool CapturedGraph::begin(void* stream, std::string& err) {
 
 bool CapturedGraph::end(void* stream, std::string& err) {
     graph_ = strata::ze::stream_of(stream)->end_capture();
+    nodes_ = graph_->nodes();
     // A capture that recorded NOTHING is a wiring mistake, and a graph that replays nothing produces no error
     // and no output - the silent kind of failure this project keeps paying for.
-    if (graph_ == nullptr) { err = "end: the capture recorded ZERO nodes - the body launched nothing"; reset(); return false; }
-    nodes_ = graph_->nodes();
+    if (nodes_ == 0) { err = "end: the capture recorded ZERO nodes - the body launched nothing"; reset(); return false; }
     // The completion event is created ONCE and reused: `launch` records it again after each replay, which is
     // what makes `wait_ms` a query rather than a sync.
     done_ = new strata::ze::Event();

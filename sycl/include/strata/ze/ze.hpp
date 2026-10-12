@@ -177,7 +177,7 @@ public:
     /// From here until end_capture, appends go to a new regular command list instead of the GPU. A stream that waits
     /// on an event recorded inside the capture joins it: its appends go to the same list, in order.
     void begin_capture();
-    /// Closes the capture into a Graph (nullptr when nothing was recorded). Streams that joined leave it.
+    /// Closes the capture into a Graph (nodes() == 0 when nothing was recorded). Streams that joined leave it.
     Graph* end_capture();
     bool capturing() const { return cap_ != nullptr; }
     /// Appends a recorded graph.
