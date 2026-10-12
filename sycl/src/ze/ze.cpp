@@ -71,6 +71,7 @@ public:
     std::vector<std::unique_ptr<DeviceState>> devs;
     bool serialize = false;
     bool report_on = false;
+    bool trace = false;
 
     std::mutex alloc_mu;
     std::map<uintptr_t, Alloc> allocs;
@@ -95,6 +96,7 @@ const char* kDeviceLost = "DEVICE_LOST";
 
 void Runtime::init() {
     serialize = env_on("STRATA_L0_SERIALIZE", false);
+    trace = env_on("STRATA_ZE_TRACE", false);
     report_on = env_on("STRATA_ZE_REPORT", false);
     STRATA_ZE_CHECK(zeInit(ZE_INIT_FLAG_GPU_ONLY));
     uint32_t nd = 0;
@@ -731,8 +733,10 @@ void Stream::after_append() {
         return;
     }
     if (rt().serialize) {
+        if (rt().trace) std::fprintf(stderr, "strata ze trace: stream %p serialize sync\n", (void*) this);
         const ze_result_t r = zeCommandListHostSynchronize(imm_, UINT64_MAX);
         if (r != ZE_RESULT_SUCCESS) fatal("zeCommandListHostSynchronize (STRATA_L0_SERIALIZE)", r, __FILE__, __LINE__);
+        if (rt().trace) std::fprintf(stderr, "strata ze trace: stream %p serialize sync done\n", (void*) this);
     }
 }
 
@@ -764,7 +768,9 @@ void Stream::launch(const NativeKernel& k, Dim3 grid, Dim3 block, void** args) {
 }
 
 void Stream::append_launch(ze_kernel_handle_t h, const char* name, int dev, Dim3 grid, Dim3 block, void** args) {
-    (void) dev;
+    if (rt().trace)
+        std::fprintf(stderr, "strata ze trace: stream %p launch %s grid %ux%ux%u block %ux%ux%u\n", (void*) this, name, grid.x,
+                     grid.y, grid.z, block.x, block.y, block.z);
     const ze_group_count_t gc{grid.x, grid.y, grid.z};
     const ze_group_size_t gs{block.x, block.y, block.z};
     const ze_result_t r = zeCommandListAppendLaunchKernelWithArguments(target(), h, gc, gs, args, nullptr, nullptr, 0, nullptr);
@@ -780,6 +786,7 @@ void Stream::append_launch(ze_kernel_handle_t h, const char* name, int dev, Dim3
 
 void Stream::memcpy(void* dst, const void* src, size_t bytes) {
     if (bytes == 0) return;
+    if (rt().trace) std::fprintf(stderr, "strata ze trace: stream %p copy %zu bytes %p -> %p\n", (void*) this, bytes, src, dst);
     std::lock_guard<std::recursive_mutex> lk(mu_);
     const bool src_ok = range_kind(src, bytes, "copy source") != MemKind::Unknown,
                dst_ok = range_kind(dst, bytes, "copy destination") != MemKind::Unknown;
@@ -843,6 +850,7 @@ void Stream::memset(void* dst, int value, size_t bytes) {
 
 void Stream::fill(void* dst, const void* pattern, size_t pattern_bytes, size_t bytes) {
     if (bytes == 0) return;
+    if (rt().trace) std::fprintf(stderr, "strata ze trace: stream %p fill %zu bytes at %p\n", (void*) this, bytes, dst);
     std::lock_guard<std::recursive_mutex> lk(mu_);
     if (range_kind(dst, bytes, "fill") == MemKind::Unknown) {
         if (cap_) {
@@ -920,8 +928,10 @@ void Stream::wait(Event& e) {
 void Stream::sync() {
     std::lock_guard<std::recursive_mutex> lk(mu_);
     g_count.host_waits.fetch_add(1, std::memory_order_relaxed);
+    if (rt().trace) std::fprintf(stderr, "strata ze trace: stream %p sync\n", (void*) this);
     const ze_result_t r = zeCommandListHostSynchronize(imm_, UINT64_MAX);
     if (r != ZE_RESULT_SUCCESS) fatal("zeCommandListHostSynchronize", r, __FILE__, __LINE__);
+    if (rt().trace) std::fprintf(stderr, "strata ze trace: stream %p sync done\n", (void*) this);
 }
 
 bool Stream::sync_for(uint64_t timeout_ms) {
