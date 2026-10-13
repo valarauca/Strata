@@ -912,7 +912,12 @@ resident_plan_kernel(const int32_t *__restrict__ ids, int n, int k,
                      const unsigned long long *slot_off, long long blob,
                      int32_t *__restrict__ pl, long long capx, uint32_t *skip,
                      uint32_t ring, const unsigned long long *__restrict__ mir,
-                     volatile uint32_t *plan_err, int32_t *usage) {
+                     volatile uint32_t *plan_err, int32_t *usage,
+                     unsigned long long *stats, int32_t *lru_res,
+                     int32_t *lru_owner, uint32_t *lru_last,
+                     uint32_t *lru_state, unsigned long long *lru_jobs,
+                     uint32_t *lru_njobs, int lru_layer, uint32_t lru_guard,
+                     uint32_t lru_scan, uint32_t lru_sample) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
 auto &s_ids = *sycl::ext::oneapi::group_local_memory_for_overwrite<
     int32_t[kResidentPlanMax]>(
@@ -945,6 +950,20 @@ auto &s_ids = *sycl::ext::oneapi::group_local_memory_for_overwrite<
                 &s_bad, 1);
     }
     item_ct1.barrier(sycl::access::fence_space::local_space);
+    if (stats != nullptr) {
+        const bool valid = tid < n && eid >= 0 && eid < n_expert;
+        const int n_valid = sycl::reduce_over_group(item_ct1.get_group(), valid ? 1 : 0, sycl::plus<int>());
+        const int n_hit = sycl::reduce_over_group(item_ct1.get_group(), valid && slot >= 0 ? 1 : 0,
+                                                  sycl::plus<int>());
+        if (tid == 0) {
+            sycl::atomic_ref<unsigned long long, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                             sycl::access::address_space::global_space>(stats[1])
+                .fetch_add((unsigned long long) n_hit);
+            sycl::atomic_ref<unsigned long long, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                             sycl::access::address_space::global_space>(stats[2])
+                .fetch_add((unsigned long long) n_valid);
+        }
+    }
     if (s_bad) {
         if (tid == 0 && skip != nullptr) *skip = 0;
         if (tid == 0 && skip == nullptr) {   // #871: the all-resident graph has no host plan to fall back on
@@ -956,6 +975,62 @@ auto &s_ids = *sycl::ext::oneapi::group_local_memory_for_overwrite<
             }
         }
         return;
+    }
+
+    if (lru_owner != nullptr && lru_layer >= 0) {
+        auto &s_slot = *sycl::ext::oneapi::group_local_memory_for_overwrite<
+            int32_t[kResidentPlanMax]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<3>());
+        if (tid < n) s_slot[tid] = slot;
+        item_ct1.barrier(sycl::access::fence_space::local_space);
+        if (tid == 0) {
+            int32_t* res_l = lru_res + (size_t) lru_layer * (size_t) n_expert;
+            const uint32_t t = lru_state[0] + 1u;
+            const uint32_t lru_end = lru_state[2];
+            lru_state[0] = t;
+            uint32_t hand = lru_state[1] < lru_end ? lru_state[1] : 0u;
+            uint32_t jobs = 0;
+            for (int j = 0; j < n; ++j)
+                if (s_slot[j] >= 0) lru_last[s_slot[j]] = t;
+            for (int j = 0; j < n && lru_end > 0; ++j) {
+                if (s_slot[j] >= 0) continue;
+                const int32_t e = s_ids[j];
+                if (e < 0 || e >= n_expert) continue;
+                const int32_t cur = res_l[e];
+                if (cur >= 0) { s_slot[j] = cur; continue; }
+                const unsigned long long src = mir != nullptr ? mir[e] : 0ull;
+                if (src == 0ull) continue;
+                int32_t chosen = -1;
+                uint32_t best = 0xffffffffu;
+                for (uint32_t step = 0; step < lru_sample; ++step) {
+                    const uint32_t sl = hand;
+                    hand = hand + 1u >= lru_end ? 0u : hand + 1u;
+                    const uint32_t ls = lru_last[sl];
+                    if (t - ls > lru_guard && (chosen < 0 || ls < best)) { chosen = (int32_t) sl; best = ls; }
+                }
+                for (uint32_t step = lru_sample; chosen < 0 && step < lru_scan; ++step) {
+                    const uint32_t sl = hand;
+                    hand = hand + 1u >= lru_end ? 0u : hand + 1u;
+                    if (t - lru_last[sl] > lru_guard) chosen = (int32_t) sl;
+                }
+                if (chosen < 0) continue;
+                const int32_t o = lru_owner[chosen];
+                if (o >= 0 && lru_res[o] == chosen) lru_res[o] = -1;
+                res_l[e] = chosen;
+                lru_owner[chosen] = lru_layer * n_expert + e;
+                lru_last[chosen] = t;
+                lru_jobs[2 * jobs] = src;
+                lru_jobs[2 * jobs + 1] = (unsigned long long) (cache_base + (slot_off ? (size_t) slot_off[chosen]
+                                                                                      : (size_t) chosen * (size_t) blob));
+                ++jobs;
+                s_slot[j] = chosen;
+            }
+            lru_state[1] = hand;
+            *lru_njobs = jobs;
+            if (stats != nullptr) stats[0] += (unsigned long long) jobs;
+        }
+        item_ct1.barrier(sycl::access::fence_space::local_space);
+        if (tid < n && s_slot[tid] >= 0) { slot = s_slot[tid]; maddr = 0; }
     }
 
     int first_j = tid;
@@ -1033,6 +1108,17 @@ auto &s_ids = *sycl::ext::oneapi::group_local_memory_for_overwrite<
                                sycl::memory_scope::device);
             strata::sys_store(skip, ring);
         }
+    }
+}
+__dpct_inline__ void lru_copy_kernel(const unsigned long long *jobs, const uint32_t *njobs, long long chunks) {
+    auto it = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const long long total = (long long) *njobs * chunks;
+    const long long stride = (long long) it.get_global_range(2);
+    for (long long i = (long long) it.get_global_id(2); i < total; i += stride) {
+        const long long j = i / chunks, c = i - j * chunks;
+        const sycl::uint4 *src = (const sycl::uint4 *) jobs[2 * j];
+        sycl::uint4 *dst = (sycl::uint4 *) jobs[2 * j + 1];
+        dst[c] = src[c];
     }
 }
 // The same plan in one block of 128 threads (n <= 128): thread i owns entry i. Groups are the distinct experts in

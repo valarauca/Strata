@@ -109,9 +109,15 @@ STRATA_KERNEL(verify_kernels_wait_flag_ge, (const uint32_t* flag, uint32_t value
 STRATA_KERNEL(verify_kernels_resident_plan,
               (const int32_t* ids, int n, int k, const int32_t* res, int n_expert, const uint8_t* cache_base,
                const unsigned long long* slot_off, long long blob, int32_t* pl, long long capx, uint32_t* skip,
-               uint32_t ring, const unsigned long long* mir, uint32_t* plan_err, int32_t* usage),
+               uint32_t ring, const unsigned long long* mir, uint32_t* plan_err, int32_t* usage,
+               unsigned long long* stats, int32_t* lru_res, int32_t* lru_owner, uint32_t* lru_last, uint32_t* lru_state,
+               unsigned long long* lru_jobs, uint32_t* lru_njobs, int lru_layer, uint32_t lru_guard, uint32_t lru_scan,
+               uint32_t lru_sample),
               resident_plan_kernel(ids, n, k, res, n_expert, cache_base, slot_off, blob, pl, capx, skip, ring, mir,
-                                   plan_err, usage))
+                                   plan_err, usage, stats, lru_res, lru_owner, lru_last, lru_state, lru_jobs, lru_njobs,
+                                   lru_layer, lru_guard, lru_scan, lru_sample))
+STRATA_KERNEL(verify_kernels_lru_copy, (const unsigned long long* jobs, const uint32_t* njobs, long long chunks),
+              lru_copy_kernel(jobs, njobs, chunks))
 STRATA_KERNEL(verify_kernels_wait_flag_ge_or,
               (const uint32_t* flag, uint32_t value, const uint32_t* skip, uint32_t spin_max),
               wait_flag_ge_or_kernel(flag, value, skip, spin_max))

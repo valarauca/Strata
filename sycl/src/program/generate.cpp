@@ -4355,6 +4355,23 @@ int main(int argc, char **argv) {
     // the GPU takes is --pcie-frac; STRATA_MIRROR_MIB caps the mirror (default: MemAvailable less 4 GiB), 0 = off.
     unsigned long long* mirror_table_d = nullptr;   // [n_layers][n_expert] device-readable mirror addresses (0 = none)
     int64_t unmirrored_misses = 0;
+    const bool lru_want = [&] {
+        const char* v = std::getenv("STRATA_EXPERT_LRU");
+        if (v == nullptr || v[0] != '1') return false;
+        auto on = [](const char* name) { const char* e = std::getenv(name); return e && *e && std::strcmp(e, "0") != 0; };
+        const char* why = nullptr;
+        if (!on("STRATA_VERIFY_NO_HOST") || !on("STRATA_VERIFY_DEVICE_PLAN"))
+            why = "it needs STRATA_VERIFY_NO_HOST=1 and STRATA_VERIFY_DEVICE_PLAN=1";
+        else if (multi_gpu) why = "one GPU only";
+        else if (o.batch > 0) why = "not with --batch";
+        else if (remote_caches) why = "not with --expert-cache-deviceN";
+        else if (xcache.segmented()) why = "not with --vram-elastic";
+        else if (strata::core::qsa_kv_elastic() && xcache.vmm_range() != nullptr) why = "not with the elastic K/V";
+        else if (!o.stream_experts || srcp != &gguf_src || o.expert_cache <= 0)
+            why = "it needs --stream-experts and an expert cache";
+        if (why != nullptr) std::fprintf(stderr, "strata generate: expert LRU off: %s\n", why);
+        return why == nullptr;
+    }();
     if (o.stream_experts && srcp == &gguf_src && o.expert_cache > 0) {
         // #1054, #1440: with a layer split the mirror holds only the first GPU's layers. The pinned memory belongs to
         // this GPU's context, and the later stages' caches do not exist yet (every later-stage expert would count as a
@@ -4388,6 +4405,13 @@ int main(int argc, char **argv) {
                             miss.push_back({l, e});
             }
         }
+        if (lru_want) {
+            std::set<std::pair<int64_t, int64_t>> have(miss.begin() + (ptrdiff_t) n_true_miss, miss.end());
+            for (int64_t l = 0; l < mirror_end; ++l)
+                for (int64_t e = 0; e < g.n_expert; ++e)
+                    if (xcache.slot_of(l, e) != strata::core::kNotResident && !have.count({l, e}))
+                        miss.push_back({l, e});
+        }
         uint64_t avail = 0;
         if (FILE* f = std::fopen("/proc/meminfo", "r")) {
             char key[64]; unsigned long long kb = 0;
@@ -4405,8 +4429,9 @@ int main(int argc, char **argv) {
                              err.c_str());
                 err.clear();
             } else {
-                std::fprintf(stderr, "strata generate: %lld of %zu experts missing from VRAM (+ %zu in the prompt loan's slots) mirrored in pinned host memory "
+                std::fprintf(stderr, "strata generate: %lld of %zu experts missing from VRAM (+ %zu %s) mirrored in pinned host memory "
                                      "(%.2f GiB, %.1f s); the GPU reads them over PCIe\n", (long long) got, n_true_miss, miss.size() - n_true_miss,
+                             lru_want ? "in VRAM, for the expert LRU" : "in the prompt loan's slots",
                              (double) gguf_src.mirrored_bytes() / 1073741824.0,
                              std::chrono::duration<double>(Clock::now() - tm).count());
                 // the device-built verify plan's view of it: each (layer, expert) -> its mirror address, 0 = none
@@ -5288,8 +5313,18 @@ int main(int argc, char **argv) {
     // The residency table is read by kernels on non-blocking streams, which do not wait for the legacy stream a plain
     // cudaMemcpy runs on, and a pageable copy can return before its DMA has landed: each upload waits for its own copy
     // (the current device's legacy stream, stream 0 - nothing else; HIP has no cudaStreamLegacy name, #550).
-    auto res_put = [&host_res](int32_t *dst) {
+    struct LruState {
+        int32_t* d_res = nullptr;
+        int64_t slots = 0;
+        strata::kernels::ExpertLru cfg;
+    } lru;
+    auto res_put = [&host_res, &lru](int32_t *dst) {
         strata::ze::copy_sync(dst, host_res.data(), host_res.size() * sizeof(int32_t));
+        if (lru.cfg.owner == nullptr || dst != lru.d_res) return;
+        std::vector<int32_t> own((size_t) lru.slots, -1);
+        for (size_t i = 0; i < host_res.size(); ++i)
+            if (host_res[i] >= 0 && host_res[i] < lru.slots) own[(size_t) host_res[i]] = (int32_t) i;
+        strata::ze::copy_sync(lru.cfg.owner, own.data(), own.size() * sizeof(int32_t));
     };
     int32_t* d_res = nullptr;
     int32_t* d_hit_count = nullptr;
@@ -5361,6 +5396,80 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "strata generate: token graph hit path: %lld resident experts, decided on the device\n",
                      (long long) resident);
     }
+    auto lru_setup = [&](int64_t lru_end) {
+        if (!lru_want || lru.cfg.owner != nullptr) return;
+        auto off = [](const char* why) { std::fprintf(stderr, "strata generate: expert LRU off: %s\n", why); };
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        const int64_t blob = (int64_t) lay.max_blob, n_slots = xcache.slots();
+        if (mirror_table_d == nullptr || d_res == nullptr || host_res.empty() || lru_end <= 0 || n_slots <= 0)
+            return off("it needs the device-built plan, its residency table and the host mirror");
+        for (int64_t l = 0; l < g.n_layers; ++l)
+            if ((int64_t) lay.blob_bytes(l) != blob) return off("the layers' expert blobs differ in size");
+        if (blob % 16 != 0) return off("the expert blob is not a multiple of 16 bytes");
+        if (const uint64_t* so = xcache.slot_offsets(); so != nullptr)
+            for (int64_t sl = 0; sl < n_slots; ++sl)
+                if (so[sl] % 16 != 0 || (int64_t) (so[sl + 1] - so[sl]) < blob)
+                    return off("a cache slot is smaller than a blob or not 16-byte aligned");
+        for (int64_t l = 0; l < g.n_layers; ++l)
+            for (int64_t e = 0; e < g.n_expert; ++e)
+                if (!gguf_src.pinned(l, e) || (uintptr_t) gguf_src.device_alias(l, e) % 16 != 0)
+                    return off("not every expert is in the host mirror (raise STRATA_MIRROR_MIB or the free RAM)");
+        constexpr size_t kJobs = 128;
+        strata::kernels::ExpertLru c;
+        c.res_all = d_res;
+        c.entries = g.n_layers * g.n_expert;
+        c.owner = (int32_t*) strata::ze::malloc_device((size_t) n_slots * sizeof(int32_t));
+        c.last = (uint32_t*) strata::ze::malloc_device((size_t) n_slots * sizeof(uint32_t));
+        c.state = (uint32_t*) strata::ze::malloc_device(4 * sizeof(uint32_t));
+        c.jobs = (unsigned long long*) strata::ze::malloc_device(2 * kJobs * sizeof(unsigned long long));
+        c.njobs = (uint32_t*) strata::ze::malloc_device(sizeof(uint32_t));
+        if (c.owner == nullptr || c.last == nullptr || c.state == nullptr || c.jobs == nullptr || c.njobs == nullptr) {
+            for (void* q : {(void*) c.owner, (void*) c.last, (void*) c.state, (void*) c.jobs, (void*) c.njobs})
+                if (q != nullptr) strata::ze::free(q);
+            return off("its device allocations failed");
+        }
+        if (const char* v = std::getenv("STRATA_EXPERT_LRU_GUARD")) c.guard = (uint32_t) std::max(1, std::atoi(v));
+        if (const char* v = std::getenv("STRATA_EXPERT_LRU_SAMPLE")) c.sample = (uint32_t) std::max(0, std::atoi(v));
+        const int64_t end = std::min(lru_end, n_slots), warm = end / 2;
+        std::vector<uint32_t> last0((size_t) n_slots, 0u);
+        for (int64_t sl = 0; sl < warm; ++sl) last0[(size_t) sl] = c.guard + 1u;
+        const uint32_t state0[4] = {c.guard + 1u, (uint32_t) warm, (uint32_t) end, 0u};
+        const uint32_t zero = 0;
+        strata::ze::copy_sync(c.last, last0.data(), last0.size() * sizeof(uint32_t));
+        strata::ze::copy_sync(c.state, state0, sizeof state0);
+        strata::ze::copy_sync(c.njobs, &zero, sizeof zero);
+        lru.d_res = d_res;
+        lru.slots = n_slots;
+        lru.cfg = c;
+        res_put(d_res);
+        strata::kernels::resident_plan_set_lru(&lru.cfg);
+        std::fprintf(stderr, "strata generate: expert LRU on: slots [0, %lld) of %lld follow the routing (guard %u plan "
+                             "calls, sample %u)\n", (long long) end, (long long) n_slots, c.guard, c.sample);
+    };
+    auto lru_pull = [&]() {
+        if (lru.cfg.owner == nullptr) return;
+        strata::ze::device_sync();
+        strata::ze::copy_sync(host_res.data(), lru.d_res, host_res.size() * sizeof(int32_t));
+    };
+    unsigned long long* plan_stats_d = nullptr;
+    unsigned long long plan_stats_seen[3] = {0, 0, 0};
+    auto plan_stats_on = [&]() -> unsigned long long* {
+        if (plan_stats_d == nullptr && mirror_table_d != nullptr &&
+            (plan_stats_d = (unsigned long long*) strata::ze::malloc_device(3 * sizeof(unsigned long long))) != nullptr) {
+            const unsigned long long z[3] = {0, 0, 0};
+            strata::ze::copy_sync(plan_stats_d, z, sizeof z);
+        }
+        return plan_stats_d;
+    };
+    auto plan_stats_take = [&](unsigned long long out[3]) -> bool {
+        if (plan_stats_d == nullptr) return false;
+        unsigned long long now[3] = {0, 0, 0};
+        strata::ze::device_sync();
+        strata::ze::copy_sync(now, plan_stats_d, sizeof now);
+        for (int i = 0; i < 3; ++i) out[i] = now[i] - plan_stats_seen[i];
+        std::memcpy(plan_stats_seen, now, sizeof now);
+        return out[2] > 0;
+    };
     if (!o.no_capture && !o.no_token_graph && layer_dump == nullptr && half_dump == nullptr &&
         (hit_fn == nullptr || thits.on()) && !native_pack && !multi_gpu) {   // a split's token graph cannot span stages
         if (!strata::core::session_capture_token(wt, g, ss, d_parts, loop_scratch.y_miss, loop_scratch.parts_bytes,
@@ -6349,9 +6458,12 @@ int main(int argc, char **argv) {
         strata::core::Verifier ver;
         strata::core::VerifyHits vh;
         vh.d_res = thits.d_res;
-        if (mirror_table_d) strata::kernels::resident_plan_set_mirror(thits.d_res, g.n_layers * g.n_expert, mirror_table_d);
+        if (mirror_table_d)
+            strata::kernels::resident_plan_set_mirror(thits.d_res, g.n_layers * g.n_expert, mirror_table_d, nullptr,
+                                                      plan_stats_on());
         for (auto& st : stages)
             if (st->mirror_d && st->d_res) strata::kernels::resident_plan_set_mirror(st->d_res, g.n_layers * g.n_expert, st->mirror_d);
+        lru_setup(lend_first >= 0 ? (int64_t) lend_first : xcache.slots());
         vh.h_res = host_res.empty() ? nullptr : host_res.data();
         vh.cache_base = thits.cache_base;
         vh.blob = thits.blob;
@@ -9046,6 +9158,7 @@ int main(int argc, char **argv) {
             // STRATA_REFILL_SERIAL=1: stage after stage, as 0.1.30/0.1.31.
             static const bool refill_serial = std::getenv("STRATA_REFILL_SERIAL") != nullptr;
             auto refill = [&](std::string& e) -> bool {
+                lru_pull();
                 const auto t_rf = Clock::now();
                 int64_t n_lent = 0, n_parts = 0;
                 for (PfPart& p : pf_parts)
@@ -9072,6 +9185,7 @@ int main(int argc, char **argv) {
             // rounded up to 256), laid out in the last of the slots it may borrow - per participant, out of that
             // participant's own cache, and marking only that participant's own layers
             auto lend = [&](int64_t tokens, std::string& e) -> bool {
+                lru_pull();
                 if (pf_parts.empty()) return true;                     // its own buffers: nothing to lend
                 const auto t_ln = Clock::now();
                 // what this segment needs, capped by the configured chunk: a request lends only what its own
@@ -9140,6 +9254,7 @@ int main(int argc, char **argv) {
             // the request ends with `YIELDED <slot> <tokens>` + DONE cancel, and the server sends it again later: it
             // continues from the slot with the same chunks.  #656's cooperative preemption, with a slot as the park.
             auto read_part = [&](int64_t a0, int64_t b0, std::string& e) -> bool {
+                lru_pull();
                 // (a layer split reads its stages as a pipeline over one run's chunks: in pieces only beside slots)
                 if (o.batch <= 0 || piped || (!stages.empty() && !batch_on())) return sp.run(ids.data() + a0, b0 - a0, a0, e);
                 const int64_t C = std::max<int64_t>(sp.chunk(), 1);
@@ -10376,6 +10491,10 @@ int main(int argc, char **argv) {
                              100.0 * (double) req_hits / (double) req_look,
                              (long long) req_hits, (long long) req_look, off);
             }
+            if (unsigned long long ps[3]; plan_stats_take(ps))
+                std::fprintf(stderr, "strata serve: device plan: %.1f%% of %llu routed entries found their expert in VRAM, "
+                                     "%llu experts admitted by the LRU in this request\n",
+                             100.0 * (double) ps[1] / (double) ps[2], ps[2], ps[0]);
             // the resident RAM mode, cumulative: experts read from experts.bin since the copy was made (what the plain
             // mmap mode reads through the OS file cache, from the SSD when the RAM could not keep it)
             if (src.complement_ready())
@@ -10867,7 +10986,10 @@ int main(int argc, char **argv) {
             strata::ze::default_stream().memset(usage_dev, 0, (size_t) (g.n_layers * g.n_expert) * 4);
             strata::ze::default_stream().sync();
         }
-        if (mirror_table_d) strata::kernels::resident_plan_set_mirror(thits.d_res, g.n_layers * g.n_expert, mirror_table_d, usage_dev);
+        if (mirror_table_d)
+            strata::kernels::resident_plan_set_mirror(thits.d_res, g.n_layers * g.n_expert, mirror_table_d, usage_dev,
+                                                      plan_stats_on());
+        lru_setup(xcache.slots());
         vh.h_res = host_res.empty() ? nullptr : host_res.data();
         vh.cache_base = thits.cache_base;
         vh.blob = thits.blob;
@@ -11404,6 +11526,9 @@ int main(int argc, char **argv) {
                             (long long) total);
             }
         }
+        if (unsigned long long ps[3]; plan_stats_take(ps))
+            std::printf("%-24s %.1f%% of %llu routed entries found their expert in VRAM, %llu experts admitted by the "
+                        "LRU\n", "expert vram hits", 100.0 * (double) ps[1] / (double) ps[2], ps[2], ps[0]);
         if (rounds > 0 && !drive.d.usage.empty())
             std::printf("%-24s %lld experts swapped into the VRAM tier (every %d rounds, %.3f ms/round)\n", "adaptive tier",
                         (long long) swaps_total, o.adapt_every, ms_adapt / rounds);

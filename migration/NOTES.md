@@ -150,3 +150,38 @@ pinned for these two runs (min_freq 400). All five answers identical between the
 | pp@16k (15,796 tokens) | 1,557 tok/s | 2,245 tok/s |
 | tg@6k | 24.2 tok/s | 32.8 tok/s |
 | tg@16k | 23.6 tok/s | 32.7 tok/s |
+
+### One B70, expert LRU (`STRATA_EXPERT_LRU=1`)
+
+The device-side expert LRU of `wg/intel-ze/level-zero-runtime` (fbd94bd1..eda7d455), ported to `strata::ze`. Every
+expert is mirrored in pinned host memory (63.3 GiB). The device plan admits each miss into the least recently used of
+16 sampled slots not used in the last 150 plan calls, and `verify_kernels_lru_copy` copies it from the mirror into the
+slot before the window's expert kernels read it. It is opt-in and refuses itself, with one line, outside one GPU with
+`STRATA_VERIFY_NO_HOST=1`, `STRATA_VERIFY_DEVICE_PLAN=1`, no `--batch`, no `--expert-cache-deviceN`, no
+`--vram-elastic` and no elastic K/V. The adaptive tier is already off in that mode. Serve copies the device table
+back to the host before a prompt loan, a refill or a prompt read. The device plan now also counts VRAM hits (the
+"expert vram hits" line in generate, "device plan:" per request in serve).
+
+Generate (`ng-l0.sh`, mtp, 256 tokens), logits bit-identical to the run without it on kl-a, kl-b and kl-c. The hit
+rates match `scripts/expert-cache-sim.py`'s replay of the same policy on the routing traces (92.4, 92.1, 84.8%).
+
+| set | VRAM hits, static / LRU | decode, static / LRU |
+|---|---|---|
+| kl-a | 59.3% / 92.4% | 28.1 / 62.8 tok/s |
+| kl-b | 72.8% / 92.1% | 31.9 / 49.6 tok/s |
+| kl-c | 59.6% / 84.7% | 26.8 / 47.5 tok/s |
+
+Serve, one round each, same binary and session, min_freq 400 (`$REF/data/l0-serve-1gpu-lruwip-off`, `-on`). All five
+answers identical between the two.
+
+| | static | LRU |
+|---|---|---|
+| chat0 / chat1 / chat2 decode | 23.9 / 18.1 / 20.0 tok/s | 65.5 / 58.7 / 51.2 tok/s |
+| pp@6k | 1,384 tok/s | 1,376 tok/s |
+| pp@16k | 1,572 tok/s | 1,603 tok/s |
+| tg@6k | 24.3 tok/s | 55.7 tok/s |
+| tg@16k | 23.7 tok/s | 57.1 tok/s |
+
+Not exercised yet: the serve prompt loan with the LRU (these runs had no loan), and a first start after the page
+cache was dropped. The first LRU run of the day prefilled 63 tokens in 11.8 s, with PLE reads at 2.1 s against 3 ms,
+and its rerun took 0.54 s.

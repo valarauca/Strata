@@ -259,17 +259,32 @@ struct MirrorReg {
     int64_t n = 0;
     const unsigned long long* table = nullptr;
     int32_t* usage = nullptr;
+    unsigned long long* stats = nullptr;
 };
 MirrorReg g_mirror[16];
+ExpertLru g_lru[16];
 }
 void resident_plan_set_mirror(const int32_t* d_res, int64_t entries, const unsigned long long* mirror_table,
-                              int32_t* usage) {
+                              int32_t* usage, unsigned long long* stats) {
     for (MirrorReg& r : g_mirror)
         if (r.res == d_res || r.res == nullptr) {
-            r = MirrorReg{d_res, entries, mirror_table, usage};
+            r = MirrorReg{d_res, entries, mirror_table, usage, stats};
             return;
         }
     std::fprintf(stderr, "resident_plan_set_mirror: more than 16 residency tables\n");
+    std::exit(1);
+}
+void resident_plan_set_lru(const ExpertLru* lru) {
+    if (lru == nullptr) {
+        for (ExpertLru& l : g_lru) l = ExpertLru{};
+        return;
+    }
+    for (ExpertLru& l : g_lru)
+        if (l.res_all == lru->res_all || l.res_all == nullptr) {
+            l = *lru;
+            return;
+        }
+    std::fprintf(stderr, "resident_plan_set_lru: more than 16 residency tables\n");
     std::exit(1);
 }
 void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_layer, int n_expert,
@@ -277,6 +292,7 @@ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_
                    long long capx, uint32_t* skip, uint32_t ring, void* stream, uint32_t* plan_err) {
     const unsigned long long* mir = nullptr;   // SYCL port: the layer's slice of the host-mirror table, if any
     int32_t* use = nullptr;                    // the layer's slice of the device routing counts, if on
+    unsigned long long* stats = nullptr;
     for (const MirrorReg& m : g_mirror) {
         if (m.res == nullptr) break;
         const uintptr_t r0 = (uintptr_t) m.res, r = (uintptr_t) res_layer;
@@ -284,11 +300,32 @@ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_
         if (at < 0 || at + n_expert > m.n) continue;
         if (m.table != nullptr) mir = m.table + at;
         if (m.usage != nullptr) use = m.usage + at;
+        stats = m.stats;
         break;
     }
-    k_verify_kernels_resident_plan(strata::ze::stream_of(stream), {1, 1, 1}, {kResidentPlanMax, 1, 1}, 0, ids,
-                                   n_entries, k, res_layer, n_expert, cache_base, slot_off, blob, plan, capx, skip, ring,
-                                   mir, plan_err, use);
+    const ExpertLru* lru = nullptr;
+    int lru_layer = -1;
+    for (const ExpertLru& l : g_lru) {
+        if (l.res_all == nullptr) break;
+        const uintptr_t r0 = (uintptr_t) l.res_all, r = (uintptr_t) res_layer;
+        const int64_t at = r >= r0 ? (int64_t) ((r - r0) / sizeof(int32_t)) : -1;
+        if (at < 0 || at + n_expert > l.entries || at % n_expert != 0) continue;
+        lru = &l;
+        lru_layer = (int) (at / n_expert);
+        break;
+    }
+    if (lru != nullptr && (mir == nullptr || blob <= 0 || blob % 16 != 0)) {
+        lru = nullptr;
+        lru_layer = -1;
+    }
+    strata::ze::Stream* st = strata::ze::stream_of(stream);
+    k_verify_kernels_resident_plan(st, {1, 1, 1}, {kResidentPlanMax, 1, 1}, 0, ids, n_entries, k, res_layer, n_expert,
+                                   cache_base, slot_off, blob, plan, capx, skip, ring, mir, plan_err, use, stats,
+                                   lru ? lru->res_all : nullptr, lru ? lru->owner : nullptr, lru ? lru->last : nullptr,
+                                   lru ? lru->state : nullptr, lru ? lru->jobs : nullptr, lru ? lru->njobs : nullptr,
+                                   lru_layer, lru ? lru->guard : 0u, lru ? lru->scan : 0u, lru ? lru->sample : 0u);
+    if (lru != nullptr)
+        k_verify_kernels_lru_copy(st, {256, 1, 1}, {256, 1, 1}, 0, lru->jobs, lru->njobs, (long long) (blob / 16));
 }
 void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream) {
     const uint32_t spin_max = strata::spin_max(strata::ze::stream_of(stream)->device());
