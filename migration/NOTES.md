@@ -186,3 +186,20 @@ answers identical between the two.
 Not exercised yet: the serve prompt loan with the LRU (these runs had no loan), and a first start after the page
 cache was dropped. The first LRU run of the day prefilled 63 tokens in 11.8 s, with PLE reads at 2.1 s against 3 ms,
 and its rerun took 0.54 s.
+
+### A/B against the pre-fork original (03:00.0, min_freq 2800)
+
+The original is 7695859a (origin/main, the SYCL engine) and the new build is 19852929 (Level Zero, expert LRU on).
+Serve ran one round per arm, sequentially, with the same arguments (`$REF/data/ab-pinned/`). Each build ran in its
+default mode. The original had `STRATA_VERIFY_DEVICE_PLAN=1`, NO_HOST off and its adaptive tier on, because 7695859a
+lacks the NO_HOST PLE gather fix. The new build had NO_HOST and the device plan. "default" is `--spec 4` with suffix
+drafts, and "MTP" adds `--mtp`. pp@128 is serve-ref's `p128` request (129 prompt tokens).
+
+| tok/s | original | new | original, MTP | new, MTP |
+|---|---|---|---|---|
+| pp@128 | 71.9 | 144.0 | 77.2 | 155.7 |
+| pp@6k | 884 | 1,471 | 883 | 1,462 |
+| pp@16k | 1,009 | 1,612 | 1,006 | 1,604 |
+| tg@128 | 28.3 | 40.0 | 35.7 | 53.1 |
+| tg@6k | 36.0 | 42.9 | 51.4 | 58.8 |
+| tg@16k | 35.6 | 41.7 | 53.3 | 57.1 |
