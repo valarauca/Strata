@@ -2,6 +2,33 @@
 
 **English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
 
+> [!IMPORTANT]
+> **This is an Intel Arc Pro B70 fork.** Its Intel engine (`sycl/`) runs on Intel Level Zero directly. Kernels are
+> compiled ahead of time with `ocloc` and no SYCL runtime is linked. It has only been tested on Intel Arc Pro B70
+> GPUs, through Level Zero, with the kernels vendored in this tree (`sycl/src/kernels` and `sycl/third_party`:
+> gemmstone, nGEN, ggml). The NVIDIA, AMD and other Intel material below is the upstream project's and is untested
+> here.
+
+### Building the Level Zero engine (Intel Arc Pro B70, Linux)
+
+Tested with Linux 7.0 (`xe` driver), the Intel oneAPI 2026.1 compiler (`icpx`), compute-runtime 26.31
+(`libze-intel-gpu1`), the Level Zero loader 1.32 (`libze1`, `libze-dev`), `ocloc` (IGC 2.40), CMake and Ninja.
+
+```sh
+source /opt/intel/oneapi/setvars.sh
+cmake -S sycl -B build-ze -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=icpx -DSTRATA_ZE_DEVICE=bmg-g31
+cmake --build build-ze --target strata
+ctest --test-dir build-ze        # kernel parity tests (STRATA_SYCL_PARITY=ON by default)
+```
+
+- `STRATA_ZE_DEVICE=bmg-g31` is the B70. Configure refuses anything but an Xe2 GPU (`bmg-*`, `lnl-*`).
+- Configure fetches llama.cpp's ggml (CPU only) at a pinned commit. To use a local llama.cpp checkout instead, pass
+  `-DSTRATA_GGML_DIR=<checkout>`.
+- Select the GPU with `ZE_ENABLE_PCI_ID_DEVICE_ORDER=1 ZE_AFFINITY_MASK=<n>`. The tested configuration also sets
+  `STRATA_VERIFY_NO_HOST=1 STRATA_VERIFY_DEVICE_PLAN=1`. The expert LRU is then on by default and pins every expert
+  in host memory (63 GiB for the Q4_0 experts). `STRATA_EXPERT_LRU=0` turns it off.
+- Results, the tested command lines and the migration notes are in `migration/NOTES.md`.
+
 <p align="center"><b>Run a 125-billion-parameter AI model on your own gaming PC</b><br>
 NVIDIA or AMD graphics card (12 GB or more) · Windows or Linux · free and open source</p>
 
