@@ -10847,6 +10847,10 @@ int main(int argc, char **argv) {
         std::vector<uint32_t> route_row;
         int32_t route_rows = 0;
         const char* route_dump_path = std::getenv("STRATA_DUMP_SPEC_ROUTE");
+        std::FILE* route_trace = nullptr;
+        std::vector<int32_t> route_ids;
+        int64_t route_windows = 0;
+        const char* route_trace_path = std::getenv("STRATA_ROUTE_TRACE");
         if (thits.d_res == nullptr) {
             std::fprintf(stderr, "strata generate: --spec needs the device residency table (--expert-profile, "
                                  "--expert-cache and the token graph)\n");
@@ -11153,6 +11157,25 @@ int main(int argc, char **argv) {
                              drive.d.fail ? drive.d.fail : "(no message)");
                 return 1;
             }
+            if (route_trace_path != nullptr && *route_trace_path) {
+                const int64_t rk = (ver.route_row_words() / g.n_layers - g.n_expert) / 2;
+                if (route_trace == nullptr) {
+                    route_trace = std::fopen(route_trace_path, "wb");
+                    const int32_t th[4] = {0x31525453, (int32_t) g.n_layers, (int32_t) g.n_expert, (int32_t) rk};
+                    if (route_trace == nullptr || std::fwrite(th, sizeof th, 1, route_trace) != 1) {
+                        std::fprintf(stderr, "strata generate: STRATA_ROUTE_TRACE: cannot write %s\n", route_trace_path);
+                        return 1;
+                    }
+                }
+                route_ids.resize((size_t) g.n_layers * (size_t) T * (size_t) rk);
+                const int32_t wh[2] = {(int32_t) T, (int32_t) p};
+                if (!ver.copy_route_ids(T, route_ids.data()) || std::fwrite(wh, sizeof wh, 1, route_trace) != 1 ||
+                    std::fwrite(route_ids.data(), sizeof(int32_t), route_ids.size(), route_trace) != route_ids.size()) {
+                    std::fprintf(stderr, "strata generate: STRATA_ROUTE_TRACE: window %lld failed\n", (long long) route_windows);
+                    return 1;
+                }
+                ++route_windows;
+            }
             if (hashes != nullptr) {   // FNV-1a over the window's final residual rows (a test path: a plain copy)
                 const size_t n_floats = (size_t) T * (size_t) (g.hc * g.n_embd);
                 hash_rows.resize(n_floats);
@@ -11314,6 +11337,10 @@ int main(int argc, char **argv) {
             std::fwrite(&route_rows, sizeof route_rows, 1, route_dump);
             std::fclose(route_dump);
             std::printf("%-24s %s (%d rows)\n", "spec route dumped", route_dump_path, (int) route_rows);
+        }
+        if (route_trace != nullptr) {
+            std::fclose(route_trace);
+            std::printf("%-24s %s (%lld windows)\n", "route trace", route_trace_path, (long long) route_windows);
         }
         if (spec_dump != nullptr) {
             std::fseek(spec_dump, 4, SEEK_SET);

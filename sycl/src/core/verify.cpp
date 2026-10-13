@@ -711,7 +711,8 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
                                                               g.n_expert) * 4);
     if (std::getenv("STRATA_DUMP_SPEC_LAYERS") != nullptr && lb_ == 0 && le_ == g.n_layers)
         dbgL_ = (float*) strata::ze::malloc_device((size_t) g.n_layers * (size_t) max_t * (size_t) (g.hc * g.n_embd + 2 * g.n_embd) * 4);
-    if (std::getenv("STRATA_DUMP_SPEC_ROUTE") != nullptr && lb_ == 0 && le_ == g.n_layers)
+    if ((std::getenv("STRATA_DUMP_SPEC_ROUTE") != nullptr || std::getenv("STRATA_ROUTE_TRACE") != nullptr) && lb_ == 0 &&
+        le_ == g.n_layers)
         dbgRt_ = (float*) strata::ze::malloc_device((size_t) g.n_layers * (size_t) max_t * (size_t) (g.n_expert + 2 * ss.k) * 4);
     std::fprintf(stderr, "strata verify: window up to %d tokens, %.1f MiB of device buffers%s\n", max_t,
                  (double) count.used / 1048576.0,
@@ -2999,6 +3000,20 @@ bool Verifier::copy_route(int t, void* host) const {
             cs_->memcpy(out + NE, lay + MT * NE + (size_t) t * K, K * 4);
             cs_->memcpy(out + NE + K, lay + MT * (NE + K) + (size_t) t * K, K * 4);
         }
+        cs_->sync();
+    } catch (const std::exception&) {
+        return false;
+    }
+    return true;
+}
+
+bool Verifier::copy_route_ids(int T, int32_t* host) const {
+    if (dbgRt_ == nullptr || host == nullptr || T <= 0 || T > max_t_) return false;
+    const ModelGeometry& g = *g_;
+    const size_t NE = (size_t) g.n_expert, K = (size_t) ss_->k, MT = (size_t) max_t_, RW = NE + 2 * K;
+    try {
+        for (int64_t l = 0; l < g.n_layers; ++l)
+            cs_->memcpy(host + (size_t) l * (size_t) T * K, dbgRt_ + (size_t) l * MT * RW + MT * NE, (size_t) T * K * 4);
         cs_->sync();
     } catch (const std::exception&) {
         return false;

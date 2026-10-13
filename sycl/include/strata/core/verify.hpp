@@ -95,6 +95,9 @@ public:
     bool copy_route(int t, void* host) const;
     /// STRATA_DUMP_SPEC_ROUTE: 32-bit words per dumped row, n_layers x (n_expert + 2*k)
     int64_t route_row_words() const;
+    /// STRATA_ROUTE_TRACE: the top-k expert ids of the last window's rows 0..T-1 for every layer, laid out
+    /// [layer][row][k] as n_layers x T x k int32 into `host` (false when the capture is off or T is out of range)
+    bool copy_route_ids(int T, int32_t* host) const;
     int64_t vocab() const { return next_ ? next_->vocab() : n_vocab_; }
     /// The sampling the verify window's head applies (temperature / top_p / top_k / seed).  Set per
     /// request; greedy by default.  The sampling itself runs OUTSIDE the captured graph - its
