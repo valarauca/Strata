@@ -12,12 +12,13 @@ namespace strata::kernels {
 /// expert was in VRAM when the plan started, and routed entries.
 void resident_plan_set_mirror(const int32_t* d_res, int64_t entries, const unsigned long long* mirror_table,
                               int32_t* usage = nullptr, unsigned long long* stats = nullptr);
-/// STRATA_EXPERT_LRU: the device-side expert cache policy. Each plan call (one layer of a window) refreshes the slots
-/// it hits and admits its misses: the hand takes the next `sample` slots of [0, lru_end) and evicts the least recently
-/// used of those not used in the last `guard` calls; if none qualifies it walks on to the first that does (at most
-/// `scan` steps in all; none found = the miss is read from the host mirror, unadmitted). An admitted expert's blob is
-/// copied from its mirror address into the slot by a kernel right after the plan, so the window's expert kernels read
-/// it from VRAM. Every slot holds one blob of the same size, and every expert has a mirror address.
+/// STRATA_EXPERT_LRU (on by default, =0 off): the device-side expert cache policy. Each plan call (one layer of a
+/// window) refreshes the slots it hits and admits its misses: the hand takes the next `sample` slots of [0, lru_end)
+/// and evicts the least recently used of those not used in the last `guard` calls; if none qualifies it walks on to
+/// the first that does (at most `scan` steps in all; none found = the miss is read from the host mirror, unadmitted).
+/// An admitted expert's blob is copied from its mirror address into the slot by a kernel right after the plan, so the
+/// window's expert kernels read it from VRAM. Every slot holds one blob of the same size, and every expert has a
+/// mirror address.
 struct ExpertLru {
     int32_t* res_all = nullptr;          ///< the [n_layers][n_expert] residency table the plans read and update
     int64_t entries = 0;                 ///< n_layers * n_expert

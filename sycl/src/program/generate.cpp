@@ -4357,7 +4357,8 @@ int main(int argc, char **argv) {
     int64_t unmirrored_misses = 0;
     const bool lru_want = [&] {
         const char* v = std::getenv("STRATA_EXPERT_LRU");
-        if (v == nullptr || v[0] != '1') return false;
+        if (v != nullptr && v[0] == '0') return false;
+        const bool asked = v != nullptr && v[0] == '1';
         auto on = [](const char* name) { const char* e = std::getenv(name); return e && *e && std::strcmp(e, "0") != 0; };
         const char* why = nullptr;
         if (!on("STRATA_VERIFY_NO_HOST") || !on("STRATA_VERIFY_DEVICE_PLAN"))
@@ -4369,7 +4370,7 @@ int main(int argc, char **argv) {
         else if (strata::core::qsa_kv_elastic() && xcache.vmm_range() != nullptr) why = "not with the elastic K/V";
         else if (!o.stream_experts || srcp != &gguf_src || o.expert_cache <= 0)
             why = "it needs --stream-experts and an expert cache";
-        if (why != nullptr) std::fprintf(stderr, "strata generate: expert LRU off: %s\n", why);
+        if (why != nullptr && asked) std::fprintf(stderr, "strata generate: expert LRU off: %s\n", why);
         return why == nullptr;
     }();
     if (o.stream_experts && srcp == &gguf_src && o.expert_cache > 0) {
@@ -5444,7 +5445,8 @@ int main(int argc, char **argv) {
         res_put(d_res);
         strata::kernels::resident_plan_set_lru(&lru.cfg);
         std::fprintf(stderr, "strata generate: expert LRU on: slots [0, %lld) of %lld follow the routing (guard %u plan "
-                             "calls, sample %u)\n", (long long) end, (long long) n_slots, c.guard, c.sample);
+                             "calls, sample %u; STRATA_EXPERT_LRU=0 off)\n", (long long) end, (long long) n_slots, c.guard,
+                     c.sample);
     };
     auto lru_pull = [&]() {
         if (lru.cfg.owner == nullptr) return;

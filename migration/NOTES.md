@@ -151,12 +151,13 @@ pinned for these two runs (min_freq 400). All five answers identical between the
 | tg@6k | 24.2 tok/s | 32.8 tok/s |
 | tg@16k | 23.6 tok/s | 32.7 tok/s |
 
-### One B70, expert LRU (`STRATA_EXPERT_LRU=1`)
+### One B70, expert LRU (on by default, `STRATA_EXPERT_LRU=0` off)
 
 The device-side expert LRU of `wg/intel-ze/level-zero-runtime` (fbd94bd1..eda7d455), ported to `strata::ze`. Every
 expert is mirrored in pinned host memory (63.3 GiB). The device plan admits each miss into the least recently used of
 16 sampled slots not used in the last 150 plan calls, and `verify_kernels_lru_copy` copies it from the mirror into the
-slot before the window's expert kernels read it. It is opt-in and refuses itself, with one line, outside one GPU with
+slot before the window's expert kernels read it. It is on by default and stays off (with one line when
+`STRATA_EXPERT_LRU=1` asked for it) outside one GPU with
 `STRATA_VERIFY_NO_HOST=1`, `STRATA_VERIFY_DEVICE_PLAN=1`, no `--batch`, no `--expert-cache-deviceN`, no
 `--vram-elastic` and no elastic K/V. The adaptive tier is already off in that mode. Serve copies the device table
 back to the host before a prompt loan, a refill or a prompt read. The device plan now also counts VRAM hits (the
