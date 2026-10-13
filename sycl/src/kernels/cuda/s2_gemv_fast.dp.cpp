@@ -26,13 +26,8 @@
 // Both changes alter the summation order or the expression, so this kernel is checked against the naive
 // reference like every other one - being faster is never a reason to be trusted, and being neutral is not
 // either.
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
+#include "strata/port.hpp"
 #include "strata/kernels/s_gemv.hpp"
-
-#include <cstdio>
-#include <cstdlib>
 
 namespace strata::kernels {
 namespace {
@@ -41,48 +36,30 @@ constexpr int QK_S2 = 64;
 constexpr int MAX_SHARED_HALVES = 4096;      // 8 KB of shared for x; n_embd 2560 fits with room
 
 // byte -> the four code values with the -1 bias already applied, in element order (bits 0,2,4,6).
-inline dpct::constant_memory<float, 2>& c_codes = *new dpct::constant_memory<float, 2>(256, 4);   // never freed: exit-order safe
+struct alignas(16) CodeLut {
+    float v[256][4];
+};
 
-bool g_lut_ready[64] = {};   // per device: __constant__ memory is per device (a layer split runs on two)
-
-void ensure_lut() try {
-    int dev = 0;
-    dev = dpct::get_current_device_id();
-    if (dev < 0 || dev >= 64) dev = 0;
-    if (g_lut_ready[dev]) return;
-    float host[256][4];
+constexpr CodeLut make_code_lut() {
+    CodeLut t{};
     for (int b = 0; b < 256; ++b) {
         for (int k = 0; k < 4; ++k) {
-            host[b][k] = (float) (((b >> (2 * k)) & 3) - 1);
+            t.v[b][k] = (float) (((b >> (2 * k)) & 3) - 1);
         }
     }
-    const dpct::err0 e =
-        DPCT_CHECK_ERROR(dpct::get_in_order_queue()
-                             .memcpy(c_codes.get_ptr(), host, sizeof(host))
-                             .wait());
+    return t;
+}
 
-    g_lut_ready[dev] = true;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
+constexpr CodeLut c_codes_lut = make_code_lut();
 
 // One block per output row.  `staged` says whether x was copied to shared, so the SAME kernel covers both
 // configurations and the bench can measure them against each other with nothing else changed.
 template <bool STAGE_X>
-/*
-DPCT1110: The total declared local variable size in device function
-s2_gemv_fast_kernel exceeds 128 bytes and may cause high register pressure.
-Consult with your hardware vendor to find the total register size available and
-adjust the code, or use smaller sub-group size to avoid high register pressure.
-*/
 __dpct_inline__ void s2_gemv_fast_kernel(
     const uint16_t *__restrict__ x, const uint8_t *__restrict__ codes,
     const float *__restrict__ scales, float *__restrict__ y, long long n_in,
     long long n_out, int threads_per_row, uint8_t *dpct_local,
-    dpct::accessor<float, dpct::constant, 2> c_codes) {
+    const float (*c_codes)[4]) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     auto smem = (float *)dpct_local;
     sycl::half *sx = reinterpret_cast<sycl::half *>(
@@ -97,10 +74,6 @@ __dpct_inline__ void s2_gemv_fast_kernel(
         const sycl::half *xh = reinterpret_cast<const sycl::half *>(x);
 #pragma unroll
         for (long long i = tid; i < n_in; i += threads_per_row) sx[i] = xh[i];
-        /*
-        DPCT1118: SYCL group functions and algorithms must be encountered in
-        converged control flow. You may need to adjust the code.
-        */
         item_ct1.barrier(sycl::access::fence_space::local_space);
     }
 
@@ -141,10 +114,6 @@ __dpct_inline__ void s2_gemv_fast_kernel(
 #pragma unroll
     for (int step = threads_per_row / 2; step > 0; step >>= 1) {
         if (tid < step) partial[tid] += partial[tid + step];
-        /*
-        DPCT1118: SYCL group functions and algorithms must be encountered in
-        converged control flow. You may need to adjust the code.
-        */
         item_ct1.barrier(sycl::access::fence_space::local_space);
     }
     if (tid == 0) y[o] = partial[0];
@@ -152,99 +121,6 @@ __dpct_inline__ void s2_gemv_fast_kernel(
 
 }  // namespace
 
-void s2_gemv_fast(const uint16_t *x, const uint8_t *codes, const float *scales,
-                  float *y, int64_t n_in, int64_t n_out, int threads_per_row,
-                  bool stage_x) try {
-    if (n_in <= 0 || n_out <= 0) return;
-    if (n_in % 4 != 0 || n_in % QK_S2 != 0) {
-        std::fprintf(stderr, "s2_gemv_fast: n_in %lld must be a multiple of %d\n", (long long) n_in, QK_S2);
-        std::exit(1);
-    }
-    ensure_lut();
-    if (stage_x && n_in > MAX_SHARED_HALVES) {
-        std::fprintf(stderr, "s2_gemv_fast: n_in %lld exceeds the %d-half shared staging limit\n",
-                     (long long) n_in, MAX_SHARED_HALVES);
-        std::exit(1);
-    }
-    /*
-    DPCT1083: The size of local memory in the migrated code may be different
-    from the original code. Check that the allocated memory size in the migrated
-    code is correct.
-    */
-    const size_t smem = (stage_x ? MAX_SHARED_HALVES * sizeof(sycl::half) : 0) +
-                        (size_t)threads_per_row * sizeof(float);
-    if (stage_x) {
-        /*
-        DPCT1049: The work-group size passed to the SYCL kernel may exceed
-        the limit. To get the device limit, query
-        info::device::max_work_group_size. Adjust the work-group size if needed.
-        */
-        c_codes.init();
-
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-        dpct::has_capability_or_fail(dpct::get_in_order_queue().get_device(),
-                                     {sycl::aspect::fp16});
-
-        dpct::get_in_order_queue().submit([&](sycl::handler &cgh) {
-            sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
-                sycl::range(smem), cgh);
-            auto c_codes_acc_ct1 = c_codes.get_access(cgh);
-
-            cgh.parallel_for<dpct_kernel_name<class s2_gemv_fast_kernel_3b9618,
-                                              dpct_kernel_scalar<true>>>(
-                sycl::nd_range<3>(sycl::range(1, 1, (unsigned)n_out) *
-                                      sycl::range(1, 1, threads_per_row),
-                                  sycl::range(1, 1, threads_per_row)),
-                exp_props, [=](sycl::nd_item<3> item_ct1) {
-                    s2_gemv_fast_kernel<true>(
-                        x, codes, scales, y, n_in, n_out, threads_per_row,
-                        dpct_local_acc_ct1
-                            .get_multi_ptr<sycl::access::decorated::no>()
-                            .get(),
-                        c_codes_acc_ct1);
-                });
-        });
-    } else {
-        /*
-        DPCT1049: The work-group size passed to the SYCL kernel may exceed
-        the limit. To get the device limit, query
-        info::device::max_work_group_size. Adjust the work-group size if needed.
-        */
-        c_codes.init();
-
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-        dpct::has_capability_or_fail(dpct::get_in_order_queue().get_device(),
-                                     {sycl::aspect::fp16});
-
-        dpct::get_in_order_queue().submit([&](sycl::handler &cgh) {
-            sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
-                sycl::range(smem), cgh);
-            auto c_codes_acc_ct1 = c_codes.get_access(cgh);
-
-            cgh.parallel_for<dpct_kernel_name<class s2_gemv_fast_kernel_61f77f,
-                                              dpct_kernel_scalar<false>>>(
-                sycl::nd_range<3>(sycl::range(1, 1, (unsigned)n_out) *
-                                      sycl::range(1, 1, threads_per_row),
-                                  sycl::range(1, 1, threads_per_row)),
-                exp_props, [=](sycl::nd_item<3> item_ct1) {
-                    s2_gemv_fast_kernel<false>(
-                        x, codes, scales, y, n_in, n_out, threads_per_row,
-                        dpct_local_acc_ct1
-                            .get_multi_ptr<sycl::access::decorated::no>()
-                            .get(),
-                        c_codes_acc_ct1);
-                });
-        });
-    }
-    const dpct::err0 e =
-        DPCT_CHECK_ERROR(dpct::get_current_device().queues_wait_and_throw());
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
+#include "s2_gemv_fast.kern.inc"
 
 }  // namespace strata::kernels

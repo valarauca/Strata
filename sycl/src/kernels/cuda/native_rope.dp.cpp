@@ -22,26 +22,13 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
-#include "strata/sycl_queue.hpp"
+#include "strata/port.hpp"
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/mrope.hpp"
-#include <atomic>
-#include <cmath>
 #include <cstdint>
-#include <cstdlib>
-#include <limits>
-#include <stdexcept>
 
 namespace strata::kernels {
 namespace {
-std::atomic<bool> enabled{false};
-bool overlaps(const void* a, size_t an, const void* b, size_t bn) {
-    auto x = reinterpret_cast<uintptr_t>(a), y = reinterpret_cast<uintptr_t>(b);
-    return x <= y ? y - x < an : x - y < bn;
-}
 // TAB (#280, STRATA_ROPE_TABLE=1): the angles from the session's float64 table.  The host launches <false> whenever
 // no table applies - the default - so the default kernel is 0.1.31's code exactly (the table read is not in it;
 // with it merely skipped at run time, the compiled default path changed its results).
@@ -100,30 +87,15 @@ norm_rope_kernel(const float *x, int in_stride, const float *__restrict__ gamma,
             sycl::ext::oneapi::this_work_item::get_work_group<3>());
 #pragma unroll
     for (int offset = 16; offset; offset >>= 1)
-        /*
-        DPCT1108: '__shfl_xor_sync' was migrated with the experimental
-        feature masked sub_group function which may not be supported by all
-        compilers or runtimes. You may need to adjust the code.
-        */
         partial += dpct::experimental::permute_sub_group_by_xor(
             0xffffffffu, sycl::ext::oneapi::this_work_item::get_sub_group(),
             partial, offset);
     const int lane = tid % 32;
     if (lane == 0) sums[tid / 32] = partial;
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
     partial = lane < 256 / 32 ? sums[lane] : 0.0f;
 #pragma unroll
     for (int offset = 16; offset; offset >>= 1)
-        /*
-        DPCT1108: '__shfl_xor_sync' was migrated with the experimental
-        feature masked sub_group function which may not be supported by all
-        compilers or runtimes. You may need to adjust the code.
-        */
         partial += dpct::experimental::permute_sub_group_by_xor(
             0xffffffffu, sycl::ext::oneapi::this_work_item::get_sub_group(),
             partial, offset);
@@ -172,250 +144,7 @@ norm_rope_kernel(const float *x, int in_stride, const float *__restrict__ gamma,
     }
 }
 }
-// one table per device (a layer split runs the rope kernels on several): set and read for the current device
-namespace {
-constexpr int kMropeDevices = 64;
-std::atomic<const int32_t*> mrope_tab[kMropeDevices] = {};
-int mrope_dev() try {
-    int d = 0;
-    if (DPCT_CHECK_ERROR(d = dpct::get_current_device_id()) != 0 || d < 0 ||
-        d >= kMropeDevices) d = 0;
-    return d;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
-}  // namespace
-void mrope_table_set(const int32_t* device_table) { mrope_tab[mrope_dev()].store(device_table, std::memory_order_relaxed); }
-const int32_t* mrope_table() { return mrope_tab[mrope_dev()].load(std::memory_order_relaxed); }
-namespace {
-// #280: the float64 angle table of each device, set at session init (before any graph is captured)
-struct RopeReg {
-    RopeTab tab;
-    RopeScaling scaling;
-};
-RopeReg rope_tab[kMropeDevices] = {};
-bool same_scaling(const RopeScaling& a, const RopeScaling& b) {
-    return a.type == b.type && a.freq_base == b.freq_base && a.factor == b.factor && a.freq_scale_in == b.freq_scale_in &&
-           a.orig_ctx == b.orig_ctx && a.ext_factor == b.ext_factor && a.attn_factor == b.attn_factor &&
-           a.beta_fast == b.beta_fast && a.beta_slow == b.beta_slow;
-}
-// opt-in: STRATA_ROPE_TABLE=1 (the table's angles differ from the fast-math ones in the last bits, so outputs move)
-bool rope_table_enabled() {
-    static const bool on = [] {
-        const char* e = std::getenv("STRATA_ROPE_TABLE");
-        return e != nullptr && e[0] == '1';
-    }();
-    return on;
-}
-}  // namespace
-void rope_table_set(const float* cos_tab, const float* sin_tab, int max_pos, const RopeScaling& scaling) {
-    rope_tab[mrope_dev()] = RopeReg{RopeTab{cos_tab, sin_tab, max_pos}, scaling};
-}
-void rope_table_release(const float* cos_tab) {
-    // every device's entry that points at it (the caller may free it from another current device)
-    for (RopeReg& r : rope_tab)
-        if (cos_tab != nullptr && r.tab.cos == cos_tab) r = RopeReg{};
-}
-RopeTab rope_table_for(const RopeScaling& scaling) {
-    if (!rope_table_enabled()) return {};
-    const RopeReg& r = rope_tab[mrope_dev()];
-    return r.tab.cos != nullptr && same_scaling(r.scaling, scaling) ? r.tab : RopeTab{};
-}
-void native_rope_set_enabled(bool value) { enabled.store(value, std::memory_order_relaxed); }
-bool native_rope_enabled() { return enabled.load(std::memory_order_relaxed); }
-bool native_norm_rope_usable(int head_dim, int n_rot) {
-    static const bool on = [] {
-        const char* off = std::getenv("STRATA_NO_NORM_ROPE");
-        if (off != nullptr && off[0] != '\0' && off[0] != '0') return false;
-#if defined(__HIPCC__)
-        const char* v = std::getenv("STRATA_NORM_ROPE");   // AMD: opt in until rope_parity check 6 passes there
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-#else
-        return true;
-#endif
-    }();
-    return on && (head_dim == 128 || head_dim == 256) && n_rot == 64;
-}
 
-void native_rope_apply(const float* x, float* out, int rows, int head_dim,
-                       int n_rot, const RopeScaling& scaling, const int* positions, void* stream) {
-    if (!x || !out || !positions || !stream || rows < 1 || rows > 65535 ||
-        (head_dim != 128 && head_dim != 256) || n_rot != 64 ||
-        rope_scaling_invalid(scaling) != nullptr ||
-        reinterpret_cast<uintptr_t>(x) % 4 || reinterpret_cast<uintptr_t>(out) % 4 ||
-        reinterpret_cast<uintptr_t>(positions) % 4) {
-        throw std::invalid_argument("native RoPE requires aligned F32 rows, width 128/256, rotation 64, valid base/scaling and explicit stream");
-    }
-    const size_t bytes = size_t(rows) * head_dim * sizeof(float);
-    if ((x != out && overlaps(x, bytes, out, bytes)) ||
-        overlaps(positions, size_t(rows) * sizeof(int), out, bytes) ||
-        overlaps(positions, size_t(rows) * sizeof(int), x, bytes)) {
-        throw std::invalid_argument("native RoPE buffers partially overlap");
-    }
-    // Match pinned host-side float powf before device fast powf/trigonometry.
-    const float theta_scale = powf((float) scaling.freq_base, -2.0f / n_rot);
-    const RopeKernelArgs k = scaling.kernel_args(n_rot);   // none: the identity constants
-    const RopeTab rt = rope_table_for(scaling);
-    const unsigned threads = (x == out && n_rot == 64 && native_norm_rope_usable(head_dim, n_rot)) ? 32u : 128u;
-    const dpct::dim3 grid(
-        threads == 32u ? 1u : unsigned((head_dim / 2 + 127) / 128), rows);
-    if (rt.cos != nullptr)
-        /*
-        DPCT1049: The work-group size passed to the SYCL kernel may exceed
-        the limit. To get the device limit, query
-        info::device::max_work_group_size. Adjust the work-group size if needed.
-        */
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
+#include "native_rope.kern.inc"
 
-        ((sycl::queue *)(strata::q_of(stream)))
-            ->submit([&](sycl::handler &cgh) {
-                auto mrope_table_ct12 = mrope_table();
-
-                cgh.parallel_for<dpct_kernel_name<class apply_b955ef,
-                                                  dpct_kernel_scalar<true>>>(
-                    sycl::nd_range<3>(grid * sycl::range(1, 1, threads),
-                                      sycl::range(1, 1, threads)),
-                    exp_props, [=](sycl::nd_item<3> item_ct1) {
-                        apply<true>(x, out, rows, head_dim, n_rot, theta_scale,
-                                    k.freq_scale, k.corr_low, k.corr_high,
-                                    k.ext_factor, k.attn_factor, positions,
-                                    mrope_table_ct12, rt);
-                    });
-            });
-    } else
-    /*
-    DPCT1049: The work-group size passed to the SYCL kernel may exceed
-    the limit. To get the device limit, query
-    info::device::max_work_group_size. Adjust the work-group size if needed.
-    */
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        ((sycl::queue *)(strata::q_of(stream)))
-            ->submit([&](sycl::handler &cgh) {
-                auto mrope_table_ct12 = mrope_table();
-
-                cgh.parallel_for<dpct_kernel_name<class apply_b955ef,
-                                                  dpct_kernel_scalar<false>>>(
-                    sycl::nd_range<3>(grid * sycl::range(1, 1, threads),
-                                      sycl::range(1, 1, threads)),
-                    exp_props, [=](sycl::nd_item<3> item_ct1) {
-                        apply<false>(x, out, rows, head_dim, n_rot, theta_scale,
-                                     k.freq_scale, k.corr_low, k.corr_high,
-                                     k.ext_factor, k.attn_factor, positions,
-                                     mrope_table_ct12, rt);
-                    });
-            });
-    }
-    /*
-    DPCT1010: SYCL uses exceptions to report errors and does not use the
-    error codes. The cudaGetLastError function call was replaced with 0. You
-    need to rewrite this code.
-    */
-    const auto error = 0;
-    /*
-    DPCT1009: SYCL reports errors using exceptions and does not use error
-    codes. Please replace the "get_error_string_dummy(...)" with a real
-    error-handling function.
-    */
-    /*
-    DPCT1001: The statement could not be removed.
-    */
-    /*
-    DPCT1000: Error handling if-stmt was detected but could not be
-    rewritten.
-    */
-    if (error !=
-        0) throw std::runtime_error(dpct::get_error_string_dummy(error));
-}
-
-void native_qsa_rms_norm_rope(const float* x, int in_stride, const float* gamma, float* out,
-                              int rows, int head_dim, int n_rot, float epsilon,
-                              const RopeScaling& scaling, const int* positions, void* stream) {
-    if (!x || !gamma || !out || !positions || !stream || rows < 1 || rows > 65535 ||
-        (head_dim != 128 && head_dim != 256) || in_stride < head_dim || n_rot != 64 ||
-        !std::isfinite(epsilon) || epsilon < 0.0f ||
-        rope_scaling_invalid(scaling) != nullptr ||
-        reinterpret_cast<uintptr_t>(x) % 4 || reinterpret_cast<uintptr_t>(gamma) % 4 ||
-        reinterpret_cast<uintptr_t>(out) % 4 || reinterpret_cast<uintptr_t>(positions) % 4) {
-        throw std::invalid_argument("native_qsa_rms_norm_rope: invalid arguments");
-    }
-    const float theta_scale = powf((float) scaling.freq_base, -2.0f / n_rot);
-    const RopeKernelArgs k = scaling.kernel_args(n_rot);
-    const RopeTab rt = rope_table_for(scaling);
-    if (rt.cos != nullptr)
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        ((sycl::queue *)(strata::q_of(stream)))
-            ->submit([&](sycl::handler &cgh) {
-                auto mrope_table_ct14 = mrope_table();
-
-                cgh.parallel_for<dpct_kernel_name<class norm_rope_kernel_c8b2b8,
-                                                  dpct_kernel_scalar<true>>>(
-                    sycl::nd_range<3>(sycl::range(1, 1, unsigned(rows)) *
-                                          sycl::range(1, 1, 256),
-                                      sycl::range(1, 1, 256)),
-                    exp_props,
-                    [=](sycl::nd_item<3> item_ct1)
-                        [[sycl::reqd_sub_group_size(32)]] {
-                            norm_rope_kernel<true>(
-                                x, in_stride, gamma, out, head_dim, n_rot,
-                                epsilon, theta_scale, k.freq_scale, k.corr_low,
-                                k.corr_high, k.ext_factor, k.attn_factor,
-                                positions, mrope_table_ct14, rt);
-                        });
-            });
-    } else {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        ((sycl::queue *)(strata::q_of(stream)))
-            ->submit([&](sycl::handler &cgh) {
-                auto mrope_table_ct14 = mrope_table();
-
-                cgh.parallel_for<dpct_kernel_name<class norm_rope_kernel_f9c8ef,
-                                                  dpct_kernel_scalar<false>>>(
-                    sycl::nd_range<3>(sycl::range(1, 1, unsigned(rows)) *
-                                          sycl::range(1, 1, 256),
-                                      sycl::range(1, 1, 256)),
-                    exp_props,
-                    [=](sycl::nd_item<3> item_ct1)
-                        [[sycl::reqd_sub_group_size(32)]] {
-                            norm_rope_kernel<false>(
-                                x, in_stride, gamma, out, head_dim, n_rot,
-                                epsilon, theta_scale, k.freq_scale, k.corr_low,
-                                k.corr_high, k.ext_factor, k.attn_factor,
-                                positions, mrope_table_ct14, rt);
-                        });
-            });
-    }
-    /*
-    DPCT1010: SYCL uses exceptions to report errors and does not use the
-    error codes. The cudaGetLastError function call was replaced with 0. You
-    need to rewrite this code.
-    */
-    const auto error = 0;
-    /*
-    DPCT1009: SYCL reports errors using exceptions and does not use error
-    codes. Please replace the "get_error_string_dummy(...)" with a real
-    error-handling function.
-    */
-    /*
-    DPCT1001: The statement could not be removed.
-    */
-    /*
-    DPCT1000: Error handling if-stmt was detected but could not be
-    rewritten.
-    */
-    if (error !=
-        0) throw std::runtime_error(dpct::get_error_string_dummy(error));
-}
 }

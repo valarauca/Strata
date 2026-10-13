@@ -1,6 +1,5 @@
-// sycl/src/core/conversation_state.cpp - SYCL port of src/core/conversation_state.cpp (two CUDA calls, by hand).
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
+// sycl/src/core/conversation_state.cpp - the Intel engine's src/core/conversation_state.cpp (two CUDA calls, by hand).
+#include "strata/ze/ze.hpp"
 #include "strata/core/conversation_snapshot.hpp"
 #include "conversation_checked.hpp"
 
@@ -25,28 +24,18 @@ bool fail(std::string& error, const char* message) {
     return false;
 }
 
-// SYCL port (hand-ported: no CUDA header is included here, so dpct never saw this file): the device-wide sync and
-// the any-direction copy as SYCL queue operations; errors arrive as exceptions instead of status codes.
+// Hand-ported (no CUDA header is included here): the device-wide sync and the any-direction copy on the Level Zero
+// runtime, which exits the process on a device failure instead of returning a status.
 bool sync(std::string& error) {
-    try {
-        dpct::get_current_device().queues_wait_and_throw();
-        return true;
-    } catch (sycl::exception const& e) {
-        error = std::string("conversation snapshot synchronize: ") + e.what();
-        return false;
-    }
+    strata::ze::device_sync();
+    return true;
 }
 
 bool copy(void* dst, const void* src, size_t bytes, std::string& error) {
     if (!bytes) return true;
     if (!dst || !src) return fail(error, "missing running-state buffer");
-    try {
-        dpct::get_in_order_queue().memcpy(dst, src, bytes).wait();
-        return true;
-    } catch (sycl::exception const& e) {
-        error = std::string("conversation snapshot running-state copy: ") + e.what();
-        return false;
-    }
+    strata::ze::copy_sync(dst, src, bytes);
+    return true;
 }
 
 // The session's carve (#216): `qsa_states` keeps global ordinals and holds the owned ones

@@ -16,9 +16,7 @@
 // `gr.cu` carried a private copy of `f32_to_bf16_bits` until this header existed.  It now includes this.
 #pragma once
 
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
+#include "strata/port.hpp"
 #include <cstdint>
 #include <cstring>
 

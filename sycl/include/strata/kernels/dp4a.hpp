@@ -18,9 +18,9 @@
 // HIP's own `__nanosleep`.
 #pragma once
 
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
+#include "strata/port.hpp"
+
+#if defined(SYCL_LANGUAGE_VERSION)
 #include <cstdint>
 #include <time.h>
 
@@ -45,11 +45,8 @@ __dpct_inline__ void strata_spin_pause() {
 #if defined(DPCT_COMPATIBILITY_TEMP) && DPCT_COMPATIBILITY_TEMP < 700
     // sm_6x: the loop spins.  Every call site is a single-thread doorbell wait, so nothing else is delayed.
 #else
-    /*
-    DPCT1008: __nanosleep function is not defined in SYCL. This is a
-    hardware-specific feature. Consult with your hardware vendor to find a
-    replacement.
-    */
     // SYCL port: no __nanosleep; the doorbell waits are bounded by strata::kSpinMax instead
 #endif
 }
+
+#endif  // SYCL_LANGUAGE_VERSION

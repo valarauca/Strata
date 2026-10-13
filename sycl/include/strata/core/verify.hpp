@@ -22,8 +22,7 @@
 #pragma once
 #include <functional>
 
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
+#include "strata/ze/ze.hpp"
 #include <cstdio>
 
 #include "strata/core/expert_source.hpp"
@@ -86,6 +85,19 @@ public:
     bool run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out, std::string& err);
     /// Diagnostics: row `t` of the last window's head logits (n_vocab floats) to the host. Valid after run().
     bool copy_logits(int t, float* host) const;
+    /// STRATA_DUMP_SPEC_LAYERS: row t's per-layer residual, mixer and MoE outputs of the last window, layer_row_floats()
+    /// floats into `host` (false when the dump is off or t is out of range)
+    bool copy_layers(int t, float* host) const;
+    /// STRATA_DUMP_SPEC_LAYERS: floats per dumped row, n_layers x (hc*n_embd + 2*n_embd)
+    int64_t layer_row_floats() const;
+    /// STRATA_DUMP_SPEC_ROUTE: row t's per-layer router logits, top-k ids and weights of the last window,
+    /// route_row_words() 32-bit words into `host` (false when the dump is off or t is out of range)
+    bool copy_route(int t, void* host) const;
+    /// STRATA_DUMP_SPEC_ROUTE: 32-bit words per dumped row, n_layers x (n_expert + 2*k)
+    int64_t route_row_words() const;
+    /// STRATA_ROUTE_TRACE: the top-k expert ids of the last window's rows 0..T-1 for every layer, laid out
+    /// [layer][row][k] as n_layers x T x k int32 into `host` (false when the capture is off or T is out of range)
+    bool copy_route_ids(int T, int32_t* host) const;
     int64_t vocab() const { return next_ ? next_->vocab() : n_vocab_; }
     /// The sampling the verify window's head applies (temperature / top_p / top_k / seed).  Set per
     /// request; greedy by default.  The sampling itself runs OUTSIDE the captured graph - its
@@ -199,13 +211,13 @@ public:
     // and returns at once, `done` polls the window's completion, `pl_finish` reads the picks, `pl_commit_async`
     // queues the commit.  Nothing chains to `next_`: the caller drives every stage.
     /// The compute stream to use instead of a private one (the two verifiers of one stage share it).  Before `init`.
-    void set_stream(dpct::queue_ptr s) { ext_stream_ = s; }
+    void set_stream(strata::ze::Stream* s) { ext_stream_ = s; }
     /// Every layer copies the token rows to the host (doorbell_publish), not only the layers with a routed expert
     /// outside the VRAM tier by the device's residency table: with windows in flight the adaptive tier marks an
     /// expert evicted on the host (the pool then computes it on the CPU) before the device table follows.  Also turns
     /// the device-planned layers (E-6) off.  Before `init`.
     void set_always_publish(bool on) { always_publish_ = on; }
-    dpct::queue_ptr stream() const { return cs_; }
+    strata::ze::Stream* stream() const { return cs_; }
     int device() const { return device_; }
     /// Capture every window size and the commit graph now (a capture syncs the stream: never with a window in flight).
     bool capture_all(std::string& err);
@@ -270,7 +282,7 @@ private:
     int row_base_ = 0;                     ///< ... its hand-off rows start here (a pipeline group's own rows)
     int brow_[8] = {};                     ///< ... and row t is slot brow_[t]
     bool last_batch_ = false;              ///< the last run was a batch window (set_plan_slot: one group)
-    std::map<std::vector<int>, dpct::experimental::command_graph_exec_ptr>
+    std::map<std::vector<int>, strata::ze::Graph*>
         exec_bm_, commit_bm_; ///< full row layout avoids slot-ID collisions
     std::map<std::vector<int>, uint64_t> bm_used_;   ///< last use of each captured layout (LRU, only with a graph limit)
     uint64_t bm_tick_ = 0;
@@ -304,12 +316,12 @@ private:
     void collect_profile();   ///< STRATA_VERIFY_PROFILE: add the last window's stamps to prof_sum_
     void accumulate_profile(const unsigned long long* stamps);   ///< one window's stamps (host copy) into prof_sum_
     // pipelined windows (pl_launch ...)
-    dpct::queue_ptr ext_stream_ = nullptr;  ///< set_stream: the stage's shared stream (not destroyed here);
+    strata::ze::Stream* ext_stream_ = nullptr;  ///< set_stream: the stage's shared stream (not destroyed here);
                                           ///< nullptr = none until set_stream() (#1555: a queue pointer captured
                                           ///< at construction would be the *constructing* device's)
     bool always_publish_ = false;
     void pl_stage(int T, const int32_t* tokens, int64_t pos0, const int32_t ple_prev[2]);
-    dpct::event_ptr ev_done_ = nullptr, ev_commit_ = nullptr;
+    strata::ze::Event* ev_done_ = nullptr, *ev_commit_ = nullptr;
     unsigned long long* prof_pin_ = nullptr;   ///< pinned host copy of the stamps (pipelined windows)
     bool fl_active_ = false, fl_prof_ = false, fl_ple_ = false, commit_live_ = false, pl_prestaged_ = false;
     int fl_T_ = 0;
@@ -354,7 +366,7 @@ private:
     bool staged_ = false;
     bool copy_used_ = false;
     bool capture_commit(std::string& err);
-    bool record_window(int T, dpct::queue_ptr cs, std::string &err);
+    bool record_window(int T, strata::ze::Stream* cs, std::string &err);
     // STRATA_VERIFY_STEPPED=1 (opt-in; Arc A-series / DG2): DG2 has no usm_atomic_host_allocations, so a running
     // kernel does not see the host's flag stores and the host sees the GPU's ring late (the doorbell wait is most of
     // a window there).  Stepped mode records the window as one graph per segment between host serves and serves each
@@ -363,7 +375,7 @@ private:
     // (a split point: the next segment is submitted as soon as the pool publishes its plan, while the CPU rows run).
     std::function<bool(int64_t, int)> step_hook_;
     std::function<bool(int64_t, int)> step_hook2_;
-    std::vector<dpct::experimental::command_graph_exec_ptr> seg_[9];
+    std::vector<strata::ze::Graph*> seg_[9];
     std::vector<std::pair<int64_t, int>> seg_at_[9];   ///< the (layer, group) after segment i; the last has none
     std::vector<char> seg_kind_[9];                    ///< 1: a serve point, 0: a split point
     bool capture_segments(int T, std::string& err);
@@ -393,16 +405,24 @@ private:
     int64_t last_pos0_ = 0;
     int32_t last_tokens_[8] = {};
     int64_t n_vocab_ = 0;
-    dpct::queue_ptr cs_ = &dpct::get_in_order_queue();
+    strata::ze::Stream* cs_ = &strata::ze::default_stream();
+    bool owns_streams_ = false;   ///< init created copy_, sh_cs_ and (without set_stream) cs_; before it they are the runtime's
     float* dbgR_ = nullptr;   ///< SYCL port debug: R (token 0) after every layer, n_layers x n_embd
+    float* dbgL_ = nullptr;   ///< STRATA_DUMP_SPEC_LAYERS: [n_layers][residual max_t x hc*N | mixer max_t x N | moe max_t x N]
     float* dbgM_ = nullptr;   ///< SYCL port debug: mixed_ (token 0) after every layer
-    dpct::queue_ptr sh_cs_ = &dpct::get_in_order_queue();
-    dpct::event_ptr ev_fork_ = nullptr, ev_join_ = nullptr;
-    dpct::experimental::command_graph_exec_ptr exec_[9] = {};
-    dpct::experimental::command_graph_exec_ptr exec_nr_[9] =
+    float* dumpL_ = nullptr;  ///< STRATA_DUMP_WINDOWS: token 0 after every layer: residual (hc*N), block output (N),
+                              ///< expert ids (K, int32 bits), routing weights (K), shared expert (N), expert outputs (K*N),
+                              ///< the layer's residency row (n_expert slots, int32 bits);
+                              ///< then the stage's input row (the embedding, or a later stage's hand-off)
+    int64_t dump_seq_ = 0;    ///< this verifier's windows so far (the file sequence)
+    float* dbgRt_ = nullptr;  ///< STRATA_DUMP_SPEC_ROUTE: [n_layers][logits max_t x NE | ids max_t x K | weights max_t x K]
+    strata::ze::Stream* sh_cs_ = &strata::ze::default_stream();
+    strata::ze::Event* ev_fork_ = nullptr, *ev_join_ = nullptr;
+    strata::ze::Graph* exec_[9] = {};
+    strata::ze::Graph* exec_nr_[9] =
         {}; // #871: the doorbell variant of a stage that is all-resident
             // otherwise
-    dpct::experimental::command_graph_exec_ptr commit_exec_ = nullptr;
+    strata::ze::Graph* commit_exec_ = nullptr;
 
     // mapped staging (host pointer, device alias)
     int32_t* h_tok_ = nullptr;   int32_t* m_tok_ = nullptr;     // T
@@ -418,17 +438,23 @@ private:
     uint32_t* h_flag_ = nullptr; uint32_t* m_flag_ = nullptr;
     uint32_t* h_flagA_ = nullptr; uint32_t* m_flagA_ = nullptr;  // the GPU plan is in place
     uint32_t* h_flagB_ = nullptr; uint32_t* m_flagB_ = nullptr;  // the PCIe share's DMA copies have landed
-    dpct::event_ptr commit_done_ =
+    strata::ze::Event* commit_done_ =
         nullptr; // recorded after an async commit (set_commit_async); see
                  // wait_commit
     bool commit_pending_ = false;
-    dpct::queue_ptr copy_ =
-        &dpct::get_in_order_queue(); // the copy engine's stream (DMA of missed
+    strata::ze::Stream* copy_ =
+        &strata::ze::default_stream(); // the copy engine's stream (DMA of missed
                                      // experts)
     struct FlagSet { uint32_t* flag; uint32_t value; };
     FlagSet flag_sets_[2 * 64 * 2] = {};                          // host-function arguments, one per (layer, group)
     static void fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t bytes);
     static void raise_flag(uint32_t* flag, uint32_t value);
+    /// Raises flag B to `want` behind this window's DMA host functions still queued on copy_ (flag B only rises, so a
+    /// direct raise would release a group whose copies have not landed); directly when copy_ is idle.
+    void raise_b(uint32_t want);
+    /// STRATA_DUMP_WINDOWS=<dir>: writes this window's dumpL_ rows for the stage's layers to
+    /// <dir>/w<seq>_l<lb>-<le>.bin (the first STRATA_DUMP_WINDOWS_MAX windows, default 64).
+    void dump_window(int T, const int32_t* tokens, int64_t pos0);
     int32_t* h_plan_ = nullptr;  int32_t* m_plan_ = nullptr;     // counts | start | dst | tok | ptr (as int32 pairs)
     int64_t plan_i32_ = 0;                                        // int32 words in the plan block
     GpuPlanSink sink_;

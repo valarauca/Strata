@@ -5,6 +5,12 @@ normal PC: one NVIDIA or AMD graphics card plus system RAM, on Windows or Linux.
 (`src/`, `include/`), a Python server with an OpenAI- and Anthropic-compatible API and a web app (`serve/`), and a
 one-click installer (`setup.py`, started by `START-HERE.bat` / `setup.sh`).
 
+## This is a private fork
+
+This checkout is a private fork that has diverged from upstream. Sweeping changes are permitted, including
+refactors across files, removed code paths and changed defaults. The upstream contribution rules below
+(one change per pull request, byte-identical default path, opt-in features) do not bind work here.
+
 ## Installing Strata for a user
 
 Follow **[docs/AI_SETUP.md](docs/AI_SETUP.md)**: check the PC, pick the model by RAM, run setup non-interactively,

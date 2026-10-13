@@ -21,16 +21,9 @@
 //      `rintf` differs from the reference wherever the f32 quotient rounds across a .5 boundary.
 //   3. The DEQUANTIZED value is `q * d16`, the fp16 scale, not `q * d32`.  The block stores fp16 and that is
 //      what a reader multiplies by.
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
-#include "strata/sycl_queue.hpp"
+#include "strata/port.hpp"
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/f16_bits.hpp"
-
-#include <cmath>
-#include <cstdio>
-#include <cstdlib>
 
 namespace strata::kernels {
 namespace {
@@ -152,11 +145,6 @@ __dpct_inline__ void quantize_q8_0_scaled_kernel(const float *__restrict__ x,
     uint8_t* out = blocks + b * 34;
 
     float amax = sycl::fmax(0.0f, sycl::fabs(xi));
-    /*
-DPCT1108: '__shfl_xor_sync' was migrated with the experimental feature
-masked sub_group function which may not be supported by all compilers or
-runtimes. You may need to adjust the code.
-*/
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) amax = sycl::fmax(
         amax, dpct::experimental::permute_sub_group_by_xor(
@@ -264,12 +252,6 @@ __dpct_inline__ void quantize_q8_K_kernel(const float *__restrict__ x,
         // wherever the true product sits just off a .5 boundary.  The first version of this kernel differed
         // from the reference in 1 element of 524,288 for exactly this reason, and `__fmul_rn` pins the
         // rounding step the source actually performs.
-        /*
-        DPCT1013: The rounding mode could not be specified and the generated
-        code may have different accuracy than the original code. Verify the
-        correctness. SYCL math built-in function rounding mode is aligned with
-        OpenCL C 1.2 standard.
-        */
         const int v = nearest_int_dev(iscale * xb[j]);
         qs[j] = (int8_t)sycl::min(
             127, v); // MIN only - the source has no lower clamp
@@ -302,173 +284,6 @@ __dpct_inline__ void dequant_q8_K_kernel(const uint8_t *__restrict__ blocks,
 
 }  // namespace
 
-void quantize_q8_0(const float* x, uint8_t* blocks, int64_t n, void* stream) {
-    if (n <= 0) return;
-    if (n % QK8_0 != 0) {
-        std::fprintf(stderr, "quantize_q8_0: n %lld is not a multiple of %d\n", (long long) n, QK8_0);
-        std::exit(1);
-    }
-    const long long nb = n / QK8_0;
-    const int threads = 128;
-    const unsigned grid = (unsigned) ((nb + threads - 1) / threads);
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-        dpct::has_capability_or_fail(
-            strata::q_of(stream)->get_device(),
-            {sycl::aspect::fp64});
-
-        strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class quantize_q8_0_kernel_5451b9>>(
-                sycl::nd_range<3>(sycl::range(1, 1, grid) *
-                                      sycl::range(1, 1, threads),
-                                  sycl::range(1, 1, threads)),
-                exp_props, [=](sycl::nd_item<3> item_ct1) {
-                    quantize_q8_0_kernel(x, blocks, nb);
-                });
-    }
-    /*
-    DPCT1010: SYCL uses exceptions to report errors and does not use the
-    error codes. The cudaGetLastError function call was replaced with 0. You
-    need to rewrite this code.
-    */
-    const dpct::err0 e = 0;
-
-    if (stream == nullptr) dpct::get_current_device().queues_wait_and_throw();
-}
-
-/// See `quantize_q8_0_scaled_kernel`.  Writes the same 34-byte `block_q8_0` layout as `quantize_q8_0`, plus
-/// `scales[n/32]` carrying the fp32 `s` the CPU path used - so a hit can be computed with the CPU's
-/// multiplier instead of the block's fp16 `d`.  `scales` must not be null.
-void quantize_q8_0_scaled(const float* x, uint8_t* blocks, float* scales, int64_t n, void* stream) {
-    if (n <= 0) return;
-    if (n % QK8_0 != 0) {
-        std::fprintf(stderr, "quantize_q8_0_scaled: n %lld is not a multiple of %d\n", (long long) n, QK8_0);
-        std::exit(1);
-    }
-    if (scales == nullptr) {
-        std::fprintf(stderr, "quantize_q8_0_scaled: scales is null\n");
-        std::exit(1);
-    }
-    const long long nb = n / QK8_0;
-    const int threads = 128;
-#if defined(__HIPCC__)
-    const unsigned grid = (unsigned) ((nb + threads - 1) / threads);
-#else
-    const unsigned grid = (unsigned) ((nb + threads / 32 - 1) / (threads / 32));   // a warp a block
-#endif
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        strata::q_of(stream)
-            ->parallel_for<
-                dpct_kernel_name<class quantize_q8_0_scaled_kernel_caf6f4>>(
-                sycl::nd_range<3>(sycl::range(1, 1, grid) *
-                                      sycl::range(1, 1, threads),
-                                  sycl::range(1, 1, threads)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        quantize_q8_0_scaled_kernel(x, blocks, scales, nb);
-                    });
-    }
-    /*
-    DPCT1010: SYCL uses exceptions to report errors and does not use the
-    error codes. The cudaGetLastError function call was replaced with 0. You
-    need to rewrite this code.
-    */
-    const dpct::err0 e = 0;
-
-    if (stream == nullptr) dpct::get_current_device().queues_wait_and_throw();
-}
-
-void dequant_q8_0(const uint8_t* blocks, float* x, int64_t n, void* stream) {
-    if (n <= 0) return;
-    const long long nb = n / QK8_0;
-    const int threads = 128;
-    const unsigned grid = (unsigned) ((nb + threads - 1) / threads);
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class dequant_q8_0_kernel_154e61>>(
-                sycl::nd_range<3>(sycl::range(1, 1, grid) *
-                                      sycl::range(1, 1, threads),
-                                  sycl::range(1, 1, threads)),
-                exp_props, [=](sycl::nd_item<3> item_ct1) {
-                    dequant_q8_0_kernel(blocks, x, nb);
-                });
-    }
-    /*
-    DPCT1010: SYCL uses exceptions to report errors and does not use the
-    error codes. The cudaGetLastError function call was replaced with 0. You
-    need to rewrite this code.
-    */
-    const dpct::err0 e = 0;
-
-    if (stream == nullptr) dpct::get_current_device().queues_wait_and_throw();
-}
-
-void quantize_q8_K(const float* x, uint8_t* blocks, int64_t n, void* stream) {
-    if (n <= 0) return;
-    if (n % QK_K != 0) {
-        std::fprintf(stderr, "quantize_q8_K: n %lld is not a multiple of %d\n", (long long) n, QK_K);
-        std::exit(1);
-    }
-    const long long nb = n / QK_K;
-    const int threads = 64;                       // one block per thread, and a block is 256 elements
-    const unsigned grid = (unsigned) ((nb + threads - 1) / threads);
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class quantize_q8_K_kernel_7aadb2>>(
-                sycl::nd_range<3>(sycl::range(1, 1, grid) *
-                                      sycl::range(1, 1, threads),
-                                  sycl::range(1, 1, threads)),
-                exp_props, [=](sycl::nd_item<3> item_ct1) {
-                    quantize_q8_K_kernel(x, blocks, nb);
-                });
-    }
-    /*
-    DPCT1010: SYCL uses exceptions to report errors and does not use the
-    error codes. The cudaGetLastError function call was replaced with 0. You
-    need to rewrite this code.
-    */
-    const dpct::err0 e = 0;
-
-    if (stream == nullptr) dpct::get_current_device().queues_wait_and_throw();
-}
-
-void dequant_q8_K(const uint8_t* blocks, float* x, int64_t n, void* stream) {
-    if (n <= 0) return;
-    const long long nb = n / QK_K;
-    const int threads = 64;
-    const unsigned grid = (unsigned) ((nb + threads - 1) / threads);
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class dequant_q8_K_kernel_e03426>>(
-                sycl::nd_range<3>(sycl::range(1, 1, grid) *
-                                      sycl::range(1, 1, threads),
-                                  sycl::range(1, 1, threads)),
-                exp_props, [=](sycl::nd_item<3> item_ct1) {
-                    dequant_q8_K_kernel(blocks, x, nb);
-                });
-    }
-    /*
-    DPCT1010: SYCL uses exceptions to report errors and does not use the
-    error codes. The cudaGetLastError function call was replaced with 0. You
-    need to rewrite this code.
-    */
-    const dpct::err0 e = 0;
-
-    if (stream == nullptr) dpct::get_current_device().queues_wait_and_throw();
-}
+#include "quantize_act.kern.inc"
 
 }  // namespace strata::kernels

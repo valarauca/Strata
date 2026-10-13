@@ -9,9 +9,9 @@
 // stays NaN (the comparisons are false for it), so STRATA_DBG_NAN still sees one.
 #pragma once
 
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
+#include "strata/port.hpp"
+
+#if defined(SYCL_LANGUAGE_VERSION)
 
 namespace strata::kernels {
 
@@ -39,3 +39,5 @@ __dpct_inline__ sycl::half2 q8_1_ds(const float d, const float sum) {
 }
 
 }  // namespace strata::kernels
+
+#endif  // SYCL_LANGUAGE_VERSION

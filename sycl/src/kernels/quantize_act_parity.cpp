@@ -11,9 +11,7 @@
 //     d16 = fp16(d32)                           (stored, and used to DEQUANTIZE)
 //     q   = clip(rint(x / (double)d32), -128, 127)
 //     round trip = q * d16
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
+#include "strata/ze/ze.hpp"
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/f16_bits.hpp"
 
@@ -28,7 +26,10 @@
 
 namespace {
 
-void check(dpct::err0 e, const char *what) {
+/// cudaMemcpy: after the device's queued work, complete on return.
+void memcpy_sync(void* dst, const void* src, size_t bytes) {
+    strata::ze::device_sync();
+    strata::ze::copy_sync(dst, src, bytes);
 }
 
 // THE CONVERSIONS COME FROM `f16_bits.hpp`, and this test used to carry its own.  The private `f16_bits_to_f32`
@@ -74,49 +75,24 @@ int run_case(const char* name, const std::vector<float>& x, bool check_bytes) {
     float* d_x = nullptr;
     uint8_t* d_b = nullptr;
     float* d_back = nullptr;
-    check(DPCT_CHECK_ERROR(d_x = sycl::malloc_device<float>(
-                               (size_t)n, dpct::get_in_order_queue())),
-          "malloc x");
-    check(DPCT_CHECK_ERROR(d_b = (uint8_t *)sycl::malloc_device(
-                               g_blocks.size(), dpct::get_in_order_queue())),
-          "malloc blocks");
-    check(DPCT_CHECK_ERROR(d_back = sycl::malloc_device<float>(
-                               (size_t)n, dpct::get_in_order_queue())),
-          "malloc back");
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming
-    in the original code the source host memory is pageable memory. If the
-    memory is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-              d_x, x.data(), (size_t)n * sizeof(float)).wait()),
-          "copy x");
+    d_x = (float*) strata::ze::malloc_device((size_t)n * sizeof(float));
+    d_b = (uint8_t*) strata::ze::malloc_device(g_blocks.size());
+    d_back = (float*) strata::ze::malloc_device((size_t)n * sizeof(float));
+    memcpy_sync(d_x, x.data(), (size_t)n * sizeof(float));
     // PROBE: does the DEVICE hold what the host thinks it sent?  The scale byte differs with the SAME
     // exponent and a zeroed mantissa, which says the kernel's amax differs from the host's on identical
     // input - so the first thing to rule out is the copy itself.
     {
         std::vector<float> rt((size_t) n);
-        check(DPCT_CHECK_ERROR(
-                  (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                      .memcpy(rt.data(), d_x, (size_t)n * sizeof(float))
-                      .wait()),
-              "probe copy back");
+        memcpy_sync(rt.data(), d_x, (size_t)n * sizeof(float));
         long long diff = 0;
         for (long long i = 0; i < n; ++i) if (std::memcmp(&rt[(size_t) i], &x[(size_t) i], 4) != 0) ++diff;
         if (diff) std::printf("    PROBE: device x differs from host x in %lld of %lld elements\n", diff, n);
     }
     strata::kernels::quantize_q8_0(d_x, d_b, n, nullptr);
     strata::kernels::dequant_q8_0(d_b, d_back, n, nullptr);
-    check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                               .memcpy(g_blocks.data(), d_b, g_blocks.size())
-                               .wait()),
-          "back blocks");
-    check(DPCT_CHECK_ERROR(
-              (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                  .memcpy(g_back.data(), d_back, (size_t)n * sizeof(float))
-                  .wait()),
-          "back vals");
+    memcpy_sync(g_blocks.data(), d_b, g_blocks.size());
+    memcpy_sync(g_back.data(), d_back, (size_t)n * sizeof(float));
 
     long long byte_bad = 0, val_bad = 0;
     if (check_bytes) {
@@ -146,9 +122,9 @@ int run_case(const char* name, const std::vector<float>& x, bool check_bytes) {
     std::printf("  %-26s blocks %s (%lld bad bytes)   round trip %s (%lld differ)\n", name,
                 !check_bytes ? "not compared" : (byte_bad ? "*** WRONG ***" : "byte-exact"), byte_bad,
                 val_bad ? "*** WRONG ***" : "bit-exact", val_bad);
-    sycl::free(d_x, dpct::get_in_order_queue());
-    sycl::free(d_b, dpct::get_in_order_queue());
-    sycl::free(d_back, dpct::get_in_order_queue());
+    strata::ze::free(d_x);
+    strata::ze::free(d_b);
+    strata::ze::free(d_back);
     return (int) (byte_bad + val_bad);
 }
 
@@ -206,35 +182,14 @@ int run_case_k(const char* name, const std::vector<float>& x, bool check_bytes, 
     float* d_x = nullptr;
     uint8_t* d_b = nullptr;
     float* d_back = nullptr;
-    check(DPCT_CHECK_ERROR(d_x = sycl::malloc_device<float>(
-                               (size_t)n, dpct::get_in_order_queue())),
-          "malloc x");
-    check(DPCT_CHECK_ERROR(d_b = (uint8_t *)sycl::malloc_device(
-                               g_blocks.size(), dpct::get_in_order_queue())),
-          "malloc blocks");
-    check(DPCT_CHECK_ERROR(d_back = sycl::malloc_device<float>(
-                               (size_t)n, dpct::get_in_order_queue())),
-          "malloc back");
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming
-    in the original code the source host memory is pageable memory. If the
-    memory is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-              d_x, x.data(), (size_t)n * sizeof(float)).wait()),
-          "copy x");
+    d_x = (float*) strata::ze::malloc_device((size_t)n * sizeof(float));
+    d_b = (uint8_t*) strata::ze::malloc_device(g_blocks.size());
+    d_back = (float*) strata::ze::malloc_device((size_t)n * sizeof(float));
+    memcpy_sync(d_x, x.data(), (size_t)n * sizeof(float));
     strata::kernels::quantize_q8_K(d_x, d_b, n, nullptr);
     strata::kernels::dequant_q8_K(d_b, d_back, n, nullptr);
-    check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                               .memcpy(g_blocks.data(), d_b, g_blocks.size())
-                               .wait()),
-          "back blocks");
-    check(DPCT_CHECK_ERROR(
-              (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                  .memcpy(g_back.data(), d_back, (size_t)n * sizeof(float))
-                  .wait()),
-          "back vals");
+    memcpy_sync(g_blocks.data(), d_b, g_blocks.size());
+    memcpy_sync(g_back.data(), d_back, (size_t)n * sizeof(float));
 
     long long byte_bad = 0, val_bad = 0, first_bad = -1;
     if (check_bytes)
@@ -268,9 +223,9 @@ int run_case_k(const char* name, const std::vector<float>& x, bool check_bytes, 
             std::printf("      d: ref %.9g  got %.9g\n", (double) rd, (double) gd);
         }
     }
-    sycl::free(d_x, dpct::get_in_order_queue());
-    sycl::free(d_b, dpct::get_in_order_queue());
-    sycl::free(d_back, dpct::get_in_order_queue());
+    strata::ze::free(d_x);
+    strata::ze::free(d_b);
+    strata::ze::free(d_back);
     return (int) (byte_bad + val_bad);
 }
 

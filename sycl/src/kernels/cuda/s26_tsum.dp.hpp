@@ -7,9 +7,7 @@
 // DPP row_xmask / permlanex16 instead of ds_bpermute.
 #pragma once
 
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
+#include "strata/port.hpp"
    // (before the first use of __forceinline__ / __float_as_int: a gfx906 build
    // gets them from its shim)
 

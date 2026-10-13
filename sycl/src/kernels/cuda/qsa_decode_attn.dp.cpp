@@ -1,16 +1,10 @@
 // src/kernels/cuda/qsa_decode_attn.cu - see include/strata/kernels/qsa_decode_attn.hpp.
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
-#include "strata/sycl_queue.hpp"
+#include "strata/port.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/kv_q4.hpp"
 
 #include <cfloat>
-#include <cstdio>
-#include <cstdlib>
-#include <cmath>
 
 namespace strata::kernels {
 namespace {
@@ -23,11 +17,6 @@ constexpr int WARPS = THREADS / 32;
 
 __dpct_inline__ float warp_sum(float v) {
 #pragma unroll
-    /*
-    DPCT1108: '__shfl_xor_sync' was migrated with the experimental feature
-    masked sub_group function which may not be supported by all compilers or
-    runtimes. You may need to adjust the code.
-    */
     for (int o = 16; o > 0; o >>= 1) v +=
         dpct::experimental::permute_sub_group_by_xor(
             0xffffffffu, sycl::ext::oneapi::this_work_item::get_sub_group(), v,
@@ -36,11 +25,6 @@ __dpct_inline__ float warp_sum(float v) {
 }
 __dpct_inline__ float warp_max(float v) {
 #pragma unroll
-    /*
-    DPCT1108: '__shfl_xor_sync' was migrated with the experimental feature
-    masked sub_group function which may not be supported by all compilers or
-    runtimes. You may need to adjust the code.
-    */
     for (int o = 16; o > 0; o >>= 1) v = sycl::fmax(
         v, dpct::experimental::permute_sub_group_by_xor(
                0xffffffffu, sycl::ext::oneapi::this_work_item::get_sub_group(),
@@ -108,12 +92,6 @@ __dpct_inline__ void load8(const QsaAttnPools &p, bool value, long long row,
 }
 
 template <int KV_MODE, bool LANE_CELL = false>
-/*
-DPCT1110: The total declared local variable size in device function
-attn_chunk_kernel exceeds 128 bytes and may cause high register pressure.
-Consult with your hardware vendor to find the total register size available and
-adjust the code, or use smaller sub-group size to avoid high register pressure.
-*/
 __dpct_inline__ void
 attn_chunk_kernel(const float *__restrict__ q, QsaAttnPools p,
                   const int32_t *__restrict__ ids,
@@ -141,11 +119,6 @@ attn_chunk_kernel(const float *__restrict__ q, QsaAttnPools p,
         *sycl::ext::oneapi::group_local_memory_for_overwrite<long long[CHUNK]>(
             sycl::ext::oneapi::this_work_item::get_work_group<
                 3>()); // pool row of each cell (page, kv head, slot)
-    /*
-    DPCT1098: The '*' expression is used instead of the __ldg call. These
-    two expressions do not provide the exact same functionality. Check the
-    generated code for potential precision and/or performance issues.
-    */
     const int n_ids = *(step + kStepWidth);
     const int chunk = item_ct1.get_group(2), kvh = item_ct1.get_group(1);
     const int t = item_ct1.get_local_id(2), lane = t & 31, warp = t >> 5;
@@ -170,11 +143,6 @@ attn_chunk_kernel(const float *__restrict__ q, QsaAttnPools p,
         }
         srow[t] = r;
     }
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
     if constexpr (LANE_CELL) {
         // S25 (STRATA_ATTN_LANECELL=1): thread t scores cell t % 64 for heads 3 (t / 64) .. +2 by itself - the same
@@ -237,11 +205,6 @@ attn_chunk_kernel(const float *__restrict__ q, QsaAttnPools p,
             if (lane == 0) sp[h][c] = s * scale;
         }
     }
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
     // per-head chunk max and exp-sum: warp w handles heads w and w+8.
     for (int h = warp; h < G; h += WARPS) {
@@ -258,11 +221,6 @@ attn_chunk_kernel(const float *__restrict__ q, QsaAttnPools p,
         const float l = warp_sum(ea + eb);
         if (lane == 0) { part_m[slot * G + h] = m; part_l[slot * G + h] = l; }
     }
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
     // values: thread t owns dimension t for all 12 heads.
     float acc[G];
@@ -547,297 +505,8 @@ __dpct_inline__ void attn_merge_kernel(const float *__restrict__ part_acc,
     attn[(size_t) h * HD + d] = L > 0.0f ? acc / L : 0.0f;
 }
 
-#if defined(STRATA_EXPERIMENTAL_SM60)
-// the current device is below sm_75 (per device: a layer split can mix cards); STRATA_ATTN_PRE75=0 turns PR #540's
-// kernel off (A/B)
-bool pre75_attn() {
-    static const bool off = [] {
-        const char* e = std::getenv("STRATA_ATTN_PRE75");
-        return e != nullptr && e[0] == '0';
-    }();
-    static int cc[64] = {};
-    int dev = 0;
-    if (off) return false;
-    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return false; }
-    if (cc[dev] == 0) {
-        int major = 0, minor = 0;
-        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
-            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess) {
-            cudaGetLastError();
-            return false;
-        }
-        cc[dev] = 10 * major + minor;
-    }
-    return cc[dev] < 75;
-}
-#define STRATA_ATTN_CHUNK(M) (pre75_attn() ? attn_chunk_kernel_pre75<M> : attn_chunk_kernel<M>)
-#else
-#define STRATA_ATTN_CHUNK(M) attn_chunk_kernel<M>
-#endif
-
 }  // namespace
 
-void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
-                           int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream) {
-    if (n_q <= 0) return;
-    if (s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !scratch || !ids || !steps ||
-        !pools.page_table || n_q > 65535) {
-        std::fprintf(stderr, "qsa_decode_attn_batch: unsupported geometry or missing buffers\n");
-        std::exit(1);
-    }
-    const int kv_mode = pools.k_q4 != nullptr ? 2 : (pools.k_q != nullptr && pools.v_q4 != nullptr ? 3
-                        : (pools.k_q != nullptr ? 1 : 0));
-    const int n_chunks = (int) ((cap + CHUNK - 1) / CHUNK);
-    // per query: [acc: n_chunks*n_head*HD][m: n_chunks*n_head][l: n_chunks*n_head], all offsets from one stride
-    const long long stride = (long long) qsa_decode_attn_scratch_floats(cap, s);
-    float* part_acc = scratch;
-    float* part_m = scratch + (size_t) n_chunks * s.n_head * HD;
-    float* part_l = part_m + (size_t) n_chunks * s.n_head;
-    const float scale = 1.0f / sqrtf((float) HD);
-    const dpct::dim3 grid((unsigned)n_chunks, (unsigned)s.n_head_kv,
-                          (unsigned)n_q);
-    dpct::queue_ptr st = strata::q_of(stream);
-    // S25: STRATA_ATTN_LANECELL=1 - the score phase one cell per thread (bit-identical scores, no shuffle reductions)
-    static const bool lane_cell = [] { const char* v = std::getenv("STRATA_ATTN_LANECELL"); return v && v[0] == '1'; }();
-#define STRATA_ATTN_LC(M)                                                      \
-    {                                                                          \
-        auto exp_props = sycl::ext::oneapi::experimental::properties{          \
-            sycl::ext::oneapi::experimental::use_root_sync};                   \
-        dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});  \
-                                                                               \
-        st->submit([&](sycl::handler &cgh) {                                   \
-            auto q_ct0 = q;                                                    \
-            QsaAttnPools pools_ct1 = pools;                                    \
-            auto ids_ct2 = ids;                                                \
-            auto steps_ct3 = steps;                                            \
-            auto s_n_head_kv_ct4 = (int)s.n_head_kv;                           \
-            auto s_page_size_ct5 = (int)s.page_size;                           \
-            auto scale_ct6 = scale;                                            \
-            auto part_acc_ct7 = part_acc;                                      \
-            auto part_m_ct8 = part_m;                                          \
-            auto part_l_ct9 = part_l;                                          \
-            auto n_chunks_ct10 = n_chunks;                                     \
-            auto cap_ct11 = (int)cap;                                          \
-            auto stride_ct12 = stride;                                         \
-                                                                               \
-            cgh.parallel_for<dpct_kernel_name<class attn_chunk_kernel_6e87d5,  \
-                                              dpct_kernel_scalar<M>,           \
-                                              dpct_kernel_scalar<true>>>(      \
-                sycl::nd_range<3>(grid * sycl::range(1, 1, THREADS),           \
-                                  sycl::range(1, 1, THREADS)),                 \
-                exp_props,                                                     \
-                [=](sycl::nd_item<3> item_ct1)                                 \
-                    [[sycl::reqd_sub_group_size(32)]] {                        \
-                        attn_chunk_kernel<M, true>(                            \
-                            q_ct0, pools_ct1, ids_ct2, steps_ct3,              \
-                            s_n_head_kv_ct4, s_page_size_ct5, scale_ct6,       \
-                            part_acc_ct7, part_m_ct8, part_l_ct9,              \
-                            n_chunks_ct10, cap_ct11, stride_ct12);             \
-                    });                                                        \
-        });                                                                    \
-    }
-    if (lane_cell) {
-        if (kv_mode == 3) { STRATA_ATTN_LC(3); }
-        else if (kv_mode == 2) { STRATA_ATTN_LC(2); }
-        else if (kv_mode == 1) { STRATA_ATTN_LC(1); }
-        else { STRATA_ATTN_LC(0); }
-    } else
-#undef STRATA_ATTN_LC
-    if (kv_mode == 3)
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-        dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});
-
-        st->parallel_for<dpct_kernel_name<class attn_chunk_kernel_dfacfc,
-                                          dpct_kernel_scalar<3>>>(
-            sycl::nd_range<3>(grid * sycl::range(1, 1, THREADS),
-                              sycl::range(1, 1, THREADS)),
-            exp_props,
-            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
-                attn_chunk_kernel<3>(q, pools, ids, steps, (int)s.n_head_kv,
-                                     (int)s.page_size, scale, part_acc, part_m,
-                                     part_l, n_chunks, (int)cap, stride);
-            });
-    } else if (kv_mode == 2)
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-        dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});
-
-        st->parallel_for<dpct_kernel_name<class attn_chunk_kernel_b0d448,
-                                          dpct_kernel_scalar<2>>>(
-            sycl::nd_range<3>(grid * sycl::range(1, 1, THREADS),
-                              sycl::range(1, 1, THREADS)),
-            exp_props,
-            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
-                attn_chunk_kernel<2>(q, pools, ids, steps, (int)s.n_head_kv,
-                                     (int)s.page_size, scale, part_acc, part_m,
-                                     part_l, n_chunks, (int)cap, stride);
-            });
-    } else if (kv_mode == 1)
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-        dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});
-
-        st->parallel_for<dpct_kernel_name<class attn_chunk_kernel_2ad0a4,
-                                          dpct_kernel_scalar<1>>>(
-            sycl::nd_range<3>(grid * sycl::range(1, 1, THREADS),
-                              sycl::range(1, 1, THREADS)),
-            exp_props,
-            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
-                attn_chunk_kernel<1>(q, pools, ids, steps, (int)s.n_head_kv,
-                                     (int)s.page_size, scale, part_acc, part_m,
-                                     part_l, n_chunks, (int)cap, stride);
-            });
-    } else {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-        dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});
-
-        st->parallel_for<dpct_kernel_name<class attn_chunk_kernel_5c04f7,
-                                          dpct_kernel_scalar<0>>>(
-            sycl::nd_range<3>(grid * sycl::range(1, 1, THREADS),
-                              sycl::range(1, 1, THREADS)),
-            exp_props,
-            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
-                attn_chunk_kernel<0>(q, pools, ids, steps, (int)s.n_head_kv,
-                                     (int)s.page_size, scale, part_acc, part_m,
-                                     part_l, n_chunks, (int)cap, stride);
-            });
-    }
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        st->parallel_for<dpct_kernel_name<class attn_merge_kernel_338175>>(
-            sycl::nd_range<3>(
-                sycl::range(1, (unsigned)n_q, (unsigned)s.n_head) *
-                    sycl::range(1, 1, HD),
-                sycl::range(1, 1, HD)),
-            exp_props, [=](sycl::nd_item<3> item_ct1) {
-                attn_merge_kernel(part_acc, part_m, part_l, n_chunks, attn,
-                                  stride);
-            });
-    }
-    /*
-    DPCT1010: SYCL uses exceptions to report errors and does not use the
-    error codes. The cudaGetLastError function call was replaced with 0. You
-    need to rewrite this code.
-    */
-    const dpct::err0 e = 0;
-}
-
-uint64_t qsa_decode_attn_scratch_floats(int64_t cap, const QsaShapes& s) {
-    const int64_t chunks = (cap + CHUNK - 1) / CHUNK;
-    return (uint64_t) chunks * (uint64_t) s.n_head * (HD + 2) + 64;
-}
-
-void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* step,
-                          int64_t cap, const QsaShapes& s, float* scratch, float* attn, void* stream) {
-    if (s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !scratch || !ids || !step ||
-        !pools.page_table) {
-        std::fprintf(stderr, "qsa_decode_attn: unsupported geometry or missing buffers\n");
-        std::exit(1);
-    }
-    const int kv_mode = pools.k_q4 != nullptr ? 2 : (pools.k_q != nullptr && pools.v_q4 != nullptr ? 3
-                        : (pools.k_q != nullptr ? 1 : 0));
-    if (kv_mode == 3 ? (!pools.k_scale || !pools.v_q4)
-                     : (kv_mode == 2 ? (!pools.v_q4) : (kv_mode == 1 ? (!pools.v_q || !pools.k_scale || !pools.v_scale)
-                                                                     : (!pools.k_pool || !pools.v_pool)))) {
-        std::fprintf(stderr, "qsa_decode_attn: incomplete KV pools\n");
-        std::exit(1);
-    }
-    const int n_chunks = (int) ((cap + CHUNK - 1) / CHUNK);
-    float* part_acc = scratch;
-    float* part_m = scratch + (size_t) n_chunks * s.n_head * HD;
-    float* part_l = part_m + (size_t) n_chunks * s.n_head;
-    const float scale = 1.0f / sqrtf((float) HD);
-    const dpct::dim3 grid((unsigned)n_chunks, (unsigned)s.n_head_kv);
-    dpct::queue_ptr st = strata::q_of(stream);
-    if (kv_mode == 3)
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-        dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});
-
-        st->parallel_for<dpct_kernel_name<class attn_chunk_kernel_f262e6,
-                                          dpct_kernel_scalar<3>>>(
-            sycl::nd_range<3>(grid * sycl::range(1, 1, THREADS),
-                              sycl::range(1, 1, THREADS)),
-            exp_props,
-            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
-                attn_chunk_kernel<3>(q, pools, ids, step, (int)s.n_head_kv,
-                                     (int)s.page_size, scale, part_acc, part_m,
-                                     part_l, n_chunks, 0, 0);
-            });
-    } else if (kv_mode == 2)
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-        dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});
-
-        st->parallel_for<dpct_kernel_name<class attn_chunk_kernel_4fd923,
-                                          dpct_kernel_scalar<2>>>(
-            sycl::nd_range<3>(grid * sycl::range(1, 1, THREADS),
-                              sycl::range(1, 1, THREADS)),
-            exp_props,
-            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
-                attn_chunk_kernel<2>(q, pools, ids, step, (int)s.n_head_kv,
-                                     (int)s.page_size, scale, part_acc, part_m,
-                                     part_l, n_chunks, 0, 0);
-            });
-    } else if (kv_mode == 1)
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-        dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});
-
-        st->parallel_for<dpct_kernel_name<class attn_chunk_kernel_f6855e,
-                                          dpct_kernel_scalar<1>>>(
-            sycl::nd_range<3>(grid * sycl::range(1, 1, THREADS),
-                              sycl::range(1, 1, THREADS)),
-            exp_props,
-            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
-                attn_chunk_kernel<1>(q, pools, ids, step, (int)s.n_head_kv,
-                                     (int)s.page_size, scale, part_acc, part_m,
-                                     part_l, n_chunks, 0, 0);
-            });
-    } else {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-        dpct::has_capability_or_fail(st->get_device(), {sycl::aspect::fp16});
-
-        st->parallel_for<dpct_kernel_name<class attn_chunk_kernel_7c8e09,
-                                          dpct_kernel_scalar<0>>>(
-            sycl::nd_range<3>(grid * sycl::range(1, 1, THREADS),
-                              sycl::range(1, 1, THREADS)),
-            exp_props,
-            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
-                attn_chunk_kernel<0>(q, pools, ids, step, (int)s.n_head_kv,
-                                     (int)s.page_size, scale, part_acc, part_m,
-                                     part_l, n_chunks, 0, 0);
-            });
-    }
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        st->parallel_for<dpct_kernel_name<class attn_merge_kernel_c055e7>>(
-            sycl::nd_range<3>(sycl::range(1, 1, (unsigned)s.n_head) *
-                                  sycl::range(1, 1, HD),
-                              sycl::range(1, 1, HD)),
-            exp_props, [=](sycl::nd_item<3> item_ct1) {
-                attn_merge_kernel(part_acc, part_m, part_l, n_chunks, attn, 0);
-            });
-    }
-    /*
-    DPCT1010: SYCL uses exceptions to report errors and does not use the
-    error codes. The cudaGetLastError function call was replaced with 0. You
-    need to rewrite this code.
-    */
-    const dpct::err0 e = 0;
-}
+#include "qsa_decode_attn.kern.inc"
 
 }  // namespace strata::kernels

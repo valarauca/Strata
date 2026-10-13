@@ -14,9 +14,7 @@
 //
 // Random bytes are valid codes for every format here (all grid indices are in range); only the fp16 block scales
 // are set, small enough that the grouped path's SwiGLU output keeps a finite fp16 q8_1 scale.
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
+#include "strata/ze/ze.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
@@ -37,18 +35,24 @@ namespace {
 
 int g_fail = 0;
 
-void ck(dpct::err0 e, const char *w) {
+/// cudaMemcpy: after the device's queued work, complete on return.
+void memcpy_sync(void* dst, const void* src, size_t bytes) {
+    strata::ze::device_sync();
+    strata::ze::copy_sync(dst, src, bytes);
+}
+
+/// cudaMemset: after the device's queued work, complete on return.
+void memset_sync(void* dst, int value, size_t bytes) {
+    strata::ze::device_sync();
+    strata::ze::default_stream().memset(dst, value, bytes);
+    strata::ze::default_stream().sync();
 }
 
 template<typename T>
 T* dalloc(size_t n) {
     T* p = nullptr;
-    ck(DPCT_CHECK_ERROR(p = (T *)sycl::malloc_device(
-                            n * sizeof(T) + 256, dpct::get_in_order_queue())),
-       "malloc");
-    ck(DPCT_CHECK_ERROR(
-           (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memset(p, 0, n * sizeof(T) + 256).wait()),
-       "memset");
+    p = (T*) strata::ze::malloc_device(n * sizeof(T) + 256);
+    memset_sync(p, 0, n * sizeof(T) + 256);
     return p;
 }
 
@@ -134,46 +138,25 @@ std::vector<float> host_iq2_xs(const std::vector<uint8_t>& w, size_t n) {
 }
 
 // ------------------------------------------------------------------------------------------------ (1) iq_mmvq
-void check_mmvq(int t, int n_in, int n_out, dpct::queue_ptr s,
+void check_mmvq(int t, int n_in, int n_out, strata::ze::Stream* s,
                 std::mt19937 &rng) {
     const auto w = random_rows(t, n_out, n_in, rng);
     uint8_t* dw = dalloc<uint8_t>(w.size());
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming
-    in the original code the source host memory is pageable memory. If the
-    memory is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    ck(DPCT_CHECK_ERROR(
-           (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(dw, w.data(), w.size()).wait()),
-       "w");
+    memcpy_sync(dw, w.data(), w.size());
     // the double reference's weights: the GPU dequantizer (iq_parity checks it against gguf-py)
     float* dwf = dalloc<float>((size_t) n_out * n_in);
     k::iq_dequant_f32(t, dw, (int64_t) n_out * n_in, dwf, s);
     std::vector<float> wf((size_t) n_out * n_in);
-    ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                            .memcpy(wf.data(), dwf, wf.size() * 4)
-                            .wait()),
-       "wf");
+    memcpy_sync(wf.data(), dwf, wf.size() * 4);
     const int max_cols = 11;
     const auto x = random_x((size_t) max_cols * n_in, rng);
     float* dx = dalloc<float>(x.size());
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming
-    in the original code the source host memory is pageable memory. If the
-    memory is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    ck(DPCT_CHECK_ERROR(
-           (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(dx, x.data(), x.size() * 4).wait()),
-       "x");
+    memcpy_sync(dx, x.data(), x.size() * 4);
     const size_t xq_bytes = (size_t) max_cols * (n_in / 32) * 36;
     uint8_t* dxq = dalloc<uint8_t>(xq_bytes);
     k::quantize_q8_1_rows(dx, max_cols, n_in, dxq, s);
     std::vector<uint8_t> xq(xq_bytes);
-    ck(DPCT_CHECK_ERROR(
-           (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(xq.data(), dxq, xq_bytes).wait()),
-       "xq");
+    memcpy_sync(xq.data(), dxq, xq_bytes);
     const auto xd = dequant_q8_1(xq, (size_t) max_cols * n_in);
     std::vector<float> hw;
     if (t == 17) {   // IQ2_XS: the GPU dequantizer against the CPU decode
@@ -195,27 +178,15 @@ void check_mmvq(int t, int n_in, int n_out, dpct::queue_ptr s,
     int bad = 0;
     double worst = 0.0;
     for (int nc : cols) {
-        ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                .memset(dy_old, 0xFF, y_old.size() * 4)
-                                .wait()),
-           "memset");
-        ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                .memset(dy_new, 0xFF, y_new.size() * 4)
-                                .wait()),
-           "memset");
+        memset_sync(dy_old, 0xFF, y_old.size() * 4);
+        memset_sync(dy_new, 0xFF, y_new.size() * 4);
         k::iq_set_old_kernels(true);
         k::iq_mmvq(t, dw, dxq, dy_old, n_in, n_out, nc, s);
         k::iq_set_old_kernels(false);
         k::iq_mmvq(t, dw, dxq, dy_new, n_in, n_out, nc, s);
-        ck(DPCT_CHECK_ERROR(s->wait()), "sync");
-        ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                .memcpy(y_old.data(), dy_old, y_old.size() * 4)
-                                .wait()),
-           "y_old");
-        ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                .memcpy(y_new.data(), dy_new, y_new.size() * 4)
-                                .wait()),
-           "y_new");
+        s->sync();
+        memcpy_sync(y_old.data(), dy_old, y_old.size() * 4);
+        memcpy_sync(y_new.data(), dy_new, y_new.size() * 4);
         size_t diff = 0;
         for (size_t i = 0; i < y_old.size(); ++i) diff += std::memcmp(&y_old[i], &y_new[i], 4) != 0;
         double num = 0, den = 0;
@@ -250,12 +221,12 @@ void check_mmvq(int t, int n_in, int n_out, dpct::queue_ptr s,
     std::printf("%-8s type %2d  %5d x %5d  iq_mmvq ncols 1..8, 11: %s (ref rel <= %.2e)\n", name_of(t), t, n_out, n_in,
                 bad ? "FAIL" : "bitwise equal to the old kernel", worst);
     g_fail += bad;
-    sycl::free(dw, dpct::get_in_order_queue());
-        sycl::free(dwf, dpct::get_in_order_queue());
-        sycl::free(dx, dpct::get_in_order_queue());
-        sycl::free(dxq, dpct::get_in_order_queue());
-        sycl::free(dy_old, dpct::get_in_order_queue());
-        sycl::free(dy_new, dpct::get_in_order_queue());
+    strata::ze::free(dw);
+    strata::ze::free(dwf);
+    strata::ze::free(dx);
+    strata::ze::free(dxq);
+    strata::ze::free(dy_old);
+    strata::ze::free(dy_new);
 }
 
 // ---------------------------------------------------------------------------------- (2) native_expert_grouped
@@ -296,15 +267,7 @@ struct Grouped {
             b.insert(b.end(), d.begin(), d.end());
             if (b.size() != L.bytes) { std::fprintf(stderr, "blob size %zu != %zu\n", b.size(), L.bytes); std::exit(2); }
             uint8_t* db = dalloc<uint8_t>(b.size());
-            /*
-            DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-            assuming in the original code the source host memory is pageable
-            memory. If the memory is not pageable, call wait() on event return
-            by memcpy API to ensure synchronization behavior.
-            */
-            ck(DPCT_CHECK_ERROR(
-                   (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(db, b.data(), b.size()).wait()),
-               "blob");
+            memcpy_sync(db, b.data(), b.size());
             blobs.push_back(db);
             ptr.push_back((unsigned long long) db);
         }
@@ -313,58 +276,16 @@ struct Grouped {
         dn = dalloc<int32_t>(1);
         ddst = dalloc<int32_t>(cap_ent);
         dtok = dalloc<int32_t>(cap_ent);
-        /*
-        DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-        assuming in the original code the source host memory is pageable memory.
-        If the memory is not pageable, call wait() on event return by memcpy API
-        to ensure synchronization behavior.
-        */
-        ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(dptr, ptr.data(),
-                                                              ptr.size() * 8).wait()),
-           "ptr");
-        /*
-        DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-        assuming in the original code the source host memory is pageable memory.
-        If the memory is not pageable, call wait() on event return by memcpy API
-        to ensure synchronization behavior.
-        */
-        ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-               dstart, start.data(), start.size() * 4).wait()),
-           "start");
-        ck(DPCT_CHECK_ERROR(
-               (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(dn, &n_groups, 4).wait()),
-           "n");
+        memcpy_sync(dptr, ptr.data(), ptr.size() * 8);
+        memcpy_sync(dstart, start.data(), start.size() * 4);
+        memcpy_sync(dn, &n_groups, 4);
         if (n_ent) {
-            /*
-            DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-            assuming in the original code the source host memory is pageable
-            memory. If the memory is not pageable, call wait() on event return
-            by memcpy API to ensure synchronization behavior.
-            */
-            ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-                   ddst, dst.data(), dst.size() * 4).wait()),
-               "dst");
-            /*
-            DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-            assuming in the original code the source host memory is pageable
-            memory. If the memory is not pageable, call wait() on event return
-            by memcpy API to ensure synchronization behavior.
-            */
-            ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-                   dtok, tok.data(), tok.size() * 4).wait()),
-               "tok");
+            memcpy_sync(ddst, dst.data(), dst.size() * 4);
+            memcpy_sync(dtok, tok.data(), tok.size() * 4);
         }
         const auto x = random_x((size_t) tokens * H, rng);
         dx = dalloc<float>(x.size());
-        /*
-        DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-        assuming in the original code the source host memory is pageable memory.
-        If the memory is not pageable, call wait() on event return by memcpy API
-        to ensure synchronization behavior.
-        */
-        ck(DPCT_CHECK_ERROR(
-               (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(dx, x.data(), x.size() * 4).wait()),
-           "x");
+        memcpy_sync(dx, x.data(), x.size() * 4);
         dxq = dalloc<uint8_t>((size_t) tokens * (H / 32) * 36);
         dscr = dalloc<uint8_t>(k::native_expert_scratch_bytes(cap_ent, FF));
         out_floats = (size_t) cap_ent * H;
@@ -372,18 +293,18 @@ struct Grouped {
     }
     ~Grouped() {
         for (auto *b : blobs)
-            DPCT_CHECK_ERROR(sycl::free(b, dpct::get_in_order_queue()));
-        sycl::free(dptr, dpct::get_in_order_queue());
-            sycl::free(dstart, dpct::get_in_order_queue());
-            sycl::free(dn, dpct::get_in_order_queue());
-            sycl::free(ddst, dpct::get_in_order_queue());
-            sycl::free(dtok, dpct::get_in_order_queue());
-        sycl::free(dx, dpct::get_in_order_queue());
-            sycl::free(dxq, dpct::get_in_order_queue());
-            sycl::free(dscr, dpct::get_in_order_queue());
-            sycl::free(dout, dpct::get_in_order_queue());
+            strata::ze::free(b);
+        strata::ze::free(dptr);
+        strata::ze::free(dstart);
+        strata::ze::free(dn);
+        strata::ze::free(ddst);
+        strata::ze::free(dtok);
+        strata::ze::free(dx);
+        strata::ze::free(dxq);
+        strata::ze::free(dscr);
+        strata::ze::free(dout);
     }
-    void run(bool old, dpct::queue_ptr s) {
+    void run(bool old, strata::ze::Stream* s) {
         k::iq_set_old_kernels(old);
         k::quantize_q8_1_rows(dx, n_tok, L.n_embd, dxq, s);
         k::native_expert_grouped(L, dptr, dstart, dn, ddst, dtok, cap_groups, cap_ent, dxq, dscr, dout, s);
@@ -392,14 +313,13 @@ struct Grouped {
     // An independent reference: every entry through iq_mmvq (itself checked against a double-precision CPU reference
     // above), one column at a time - gate and up rows against the token's q8_1 activations, SwiGLU into q8_1, the down
     // rows against that.  Not bitwise the grouped path (accumulation order), so it is compared with a tolerance.
-    std::vector<float> reference(dpct::queue_ptr s) {
+    std::vector<float> reference(strata::ze::Stream* s) {
         const int64_t H = L.n_embd, FF = L.n_ff;
         float *g = dalloc<float>(FF), *u = dalloc<float>(FF), *y = dalloc<float>(H);
         uint8_t* hq = dalloc<uint8_t>((size_t) (FF / 32) * 36 + 64);
         std::vector<float> out(out_floats, 0.0f);
         std::vector<unsigned long long> ptr(n_groups);
-        ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                .memcpy(ptr.data(), dptr, ptr.size() * 8).wait()), "ptr");
+        memcpy_sync(ptr.data(), dptr, ptr.size() * 8);
         for (int gi = 0; gi < n_groups; ++gi) {
             const uint8_t* blob = (const uint8_t*) ptr[gi];
             for (int e = h_start[gi]; e < h_start[gi + 1]; ++e) {
@@ -408,38 +328,26 @@ struct Grouped {
                 k::iq_mmvq(L.gu_type, blob + L.up_off, xq, u, (int) H, (int) FF, 1, s);
                 k::native_swiglu_quantize_q8_1(g, u, hq, (int) FF, 1, s);
                 k::iq_mmvq(L.d_type, blob + L.down_off, hq, y, (int) FF, (int) H, 1, s);
-                ck(DPCT_CHECK_ERROR(s->wait()), "ref sync");
-                ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                        .memcpy(out.data() + (size_t) h_dst[e] * H, y, (size_t) H * 4).wait()), "ref out");
+                s->sync();
+                memcpy_sync(out.data() + (size_t) h_dst[e] * H, y, (size_t) H * 4);
             }
         }
-        sycl::free(g, dpct::get_in_order_queue()); sycl::free(u, dpct::get_in_order_queue());
-        sycl::free(y, dpct::get_in_order_queue()); sycl::free(hq, dpct::get_in_order_queue());
+        strata::ze::free(g); strata::ze::free(u);
+        strata::ze::free(y); strata::ze::free(hq);
         return out;
     }
-    std::vector<float> result(bool old, dpct::queue_ptr s) {
-        ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                .memset(dout, 0xFF, out_floats * 4)
-                                .wait()),
-           "memset"); // NaN rows: must stay NaN where nothing writes
-        ck(DPCT_CHECK_ERROR(
-               (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                   .memset(dscr, 0,
-                           k::native_expert_scratch_bytes(cap_ent, L.n_ff))
-                   .wait()),
-           "memset");
+    std::vector<float> result(bool old, strata::ze::Stream* s) {
+        memset_sync(dout, 0xFF, out_floats * 4); // NaN rows: must stay NaN where nothing writes
+        memset_sync(dscr, 0, k::native_expert_scratch_bytes(cap_ent, L.n_ff));
         run(old, s);
-        ck(DPCT_CHECK_ERROR(s->wait()), "sync");
+        s->sync();
         std::vector<float> o(out_floats);
-        ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                .memcpy(o.data(), dout, o.size() * 4)
-                                .wait()),
-           "out");
+        memcpy_sync(o.data(), dout, o.size() * 4);
         return o;
     }
 };
 
-void check_grouped(int gu, int dt, int64_t H, int64_t FF, dpct::queue_ptr s,
+void check_grouped(int gu, int dt, int64_t H, int64_t FF, strata::ze::Stream* s,
                    std::mt19937 &rng) {
     // 0..11 entries per group: one pass, a partial pass, two passes and three passes of GRP_NC = 4
     Grouped G(gu, dt, H, FF, {1, 3, 4, 5, 0, 8, 2, 11, 1}, 8, rng);
@@ -477,51 +385,31 @@ void check_grouped(int gu, int dt, int64_t H, int64_t FF, dpct::queue_ptr s,
 }
 
 // ------------------------------------------------------------------------------------------------ --bench
-float time_ms(dpct::queue_ptr s, int it, const auto &fn) {
-    dpct::event_ptr e0, e1;
-    e0 = new sycl::event();
-    e1 = new sycl::event();
+float time_ms(strata::ze::Stream* s, int it, const auto &fn) {
+    strata::ze::Event* e0 = new strata::ze::Event(true);
+    strata::ze::Event* e1 = new strata::ze::Event(true);
     fn();
-    dpct::sync_barrier(e0, s);
+    s->record(*e0);
     for (int i = 0; i < it; ++i) fn();
-    dpct::sync_barrier(e1, s);
-    ck(DPCT_CHECK_ERROR(e1->wait_and_throw()), "bench");
+    s->record(*e1);
+    e1->sync();
     float ms = 0;
-    ms =
-        (e1->get_profiling_info<sycl::info::event_profiling::command_end>() -
-         e0->get_profiling_info<sycl::info::event_profiling::command_start>()) /
-        1000000.0f;
-    dpct::destroy_event(e0);
-    dpct::destroy_event(e1);
+    ms = e1->elapsed_ms_since(*e0);
+    delete e0;
+    delete e1;
     return ms / it;
 }
 
-void bench(dpct::queue_ptr s, std::mt19937 &rng) {
+void bench(strata::ze::Stream* s, std::mt19937 &rng) {
     std::printf("\n--bench: microseconds per call, old (per-column decode) / new (decode once), idle GPU assumed\n");
     const int n_in = 2560, n_out = 8192, it = 200;
     for (int t : {16, 17, 18, 21, 22, 29}) {
         const auto w = random_rows(t, n_out, n_in, rng);
         uint8_t* dw = dalloc<uint8_t>(w.size());
-        /*
-        DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-        assuming in the original code the source host memory is pageable memory.
-        If the memory is not pageable, call wait() on event return by memcpy API
-        to ensure synchronization behavior.
-        */
-        ck(DPCT_CHECK_ERROR(
-               (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(dw, w.data(), w.size()).wait()),
-           "w");
+        memcpy_sync(dw, w.data(), w.size());
         const auto x = random_x((size_t) 8 * n_in, rng);
         float* dx = dalloc<float>(x.size());
-        /*
-        DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-        assuming in the original code the source host memory is pageable memory.
-        If the memory is not pageable, call wait() on event return by memcpy API
-        to ensure synchronization behavior.
-        */
-        ck(DPCT_CHECK_ERROR(
-               (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(dx, x.data(), x.size() * 4).wait()),
-           "x");
+        memcpy_sync(dx, x.data(), x.size() * 4);
         uint8_t* dxq = dalloc<uint8_t>((size_t) 8 * (n_in / 32) * 36);
         k::quantize_q8_1_rows(dx, 8, n_in, dxq, s);
         float* dy = dalloc<float>((size_t) 8 * n_out);
@@ -536,10 +424,10 @@ void bench(dpct::queue_ptr s, std::mt19937 &rng) {
         }
         std::printf("\n");
         k::iq_set_old_kernels(false);
-        sycl::free(dw, dpct::get_in_order_queue());
-            sycl::free(dx, dpct::get_in_order_queue());
-            sycl::free(dxq, dpct::get_in_order_queue());
-            sycl::free(dy, dpct::get_in_order_queue());
+        strata::ze::free(dw);
+        strata::ze::free(dx);
+        strata::ze::free(dxq);
+        strata::ze::free(dy);
     }
     // the verify window's shape: 2560 x 640 experts, 16 groups of m entries each
     for (int gu : {16, 17, 18, 21, 22, 29}) {
@@ -559,7 +447,7 @@ void bench(dpct::queue_ptr s, std::mt19937 &rng) {
 // native_swiglu_quantize_q8_1) against a host transcription of the 0.1.38 formula: every finite block bit for bit; a
 // block whose sum (or scale) overflowed fp16 is now stored finite (the largest half, its sign), with its values in the
 // int8 range.  The fused one gets gate = 32 and up = x / 32: silu(32) is 32 in float, so its activations are x exactly.
-void check_q8_1_finite(dpct::queue_ptr s, std::mt19937 &rng) {
+void check_q8_1_finite(strata::ze::Stream* s, std::mt19937 &rng) {
     const int n = 2560, rows = 3, nb = n / 32;
     std::vector<float> x = random_x((size_t) rows * n, rng);
     for (int i = 0; i < 32; ++i) x[(size_t) 5 * 32 + i] = 3000.0f;                  // sum 96,000: overflowed
@@ -567,48 +455,21 @@ void check_q8_1_finite(dpct::queue_ptr s, std::mt19937 &rng) {
     for (int i = 0; i < 32; ++i) x[(size_t) 13 * 32 + i] = 2000.0f + i;            // sum 64,496: finite, kept
     x[(size_t) n + 40] = 2.0e7f;                                                    // amax / 127 overflowed too
     float* dx = dalloc<float>(x.size());
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming
-    in the original code the source host memory is pageable memory. If the
-    memory is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    ck(DPCT_CHECK_ERROR(
-           (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(dx, x.data(), x.size() * 4).wait()),
-       "x");
+    memcpy_sync(dx, x.data(), x.size() * 4);
     std::vector<float> gate(x.size(), 32.0f), up(x.size());
     for (size_t i = 0; i < x.size(); ++i) up[i] = x[i] / 32.0f;
     float* dg = dalloc<float>(x.size());
     float* du = dalloc<float>(x.size());
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming
-    in the original code the source host memory is pageable memory. If the
-    memory is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    ck(DPCT_CHECK_ERROR(
-           (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(dg, gate.data(), x.size() * 4).wait()),
-       "gate");
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming
-    in the original code the source host memory is pageable memory. If the
-    memory is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    ck(DPCT_CHECK_ERROR(
-           (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(du, up.data(), x.size() * 4).wait()),
-       "up");
+    memcpy_sync(dg, gate.data(), x.size() * 4);
+    memcpy_sync(du, up.data(), x.size() * 4);
     uint8_t* dq = dalloc<uint8_t>((size_t) rows * nb * 36);
     for (int path = 0; path < 3; ++path) {
         if (path == 0) k::quantize_q8_1_rows(dx, rows, n, dq, s);
         else if (path == 1) k::native_quantize_q8_1(dx, dq, n, rows, s);
         else k::native_swiglu_quantize_q8_1(dg, du, dq, n, rows, s);
-        ck(DPCT_CHECK_ERROR(s->wait()), "quantize");
+        s->sync();
         std::vector<uint8_t> got((size_t) rows * nb * 36);
-        ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                .memcpy(got.data(), dq, got.size())
-                                .wait()),
-           "q");
+        memcpy_sync(got.data(), dq, got.size());
         int same = 0, clamped = 0, bad = 0;
         for (int b = 0; b < rows * nb; ++b) {
             const float* v = x.data() + (size_t) b * 32;
@@ -652,19 +513,17 @@ void check_q8_1_finite(dpct::queue_ptr s, std::mt19937 &rng) {
                     same, clamped, bad ? "  FAIL" : "");
         g_fail += bad + (clamped != 3);
     }
-    sycl::free(dx, dpct::get_in_order_queue());
-    sycl::free(dg, dpct::get_in_order_queue());
-    sycl::free(du, dpct::get_in_order_queue());
-    sycl::free(dq, dpct::get_in_order_queue());
+    strata::ze::free(dx);
+    strata::ze::free(dg);
+    strata::ze::free(du);
+    strata::ze::free(dq);
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
     const bool do_bench = argc > 1 && std::string(argv[1]) == "--bench";
-    dpct::queue_ptr s;
-    ck(DPCT_CHECK_ERROR(s = dpct::get_current_device().create_queue(true)),
-       "stream");
+    strata::ze::Stream* s = new strata::ze::Stream();
     std::mt19937 rng(18);
     for (int t : {16, 17, 18, 20, 21, 22, 23, 29, 42}) {
         check_mmvq(t, 2560, 67, s, rng);   // the model's n_embd; 67 rows: a partial block of 4 rows
@@ -677,6 +536,6 @@ int main(int argc, char** argv) {
     check_q8_1_finite(s, rng);
     if (do_bench) bench(s, rng);
     std::printf("iq_multi_parity: %d failures\n", g_fail);
-    dpct::get_current_device().destroy_queue(s);
+    delete s;
     return g_fail ? 1 : 0;
 }

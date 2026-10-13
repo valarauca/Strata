@@ -10,9 +10,7 @@
 //      f32 instead is a 2^-9 = 1.95e-03 relative change, which is above any 1e-3 tolerance.  An fp16
 //      activation is the rival reading, computed and required to differ, because it is what the engine did
 //      before `docs/activation-contract.md` settled the question and it produces perfectly plausible output.
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
+#include "strata/ze/ze.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/f16_bits.hpp"
@@ -29,7 +27,10 @@ namespace {
 using strata::kernels::bf16_from_f32;
 using strata::kernels::f32_from_bf16;
 
-void check(dpct::err0 e, const char *what) {
+/// cudaMemcpy: after the device's queued work, complete on return.
+void memcpy_sync(void* dst, const void* src, size_t bytes) {
+    strata::ze::device_sync();
+    strata::ze::copy_sync(dst, src, bytes);
 }
 
 double rel_l1(const std::vector<float>& a, const std::vector<float>& b) {
@@ -92,51 +93,19 @@ int main(int argc, char** argv) {
 
         uint16_t *d_x = nullptr, *d_w = nullptr;
         float *d_y = nullptr;
-        check(DPCT_CHECK_ERROR(d_x = (uint16_t *)sycl::malloc_device(
-                                   x.size() * 2, dpct::get_in_order_queue())),
-              "x");
-        check(DPCT_CHECK_ERROR(d_w = (uint16_t *)sycl::malloc_device(
-                                   w.size() * 2, dpct::get_in_order_queue())),
-              "w");
-        check(DPCT_CHECK_ERROR(
-                  d_y = (float *)sycl::malloc_device(
-                      (size_t)s.n_out * 4, dpct::get_in_order_queue())),
-              "y");
-        /*
-        DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-        assuming in the original code the source host memory is pageable memory.
-        If the memory is not pageable, call wait() on event return by memcpy API
-        to ensure synchronization behavior.
-        */
-        check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(d_x, x.data(),
-                                                                 x.size() * 2).wait()),
-              "cx");
-        /*
-        DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-        assuming in the original code the source host memory is pageable memory.
-        If the memory is not pageable, call wait() on event return by memcpy API
-        to ensure synchronization behavior.
-        */
-        check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(d_w, w.data(),
-                                                                 w.size() * 2).wait()),
-              "cw");
+        d_x = (uint16_t*) strata::ze::malloc_device(x.size() * 2);
+        d_w = (uint16_t*) strata::ze::malloc_device(w.size() * 2);
+        d_y = (float*) strata::ze::malloc_device((size_t)s.n_out * 4);
+        memcpy_sync(d_x, x.data(), x.size() * 2);
+        memcpy_sync(d_w, w.data(), w.size() * 2);
 
         std::vector<float> naive((size_t) s.n_out), warp((size_t) s.n_out), split((size_t) s.n_out);
         strata::kernels::bf16_gemv(d_x, d_w, d_y, s.n_in, s.n_out, nullptr);
-        check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                   .memcpy(naive.data(), d_y, naive.size() * 4)
-                                   .wait()),
-              "cy1");
+        memcpy_sync(naive.data(), d_y, naive.size() * 4);
         strata::kernels::bf16_gemv_split(d_x, d_w, d_y, s.n_in, s.n_out, 32, nullptr);
-        check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                   .memcpy(warp.data(), d_y, warp.size() * 4)
-                                   .wait()),
-              "cy2");
+        memcpy_sync(warp.data(), d_y, warp.size() * 4);
         strata::kernels::bf16_gemv_split(d_x, d_w, d_y, s.n_in, s.n_out, 256, nullptr);
-        check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                   .memcpy(split.data(), d_y, split.size() * 4)
-                                   .wait()),
-              "cy3");
+        memcpy_sync(split.data(), d_y, split.size() * 4);
 
         const double rn = rel_l1(want, naive), rw = rel_l1(want, warp), rs = rel_l1(want, split);
         std::printf("  %-34s naive %.2e  warp %.2e  split256 %.2e\n", s.what, rn, rw, rs);
@@ -157,31 +126,19 @@ int main(int argc, char** argv) {
             // Round the fp16 value to bf16 - i.e. give the kernel a bf16 activation whose VALUES came through
             // fp16.  That is the whole difference between the two contracts at this call site.
             for (size_t i = 0; i < fp16_as_f32.size(); ++i) x[i] = bf16_from_f32(fp16_as_f32[i]);
-            /*
-            DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-            assuming in the original code the source host memory is pageable
-            memory. If the memory is not pageable, call wait() on event return
-            by memcpy API to ensure synchronization behavior.
-            */
-            check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-                      d_x, x.data(), x.size() * 2).wait()),
-                  "cx2");
+            memcpy_sync(d_x, x.data(), x.size() * 2);
             std::vector<float> rival((size_t) s.n_out);
             strata::kernels::bf16_gemv(d_x, d_w, d_y, s.n_in, s.n_out, nullptr);
-            check(DPCT_CHECK_ERROR(
-                      (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                          .memcpy(rival.data(), d_y, rival.size() * 4)
-                          .wait()),
-                  "cy4");
+            memcpy_sync(rival.data(), d_y, rival.size() * 4);
             const double r = rel_l1(want, rival);
             const bool visible = r > 1e-4;
             std::printf("      %-30s %s (%.4f%% apart)\n", "bf16 vs fp16 activation",
                         visible ? "yes" : "*** NO ***", r * 100);
             if (!visible) ++bad;
         }
-        sycl::free(d_x, dpct::get_in_order_queue());
-            sycl::free(d_w, dpct::get_in_order_queue());
-            sycl::free(d_y, dpct::get_in_order_queue());
+        strata::ze::free(d_x);
+        strata::ze::free(d_w);
+        strata::ze::free(d_y);
     }
 
     std::printf("\nbf16_gemv: %d failures\n", bad);

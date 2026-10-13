@@ -1,35 +1,20 @@
 // src/kernels/cuda/qsa_prompt_attn.cu - see include/strata/kernels/qsa_prompt_attn.hpp.
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
-#include "strata/sycl_queue.hpp"
-#include "strata/core/emulate.hpp"
-#include <cstdlib>
-#include <cstring>
+#include "strata/port.hpp"
 #include "strata/kernels/qsa_prompt_attn.hpp"
-#include "strata/kernels/qsa_prompt_attn_xmx.hpp"
-#include "strata/kernels/gfx_arch.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "qsa_prompt_attn_shared.hpp"
 
 #include <cmath>
-
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
 #include <type_traits>
 
 namespace strata::kernels {
 namespace {
 
-constexpr int HD = 256;           // head_dim
-constexpr int G = 12;             // query heads per KV head
-#ifndef D1_CH
-#define D1_CH 32
-#endif
-constexpr int CH = D1_CH;         // cells per chunk
-constexpr int THREADS = 128;      // 4 warps: scores by cell (8 each), p.v by dimension (64 each = one int8 scale group)
-constexpr int QS = HD + 8;        // q row stride in halves (bank-conflict-free fragment loads)
+template <int KV_MODE>
+using Smem = SmemT<KV_MODE, sycl::half>;
+static_assert(sizeof(sycl::half) == sizeof(uint16_t) && alignof(sycl::half) == alignof(uint16_t),
+              "the host sizes Smem with uint16_t halves");
 
 // The MMA below needs sm_75 or newer (Turing runs it as two k=8 steps); cp.async needs sm_80. Builds for pre-sm_75
 // cards compile the MMA to a trap; qsa_prompt_attn_batch refuses such a device at run time, so the old kernel runs
@@ -107,36 +92,8 @@ __dpct_inline__ uint32_t pack_h2(float lo_k,
 // KV_MODE 4 (Q4_0 K and V, `--kv q4_0`): mode 1 with a scale per 32 values - each q4_0 block's codes enter as exact
 // int8 (code - 8) and its fp16 scale is applied in FP32, as mode 1's are; the caller rotates q and un-rotates the
 // output (kv_q4.hpp).
-template <int KV_MODE>
-struct Smem {
-    using KElem =
-        typename std::conditional<KV_MODE == 0, sycl::half, int8_t>::type;
-    using VElem = typename std::conditional<KV_MODE == 1 || KV_MODE == 4,
-                                            int8_t, sycl::half>::type;
-    static constexpr int KROW = KV_MODE == 0 ? HD + 8 : HD + 16;   // elements; 16-byte aligned rows, banks spread
-    static constexpr int VROW = (KV_MODE == 1 || KV_MODE == 4) ? HD + 16 : HD + 8;
-    static constexpr int NG = KV_MODE == 4 ? HD / QK4_0 : 4;      // scale groups per row (q4_0: 8 of 32, else 4 of 64)
-    sycl::half qh[16][QS];
-    sycl::half ql[16][QS];
-    KElem k[CH][KROW];
-    VElem v[CH][VROW];
-    float ks[CH][NG];
-    float vs[CH][NG];
-    float s[16][CH + 1];
-    float qmax[THREADS / 32];
-    float alpha[16];
-    float lsum[16];
-    float mrow[16];
-    long long row[CH];
-};
 
 template <int KV_MODE>
-/*
-DPCT1110: The total declared local variable size in device function
-prompt_attn_kernel exceeds 128 bytes and may cause high register pressure.
-Consult with your hardware vendor to find the total register size available and
-adjust the code, or use smaller sub-group size to avoid high register pressure.
-*/
 __dpct_inline__ void
 prompt_attn_kernel(const float *__restrict__ q, QsaAttnPools p,
                    const int32_t *__restrict__ ids,
@@ -151,11 +108,6 @@ prompt_attn_kernel(const float *__restrict__ q, QsaAttnPools p,
     q += (size_t) qi * n_head * HD + (size_t) kvh * G * HD;
     attn += (size_t) qi * n_head * HD + (size_t) kvh * G * HD;
     ids += (size_t) qi * cap;
-    /*
-    DPCT1098: The '*' expression is used instead of the __ldg call. These
-    two expressions do not provide the exact same functionality. Check the
-    generated code for potential precision and/or performance issues.
-    */
     const int n = *(steps + (size_t)qi * kStepCount + kStepWidth);
     const int t = item_ct1.get_local_id(2), lane = t & 31, warp = t >> 5;
     const int gid = lane >> 2, tig = lane & 3;
@@ -167,30 +119,15 @@ prompt_attn_kernel(const float *__restrict__ q, QsaAttnPools p,
     for (int i = t; i < G * HD; i += THREADS)
         qm = sycl::fmax(qm, sycl::fabs(q[i]));
 #pragma unroll
-    /*
-    DPCT1108: '__shfl_xor_sync' was migrated with the experimental feature
-    masked sub_group function which may not be supported by all compilers or
-    runtimes. You may need to adjust the code.
-    */
     for (int o = 16; o > 0; o >>= 1) qm = sycl::fmax(
         qm, dpct::experimental::permute_sub_group_by_xor(
                 0xffffffffu, sycl::ext::oneapi::this_work_item::get_sub_group(),
                 qm, o));
     if (lane == 0) S.qmax[warp] = qm;
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
     qm = sycl::fmax(sycl::fmax(S.qmax[0], S.qmax[1]),
                     sycl::fmax(S.qmax[2], S.qmax[3]));
     int qe = 0;
-    /*
-    DPCT1017: The sycl::frexp call is used instead of the frexpf call.
-    These two calls do not provide exactly the same functionality. Check the
-    potential precision and/or performance issues for the generated code.
-    */
     if (qm > 0.0f) sycl::frexp(
         qm, sycl::address_space_cast<sycl::access::address_space::generic_space,
                                      sycl::access::decorated::yes>(
@@ -227,15 +164,6 @@ prompt_attn_kernel(const float *__restrict__ q, QsaAttnPools p,
             }
             S.row[t] = r;
         }
-        /*
-        DPCT1118: SYCL group functions and algorithms must be encountered in
-        converged control flow. You may need to adjust the code.
-        */
-        /*
-        DPCT1065: Consider replacing sycl::nd_item::barrier() with
-        sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
-        better performance if there is no access to global memory.
-        */
         item_ct1.barrier(); // rows ready; the previous chunk's p.v is done with
                             // k, v, s
         // gather the chunk's K and V rows (16-byte pieces; K8V4's V as q4_0 blocks dequantized to fp16)
@@ -254,12 +182,6 @@ prompt_attn_kernel(const float *__restrict__ q, QsaAttnPools p,
                 float d = 0.0f;
                 if (r >= 0) {
                     const block_q4_0* blk = reinterpret_cast<const block_q4_0*>((kv == 0 ? p.k_q4 : p.v_q4) + r * BYTES) + b;
-                    /*
-                    DPCT1098: The '*' expression is used instead of the
-                    __ldg call. These two expressions do not provide the exact
-                    same functionality. Check the generated code for potential
-                    precision and/or performance issues.
-                    */
                     d = sycl::vec<sycl::half, 1>(
                             sycl::bit_cast<sycl::half, unsigned short>(blk->d))
                             .convert<float,
@@ -268,12 +190,6 @@ prompt_attn_kernel(const float *__restrict__ q, QsaAttnPools p,
                     uint32_t w[4];
 #pragma unroll
                     for (int j = 0; j < 4; ++j)
-                        /*
-                        DPCT1098: The '*' expression is used instead of the
-                        __ldg call. These two expressions do not provide the
-                        exact same functionality. Check the generated code for
-                        potential precision and/or performance issues.
-                        */
                         w[j] = (uint32_t)*(q16 + 2 * j) |
                                ((uint32_t)*(q16 + 2 * j + 1) << 16);
                     // per byte: the low nibble minus 8 is element j, the high one minus 8 element j + 16
@@ -312,22 +228,10 @@ prompt_attn_kernel(const float *__restrict__ q, QsaAttnPools p,
                 sycl::uint4 kx = sycl::uint4(0, 0, 0, 0);
                 if (r >= 0) {
                     if constexpr (KV_MODE == 0)
-                        /*
-                        DPCT1098: The '*' expression is used instead of the
-                        __ldg call. These two expressions do not provide the
-                        exact same functionality. Check the generated code for
-                        potential precision and/or performance issues.
-                        */
                         kx = *(reinterpret_cast<const sycl::uint4 *>(p.k_pool +
                                                                      r * HD) +
                                pc);
                     else   // modes 1 and 3: the K side is INT8
-                        /*
-                        DPCT1098: The '*' expression is used instead of the
-                        __ldg call. These two expressions do not provide the
-                        exact same functionality. Check the generated code for
-                        potential precision and/or performance issues.
-                        */
                         kx = *(reinterpret_cast<const sycl::uint4 *>(p.k_q +
                                                                      r * HD) +
                                pc);
@@ -376,24 +280,10 @@ prompt_attn_kernel(const float *__restrict__ q, QsaAttnPools p,
                     sycl::uint4 vx = sycl::uint4(0, 0, 0, 0);
                     if (r >= 0) {
                         if constexpr (KV_MODE == 1)
-                            /*
-                            DPCT1098: The '*' expression is used instead of
-                            the __ldg call. These two expressions do not provide
-                            the exact same functionality. Check the generated
-                            code for potential precision and/or performance
-                            issues.
-                            */
                             vx = *(reinterpret_cast<const sycl::uint4 *>(
                                        p.v_q + r * HD) +
                                    pc);
                         else
-                            /*
-                            DPCT1098: The '*' expression is used instead of
-                            the __ldg call. These two expressions do not provide
-                            the exact same functionality. Check the generated
-                            code for potential precision and/or performance
-                            issues.
-                            */
                             vx = *(reinterpret_cast<const sycl::uint4 *>(
                                        p.v_pool + r * HD) +
                                    pc);
@@ -434,15 +324,6 @@ prompt_attn_kernel(const float *__restrict__ q, QsaAttnPools p,
                 S.vs[c][g] = b;
             }
         }
-        /*
-        DPCT1118: SYCL group functions and algorithms must be encountered in
-        converged control flow. You may need to adjust the code.
-        */
-        /*
-        DPCT1065: Consider replacing sycl::nd_item::barrier() with
-        sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
-        better performance if there is no access to global memory.
-        */
         item_ct1.barrier();
         // scores: warp w takes cells 8w..8w+7 (one n-tile) over all 256 dims, per scale group (64 dims; q4_0's 32)
         constexpr int NG = Smem<KV_MODE>::NG, KPG = HD / 16 / NG;   // groups per row, 16-dim MMA steps per group
@@ -489,15 +370,6 @@ prompt_attn_kernel(const float *__restrict__ q, QsaAttnPools p,
             S.s[gid + 8][c] = c < nh ? sc[2] * qdown : -INFINITY;
             S.s[gid + 8][c + 1] = c + 1 < nh ? sc[3] * qdown : -INFINITY;
         }
-        /*
-        DPCT1118: SYCL group functions and algorithms must be encountered in
-        converged control flow. You may need to adjust the code.
-        */
-        /*
-        DPCT1065: Consider replacing sycl::nd_item::barrier() with
-        sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
-        better performance if there is no access to global memory.
-        */
         item_ct1.barrier();
         // online softmax: row t/8, 4 cells per thread, 8 threads per row (lanes 8r..8r+7 of a warp)
         {
@@ -509,11 +381,6 @@ prompt_attn_kernel(const float *__restrict__ q, QsaAttnPools p,
                 x[j] = S.s[r][sub * PER + j]; mx = sycl::fmax(mx, x[j]);
             }
 #pragma unroll
-            /*
-            DPCT1108: '__shfl_xor_sync' was migrated with the experimental
-            feature masked sub_group function which may not be supported by all
-            compilers or runtimes. You may need to adjust the code.
-            */
             for (int o = 1; o < 8; o <<= 1) mx = sycl::fmax(
                 mx,
                 dpct::experimental::permute_sub_group_by_xor(
@@ -530,11 +397,6 @@ prompt_attn_kernel(const float *__restrict__ q, QsaAttnPools p,
                 sum += e;
             }
 #pragma unroll
-            /*
-            DPCT1108: '__shfl_xor_sync' was migrated with the experimental
-            feature masked sub_group function which may not be supported by all
-            compilers or runtimes. You may need to adjust the code.
-            */
             for (int o = 1; o < 8; o <<= 1) sum +=
                 dpct::experimental::permute_sub_group_by_xor(
                     0xffffffffu,
@@ -549,15 +411,6 @@ prompt_attn_kernel(const float *__restrict__ q, QsaAttnPools p,
                 S.mrow[r] = m_new;
             }
         }
-        /*
-        DPCT1118: SYCL group functions and algorithms must be encountered in
-        converged control flow. You may need to adjust the code.
-        */
-        /*
-        DPCT1065: Consider replacing sycl::nd_item::barrier() with
-        sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
-        better performance if there is no access to global memory.
-        */
         item_ct1.barrier();
         // p.v: warp w owns dims [64w, 64w+64), which is int8 scale group w (q4_0: groups 2w and 2w+1, four n-tiles
         // each). A group's scale is folded into p relative to the chunk's largest magnitude (q4_0's scales are signed:
@@ -577,11 +430,6 @@ prompt_attn_kernel(const float *__restrict__ q, QsaAttnPools p,
             for (int c = lane; c < CH; c += 32)
                 vmax = sycl::fmax(vmax, sycl::fabs(S.vs[c][vg]));
 #pragma unroll
-            /*
-            DPCT1108: '__shfl_xor_sync' was migrated with the experimental
-            feature masked sub_group function which may not be supported by all
-            compilers or runtimes. You may need to adjust the code.
-            */
             for (int o = 16; o > 0; o >>= 1) vmax = sycl::fmax(
                 vmax, dpct::experimental::permute_sub_group_by_xor(
                           0xffffffffu,
@@ -656,11 +504,6 @@ prompt_attn_kernel(const float *__restrict__ q, QsaAttnPools p,
             }
         }
     }
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
     const float l0 = S.lsum[gid], l1 = S.lsum[gid + 8];
     const float i0 = l0 > 0.0f ? 1.0f / l0 : 0.0f, i1 = l1 > 0.0f ? 1.0f / l1 : 0.0f;
@@ -680,18 +523,6 @@ prompt_attn_kernel(const float *__restrict__ q, QsaAttnPools p,
 // warp needs only its own 64-byte slice of each K and V row: it gathers it itself with cp.async into its own
 // double-buffered stage while it computes the previous chunk, and q stays in registers. Only the q.k partial sums
 // (one per dim group) cross warps, and they are added in a fixed order: the result is deterministic.
-constexpr int CH2 = 32;
-
-struct Smem2 {
-    int8_t kv[2][4][2][CH2][64];   // stage, warp, K/V, cell, 64 dims in 16-byte pieces XOR-swizzled by the cell
-    float sc[2][4][2][CH2];        // stage, warp, K/V scale of the cell for the warp's group
-    float part[4][16][CH2 + 1];    // q.k per dim group
-    float p[16][CH2 + 1];
-    float qmax[4];
-    float alpha[16];
-    float lsum[16];
-    float mrow[16];
-};
 
 __dpct_inline__ int
 swz(int cell, int byte) { // byte offset of (cell, byte) in a stage slice
@@ -702,9 +533,6 @@ __dpct_inline__ void cp_async16(void *smem, const void *gmem, bool valid) {
     /* unreachable on SYCL: the launcher refuses this device */
 #else
     auto sa = smem;
-    /*
-    DPCT1053: Migration of device assembly code is not supported.
-    */
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(sa),
                  "l"(gmem), "r"(valid ? 16 : 0));
 #endif
@@ -728,12 +556,6 @@ __dpct_inline__ void cp_async_wait1() {
 #endif
 }
 
-/*
-DPCT1110: The total declared local variable size in device function
-prompt_attn_i8_kernel exceeds 128 bytes and may cause high register pressure.
-Consult with your hardware vendor to find the total register size available and
-adjust the code, or use smaller sub-group size to avoid high register pressure.
-*/
 __dpct_inline__ void
 prompt_attn_i8_kernel(const float *__restrict__ q, QsaAttnPools p,
                       const int32_t *__restrict__ ids,
@@ -748,11 +570,6 @@ prompt_attn_i8_kernel(const float *__restrict__ q, QsaAttnPools p,
     q += (size_t) qi * n_head * HD + (size_t) kvh * G * HD;
     attn += (size_t) qi * n_head * HD + (size_t) kvh * G * HD;
     ids += (size_t) qi * cap;
-    /*
-    DPCT1098: The '*' expression is used instead of the __ldg call. These
-    two expressions do not provide the exact same functionality. Check the
-    generated code for potential precision and/or performance issues.
-    */
     const int n = *(steps + (size_t)qi * kStepCount + kStepWidth);
     const int t = item_ct1.get_local_id(2), lane = t & 31, warp = t >> 5;
     const int gid = lane >> 2, tig = lane & 3;
@@ -764,31 +581,16 @@ prompt_attn_i8_kernel(const float *__restrict__ q, QsaAttnPools p,
     for (int i = t; i < G * HD; i += THREADS)
         qm = sycl::fmax(qm, sycl::fabs(q[i]));
 #pragma unroll
-    /*
-    DPCT1108: '__shfl_xor_sync' was migrated with the experimental feature
-    masked sub_group function which may not be supported by all compilers or
-    runtimes. You may need to adjust the code.
-    */
     for (int o = 16; o > 0; o >>= 1) qm = sycl::fmax(
         qm, dpct::experimental::permute_sub_group_by_xor(
                 0xffffffffu, sycl::ext::oneapi::this_work_item::get_sub_group(),
                 qm, o));
     if (lane == 0) S.qmax[warp] = qm;
     if (t < 16) { S.mrow[t] = -INFINITY; S.lsum[t] = 0.0f; }
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
     qm = sycl::fmax(sycl::fmax(S.qmax[0], S.qmax[1]),
                     sycl::fmax(S.qmax[2], S.qmax[3]));
     int qe = 0;
-    /*
-    DPCT1017: The sycl::frexp call is used instead of the frexpf call.
-    These two calls do not provide exactly the same functionality. Check the
-    potential precision and/or performance issues for the generated code.
-    */
     if (qm > 0.0f) sycl::frexp(
         qm, sycl::address_space_cast<sycl::access::address_space::generic_space,
                                      sycl::access::decorated::yes>(&qe));
@@ -820,21 +622,11 @@ prompt_attn_i8_kernel(const float *__restrict__ q, QsaAttnPools p,
 
     // the chunk pipeline: cells two chunks ahead, their pool rows one chunk ahead, the data (cp.async) one ahead
     const int n_chunks = (n + CH2 - 1) / CH2;
-    /*
-    DPCT1098: The '*' expression is used instead of the __ldg call. These
-    two expressions do not provide the exact same functionality. Check the
-    generated code for potential precision and/or performance issues.
-    */
     auto cell_of = [&](int c) -> int {
                                        return c < n ? *(ids + c) : -1;
     };
     auto row_of = [&](int cell) -> long long {
         if (cell < 0) return -1;
-        /*
-        DPCT1098: The '*' expression is used instead of the __ldg call.
-        These two expressions do not provide the exact same functionality. Check
-        the generated code for potential precision and/or performance issues.
-        */
         const long long page = (long long)*(p.page_table + cell / page_size);
         return (page * n_kv_heads + kvh) * page_size + (cell % page_size);
     };
@@ -842,15 +634,6 @@ prompt_attn_i8_kernel(const float *__restrict__ q, QsaAttnPools p,
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
             const int idx = lane + 32 * j, cell = idx >> 2, pc = idx & 3;
-            /*
-            DPCT1108: '__shfl_sync' was migrated with the experimental
-            feature masked sub_group function which may not be supported by all
-            compilers or runtimes. You may need to adjust the code.
-            */
-            /*
-            DPCT1121: Make sure that the "r" which is used in the SYCL group
-            function/algorithm is initialized.
-            */
             const long long rr = dpct::experimental::select_from_sub_group(
                 0xffffffffu, sycl::ext::oneapi::this_work_item::get_sub_group(),
                 r, cell);
@@ -859,21 +642,11 @@ prompt_attn_i8_kernel(const float *__restrict__ q, QsaAttnPools p,
             cp_async16(&S.kv[st][warp][0][0][0] + swz(cell, pc * 16), p.k_q + off, ok);
             cp_async16(&S.kv[st][warp][1][0][0] + swz(cell, pc * 16), p.v_q + off, ok);
         }
-        /*
-        DPCT1098: The '*' expression is used instead of the __ldg call.
-        These two expressions do not provide the exact same functionality. Check
-        the generated code for potential precision and/or performance issues.
-        */
         ksr = r >= 0 ? sycl::vec<sycl::half, 1>(
                            sycl::bit_cast<sycl::half, unsigned short>(
                                *(p.k_scale + r * (HD / KV_Q8_GROUP) + warp)))
                            .convert<float, sycl::rounding_mode::automatic>()[0]
                      : 0.0f;
-        /*
-        DPCT1098: The '*' expression is used instead of the __ldg call.
-        These two expressions do not provide the exact same functionality. Check
-        the generated code for potential precision and/or performance issues.
-        */
         vsr = r >= 0 ? sycl::vec<sycl::half, 1>(
                            sycl::bit_cast<sycl::half, unsigned short>(
                                *(p.v_scale + r * (HD / KV_Q8_GROUP) + warp)))
@@ -923,15 +696,6 @@ prompt_attn_i8_kernel(const float *__restrict__ q, QsaAttnPools p,
             S.part[warp][gid + 8][c] = tg[2] * s0;
             S.part[warp][gid + 8][c + 1] = tg[3] * s1;
         }
-        /*
-        DPCT1118: SYCL group functions and algorithms must be encountered in
-        converged control flow. You may need to adjust the code.
-        */
-        /*
-        DPCT1065: Consider replacing sycl::nd_item::barrier() with
-        sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
-        better performance if there is no access to global memory.
-        */
         item_ct1.barrier();
         // online softmax over the four groups' sum (fixed order): row t/8, 4 cells per thread
         {
@@ -945,11 +709,6 @@ prompt_attn_i8_kernel(const float *__restrict__ q, QsaAttnPools p,
                 mx = sycl::fmax(mx, x[j]);
             }
 #pragma unroll
-            /*
-            DPCT1108: '__shfl_xor_sync' was migrated with the experimental
-            feature masked sub_group function which may not be supported by all
-            compilers or runtimes. You may need to adjust the code.
-            */
             for (int o = 1; o < 8; o <<= 1) mx = sycl::fmax(
                 mx,
                 dpct::experimental::permute_sub_group_by_xor(
@@ -966,11 +725,6 @@ prompt_attn_i8_kernel(const float *__restrict__ q, QsaAttnPools p,
                 sum += e;
             }
 #pragma unroll
-            /*
-            DPCT1108: '__shfl_xor_sync' was migrated with the experimental
-            feature masked sub_group function which may not be supported by all
-            compilers or runtimes. You may need to adjust the code.
-            */
             for (int o = 1; o < 8; o <<= 1) sum +=
                 dpct::experimental::permute_sub_group_by_xor(
                     0xffffffffu,
@@ -985,25 +739,11 @@ prompt_attn_i8_kernel(const float *__restrict__ q, QsaAttnPools p,
                 S.mrow[r] = m_new;
             }
         }
-        /*
-        DPCT1118: SYCL group functions and algorithms must be encountered in
-        converged control flow. You may need to adjust the code.
-        */
-        /*
-        DPCT1065: Consider replacing sycl::nd_item::barrier() with
-        sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
-        better performance if there is no access to global memory.
-        */
         item_ct1.barrier();
         // p.v over this warp's 64 dims (as v1)
         {
             float vmax = S.sc[st][warp][1][lane];
 #pragma unroll
-            /*
-            DPCT1108: '__shfl_xor_sync' was migrated with the experimental
-            feature masked sub_group function which may not be supported by all
-            compilers or runtimes. You may need to adjust the code.
-            */
             for (int o = 16; o > 0; o >>= 1) vmax = sycl::fmax(
                 vmax, dpct::experimental::permute_sub_group_by_xor(
                           0xffffffffu,
@@ -1071,11 +811,6 @@ prompt_attn_i8_kernel(const float *__restrict__ q, QsaAttnPools p,
         }
         sycl::group_barrier(sycl::ext::oneapi::this_work_item::get_sub_group());
     }
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
     const float l0 = S.lsum[gid], l1 = S.lsum[gid + 8];
     const float i0 = l0 > 0.0f ? 1.0f / l0 : 0.0f, i1 = l1 > 0.0f ? 1.0f / l1 : 0.0f;
@@ -1089,170 +824,6 @@ prompt_attn_i8_kernel(const float *__restrict__ q, QsaAttnPools p,
                                               d) =
                 sycl::float2(acc[j][2] * i1, acc[j][3] * i1);
     }
-}
-
-bool launch_i8(const float *q, const QsaAttnPools &pools, const int32_t *ids,
-               const int32_t *steps, int64_t cap, const QsaShapes &s,
-               float *attn, int64_t n_q, dpct::queue_ptr st) try {
-    static bool attr[64] = {};   // the shared-memory opt-in is per device (a layer split runs this on several)
-    int dev = 0;
-    dev = dpct::get_current_device_id();
-    /*
-    DPCT1083: The size of local memory in the migrated code may be different
-    from the original code. Check that the allocated memory size in the migrated
-    code is correct.
-    */
-    const int bytes = (int)sizeof(Smem2);
-    if (dev < 0 || dev >= 64) return false;
-    if (!attr[dev]) {
-        /*
-        DPCT1027: The call to cudaFuncSetAttribute was replaced with 0
-        because SYCL currently does not support corresponding setting.
-        */
-        if (0 != 0) {
-            /*
-            DPCT1026: The call to cudaGetLastError was removed because this
-            functionality is redundant in SYCL.
-            */
-            return false;
-        }
-        attr[dev] = true;
-    }
-    const float scale_log2 = 1.4426950408889634f / sqrtf((float) HD);
-    for (int64_t q0 = 0; q0 < n_q; q0 += 65535) {
-        const int64_t nb = n_q - q0 < 65535 ? n_q - q0 : 65535;
-        {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
-            dpct::has_capability_or_fail(st->get_device(),
-                                         {sycl::aspect::fp16});
-
-            st->submit([&](sycl::handler &cgh) {
-                sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
-                    sycl::range(bytes), cgh);
-
-                auto q_q0_s_n_head_HD_ct0 = q + q0 * s.n_head * HD;
-                auto ids_q0_cap_ct2 = ids + q0 * cap;
-                auto steps_q0_kStepCount_ct3 = steps + q0 * kStepCount;
-                auto attn_q0_s_n_head_HD_ct7 = attn + q0 * s.n_head * HD;
-
-                cgh.parallel_for<
-                    dpct_kernel_name<class prompt_attn_i8_kernel_c3d463>>(
-                    sycl::nd_range<3>(
-                        sycl::range(1, (unsigned)s.n_head_kv, (unsigned)nb) *
-                            sycl::range(1, 1, THREADS),
-                        sycl::range(1, 1, THREADS)),
-                    exp_props,
-                    [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(
-                        32)]] {
-                        prompt_attn_i8_kernel(
-                            q_q0_s_n_head_HD_ct0, pools, ids_q0_cap_ct2,
-                            steps_q0_kStepCount_ct3, (int)s.n_head_kv,
-                            (int)s.page_size, scale_log2,
-                            attn_q0_s_n_head_HD_ct7, (int)cap,
-                            dpct_local_acc_ct1
-                                .get_multi_ptr<sycl::access::decorated::no>()
-                                .get());
-                    });
-            });
-        }
-    }
-    /*
-    DPCT1010: SYCL uses exceptions to report errors and does not use the
-    error codes. The cudaGetLastError function call was replaced with 0. You
-    need to rewrite this code.
-    */
-    const dpct::err0 e = 0;
-
-    return true;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
-
-template <int KV_MODE>
-bool launch(const float *q, const QsaAttnPools &pools, const int32_t *ids,
-            const int32_t *steps, int64_t cap, const QsaShapes &s, float *attn,
-            int64_t n_q, dpct::queue_ptr st) try {
-    static bool attr[64] = {};   // per device, as above
-    int dev = 0;
-    dev = dpct::get_current_device_id();
-    /*
-    DPCT1083: The size of local memory in the migrated code may be different
-    from the original code. Check that the allocated memory size in the migrated
-    code is correct.
-    */
-    const int bytes = (int)sizeof(Smem<KV_MODE>);
-    if (dev < 0 || dev >= 64) return false;
-    if (!attr[dev]) {
-        /*
-        DPCT1027: The call to cudaFuncSetAttribute was replaced with 0
-        because SYCL currently does not support corresponding setting.
-        */
-        if (0 != 0) {
-            /*
-            DPCT1026: The call to cudaGetLastError was removed because this
-            functionality is redundant in SYCL.
-            */
-            return false;
-        }
-        attr[dev] = true;
-    }
-    const float scale_log2 = 1.4426950408889634f / sqrtf((float) HD);
-    for (int64_t q0 = 0; q0 < n_q; q0 += 65535) {
-        const int64_t nb = n_q - q0 < 65535 ? n_q - q0 : 65535;
-        {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
-            dpct::has_capability_or_fail(st->get_device(),
-                                         {sycl::aspect::fp16});
-
-            st->submit([&](sycl::handler &cgh) {
-                sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
-                    sycl::range(bytes), cgh);
-
-                auto q_q0_s_n_head_HD_ct0 = q + q0 * s.n_head * HD;
-                auto ids_q0_cap_ct2 = ids + q0 * cap;
-                auto steps_q0_kStepCount_ct3 = steps + q0 * kStepCount;
-                auto attn_q0_s_n_head_HD_ct7 = attn + q0 * s.n_head * HD;
-
-                cgh.parallel_for<
-                    dpct_kernel_name<class prompt_attn_kernel_e09b15,
-                                     dpct_kernel_scalar<KV_MODE>>>(
-                    sycl::nd_range<3>(
-                        sycl::range(1, (unsigned)s.n_head_kv, (unsigned)nb) *
-                            sycl::range(1, 1, THREADS),
-                        sycl::range(1, 1, THREADS)),
-                    exp_props,
-                    [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(
-                        32)]] {
-                        prompt_attn_kernel<KV_MODE>(
-                            q_q0_s_n_head_HD_ct0, pools, ids_q0_cap_ct2,
-                            steps_q0_kStepCount_ct3, (int)s.n_head_kv,
-                            (int)s.page_size, scale_log2,
-                            attn_q0_s_n_head_HD_ct7, (int)cap,
-                            dpct_local_acc_ct1
-                                .get_multi_ptr<sycl::access::decorated::no>()
-                                .get());
-                    });
-            });
-        }
-    }
-    /*
-    DPCT1010: SYCL uses exceptions to report errors and does not use the
-    error codes. The cudaGetLastError function call was replaced with 0. You
-    need to rewrite this code.
-    */
-    const dpct::err0 e = 0;
-
-    return true;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
 }
 
 // PR #600: compiled only into the experimental build (-DSTRATA_EXPERIMENTAL_SM60=ON), the one build that runs on a
@@ -1601,43 +1172,6 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_v70_kernel(const float* _
         }
 }
 
-template <int KV_MODE>
-bool launch70(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
-              const QsaShapes& s, float* attn, int64_t n_q, cudaStream_t st) {
-    static bool attr[64] = {};
-    int dev = 0;
-    cudaGetDevice(&dev);
-    const int bytes = (int) sizeof(Smem70<KV_MODE>);
-    if (dev < 0 || dev >= 64) return false;
-    if (!attr[dev]) {
-        if (cudaFuncSetAttribute(prompt_attn_v70_kernel<KV_MODE>, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes) !=
-            cudaSuccess) {
-            cudaGetLastError();
-            return false;
-        }
-        attr[dev] = true;
-    }
-    const float scale_log2 = 1.4426950408889634f / sqrtf((float) HD);
-    for (int64_t q0 = 0; q0 < n_q; q0 += 65535) {
-        const int64_t nb = n_q - q0 < 65535 ? n_q - q0 : 65535;
-        prompt_attn_v70_kernel<KV_MODE><<<dim3((unsigned) nb, (unsigned) s.n_head_kv), THREADS, bytes, st>>>(
-            q + q0 * s.n_head * HD, pools, ids + q0 * cap, steps + q0 * kStepCount, (int) s.n_head_kv,
-            (int) s.page_size, scale_log2, attn + q0 * s.n_head * HD, (int) cap);
-    }
-    const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "qsa_prompt_attn_batch (sm_70): %s\n", cudaGetErrorString(e));
-        std::exit(1);
-    }
-    return true;
-}
-#else   // AMD, or a build without STRATA_EXPERIMENTAL_SM60: no m8n8k4 kernel (the caller keeps the old one)
-template <int KV_MODE>
-bool launch70(const float *, const QsaAttnPools &, const int32_t *,
-              const int32_t *, int64_t, const QsaShapes &, float *, int64_t,
-              dpct::queue_ptr) {
-    return false;
-}
 #endif  // !__HIPCC__ && STRATA_EXPERIMENTAL_SM60
 
 #if defined(__HIPCC__)
@@ -1911,144 +1445,10 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_wmma_kernel(const float* 
     __builtin_trap();
 #endif
 }
-
-// gfx12 (RDNA4) and gfx11 (RDNA3 / RDNA3.5), only on request: the output differs from the default kernel's in its
-// last bits
-bool hip_wmma_usable() {
-    static const bool want = [] {
-        const char* e = std::getenv("STRATA_HIP_WMMA");
-        return e != nullptr && e[0] == '1';
-    }();
-    if (!want) return false;
-    static int arch[64] = {};   // 0 unknown, 1 gfx11 / gfx12, 2 other
-    int dev = 0;
-    if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= 64) { (void) hipGetLastError(); return false; }
-    if (arch[dev] == 0) {
-        hipDeviceProp_t prop{};
-        if (hipGetDeviceProperties(&prop, dev) != hipSuccess) { (void) hipGetLastError(); return false; }
-        arch[dev] = std::strncmp(prop.gcnArchName, "gfx12", 5) == 0 || strata::kernels::gfx_arch_is_gfx11_wmma(prop.gcnArchName)
-                        ? 1 : 2;
-        static bool told = false;
-        if (!told) {
-            told = true;
-            std::fprintf(stderr, "strata: STRATA_HIP_WMMA: the prompt attention on matrix cores %s (%s)\n",
-                         arch[dev] == 1 ? "on" : "unavailable", prop.gcnArchName);
-        }
-    }
-    return arch[dev] == 1;
-}
-
-bool launch_wmma(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
-                 const QsaShapes& s, float* attn, int64_t n_q, cudaStream_t st) {
-    const float scale_log2 = 1.4426950408889634f / sqrtf((float) HD);
-    for (int64_t q0 = 0; q0 < n_q; q0 += 65535) {
-        const int64_t nb = n_q - q0 < 65535 ? n_q - q0 : 65535;
-        static const bool fast = [] { const char* e = std::getenv("STRATA_PA_FAST"); return e != nullptr && e[0] == '1'; }();
-        static const int64_t min_t = [] { const char* e = std::getenv("STRATA_PF_SWITCH_MIN_T"); return e ? (int64_t) std::atoll(e) : (int64_t) 0; }();
-        if (fast && n_q >= min_t)
-            prompt_attn_wmma_kernel<false><<<dim3((unsigned) nb, (unsigned) s.n_head_kv), THREADS, 0, st>>>(
-                q + q0 * s.n_head * HD, pools, ids + q0 * cap, steps + q0 * kStepCount, (int) s.n_head_kv,
-                (int) s.page_size, scale_log2, attn + q0 * s.n_head * HD, (int) cap);
-        else
-            prompt_attn_wmma_kernel<true><<<dim3((unsigned) nb, (unsigned) s.n_head_kv), THREADS, 0, st>>>(
-                q + q0 * s.n_head * HD, pools, ids + q0 * cap, steps + q0 * kStepCount, (int) s.n_head_kv,
-                (int) s.page_size, scale_log2, attn + q0 * s.n_head * HD, (int) cap);
-    }
-    const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "qsa_prompt_attn_batch (wmma): %s\n", cudaGetErrorString(e));
-        std::exit(1);
-    }
-    return true;
-}
 #endif
 
 }  // namespace
 
-bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
-                           int64_t cap, const QsaShapes& s, float* attn, int64_t n_q, void* stream) {
-    if (n_q <= 0) return true;
-    bool volta = false, turing = false;   // per call, from the CURRENT device (a layer split can mix Turing with newer cards)
-    {   // sm_75 or newer: the MMA above compiles for both.  sm_80+ runs the cp.async kernel (launch_i8); Turing has
-        // no cp.async, so it runs the v1 kernel (launch<1>, same accuracy, another summation order).  An older card
-        // keeps the old kernel.
-        // #371: the compute capability with its minor - sm_70 (V100) has no m16n8k8 (the kernels trap below sm_75)
-#if defined(STRATA_HIP_GFX906)
-        return false;   // gfx906: the tensor-core and WMMA kernels are not for it; the FP32 kernel runs
-#endif
-        static int cc[64] = {};
-        int dev = 0;
-        /*
-        DPCT1026: The call to cudaGetLastError was removed because this
-        functionality is redundant in SYCL.
-        */
-        if (DPCT_CHECK_ERROR(dev = dpct::get_current_device_id()) != 0 ||
-            dev < 0 || dev >= 64) {
-            ; return false;
-        }
-        if (cc[dev] == 0) {
-            int major = 0, minor = 0;
-            if (DPCT_CHECK_ERROR(
-                    major = dpct::get_device(dev).get_major_version()) != 0 ||
-                DPCT_CHECK_ERROR(
-                    minor = dpct::get_device(dev).get_minor_version()) != 0) {
-                /*
-                DPCT1026: The call to cudaGetLastError was removed because
-                this functionality is redundant in SYCL.
-                */
-                return false;
-            }
-            // STRATA_QSA_WARP=1|attn (an A/B arm): the pre-sm_80 kernels on any card, as RTX 20 runs them
-            const char* w = std::getenv("STRATA_QSA_WARP");
-            cc[dev] = w && (!std::strcmp(w, "1") || !std::strcmp(w, "attn")) ? 75
-                      : 10 * strata::cc_major_of(major) + strata::cc_minor_of(minor);
-        }
-        (void) cc[dev];
-        // SYCL: the mma.sync kernel below is not ported (upstream's Turing/sm_80 split - `turing` - does not
-        // apply); its XMX port takes the same arguments
-        if (qsa_prompt_attn_xmx(q, pools, ids, steps, cap, s, attn, n_q, stream)) return true;
-        return false;   // the caller takes the older kernel
-    }
-#if defined(__HIPCC__)
-    // the tensor-core kernels are compiled out on AMD (its major version is not a CUDA sm); RDNA4 has its own int8-KV
-    // matrix-core kernel, opt-in (STRATA_HIP_WMMA=1); everything else keeps the old kernel
-    (void) turing; (void) volta;
-    if (pools.k_q != nullptr && pools.v_q != nullptr && pools.k_scale != nullptr && pools.v_scale != nullptr &&
-        pools.k_q4 == nullptr && pools.v_q4 == nullptr && s.head_dim == HD && s.n_head == (int64_t) G * s.n_head_kv &&
-        cap > 0 && ids && steps && pools.page_table && hip_wmma_usable())
-        return launch_wmma(q, pools, ids, steps, cap, s, attn, n_q, (cudaStream_t) stream);
-    return false;
-#endif
-    if (s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !ids || !steps || !pools.page_table)
-        return false;
-    dpct::queue_ptr st = strata::q_of(stream);
-    if (pools.k_q4 != nullptr) {   // Q4_0 K and V (--kv q4_0): mode 4.  STRATA_PROMPT_ATTN_Q4=0: the old kernel (A/B)
-        static const bool q4_off = [] {
-            const char* v = std::getenv("STRATA_PROMPT_ATTN_Q4");
-            return v != nullptr && v[0] == '0';
-        }();
-        // sm_80+ only: on Turing mode 4 would run as pairs of m16n8k8 MMAs, which no parity run has checked yet
-        if (q4_off || turing || pools.v_q4 == nullptr) return false;
-        return launch<4>(q, pools, ids, steps, cap, s, attn, n_q, st);
-    }
-    if (pools.k_q != nullptr && pools.v_q4 != nullptr) {   // hybrid K8V4: int8 K + dequantized-q4 V
-        if (!pools.k_scale) return false;
-        if (volta) return launch70<3>(q, pools, ids, steps, cap, s, attn, n_q, st);
-        return launch<3>(q, pools, ids, steps, cap, s, attn, n_q, st);
-    }
-    if (pools.k_q != nullptr) {
-        if (!pools.v_q || !pools.k_scale || !pools.v_scale) return false;
-        // STRATA_PROMPT_ATTN_V1=1 (debug): the first version, same accuracy, another summation order - the control
-        // for how far the model amplifies an FP32-level change.  Turing always takes it: v2's cp.async does not
-        // exist before sm_80.
-        static const bool v1 = std::getenv("STRATA_PROMPT_ATTN_V1") != nullptr;
-        if (volta) return launch70<1>(q, pools, ids, steps, cap, s, attn, n_q, st);
-        if (v1 || turing) return launch<1>(q, pools, ids, steps, cap, s, attn, n_q, st);
-        return launch_i8(q, pools, ids, steps, cap, s, attn, n_q, st);
-    }
-    if (!pools.k_pool || !pools.v_pool) return false;
-    if (volta) return launch70<0>(q, pools, ids, steps, cap, s, attn, n_q, st);
-    return launch<0>(q, pools, ids, steps, cap, s, attn, n_q, st);
-}
+#include "qsa_prompt_attn.kern.inc"
 
 }  // namespace strata::kernels

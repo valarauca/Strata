@@ -9,9 +9,7 @@
 //      fixed without being fixed.
 //   3. The measured size of that difference is reported, so the number in the state file is one this test
 //      produces rather than one quoted from elsewhere.
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
+#include "strata/ze/ze.hpp"
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/s_gemv.hpp"
 #include "strata/kernels/s2_gemv_q8.hpp"
@@ -25,7 +23,10 @@
 
 namespace {
 
-void check(dpct::err0 e, const char *what) {
+/// cudaMemcpy: after the device's queued work, complete on return.
+void memcpy_sync(void* dst, const void* src, size_t bytes) {
+    strata::ze::device_sync();
+    strata::ze::copy_sync(dst, src, bytes);
 }
 
 }  // namespace
@@ -54,61 +55,21 @@ int main(int argc, char** argv) {
     uint8_t* d_act = nullptr;
     uint8_t* d_codes = nullptr;
     float *d_scales = nullptr, *d_y_fp16 = nullptr, *d_y_q8 = nullptr;
-    check(DPCT_CHECK_ERROR(d_x = sycl::malloc_device<float>(
-                               (size_t)n_in, dpct::get_in_order_queue())),
-          "m x");
-    check(DPCT_CHECK_ERROR(
-              d_act = (uint8_t *)sycl::malloc_device(
-                  (size_t)(n_in / 32) * 34, dpct::get_in_order_queue())),
-          "m act");
-    check(DPCT_CHECK_ERROR(d_codes = (uint8_t *)sycl::malloc_device(
-                               codes.size(), dpct::get_in_order_queue())),
-          "m codes");
-    check(DPCT_CHECK_ERROR(d_scales = sycl::malloc_device<float>(
-                               scales.size(), dpct::get_in_order_queue())),
-          "m scales");
-    check(DPCT_CHECK_ERROR(d_y_fp16 = sycl::malloc_device<float>(
-                               (size_t)n_out, dpct::get_in_order_queue())),
-          "m y1");
-    check(DPCT_CHECK_ERROR(d_y_q8 = sycl::malloc_device<float>(
-                               (size_t)n_out, dpct::get_in_order_queue())),
-          "m y2");
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming
-    in the original code the source host memory is pageable memory. If the
-    memory is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-              d_x, x.data(), x.size() * sizeof(float)).wait()),
-          "c x");
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming
-    in the original code the source host memory is pageable memory. If the
-    memory is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-              d_codes, codes.data(), codes.size()).wait()),
-          "c codes");
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming
-    in the original code the source host memory is pageable memory. If the
-    memory is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-              d_scales, scales.data(), scales.size() * sizeof(float)).wait()),
-          "c scales");
+    d_x = (float*) strata::ze::malloc_device((size_t)n_in * sizeof(float));
+    d_act = (uint8_t*) strata::ze::malloc_device((size_t)(n_in / 32) * 34);
+    d_codes = (uint8_t*) strata::ze::malloc_device(codes.size());
+    d_scales = (float*) strata::ze::malloc_device(scales.size() * sizeof(float));
+    d_y_fp16 = (float*) strata::ze::malloc_device((size_t)n_out * sizeof(float));
+    d_y_q8 = (float*) strata::ze::malloc_device((size_t)n_out * sizeof(float));
+    memcpy_sync(d_x, x.data(), x.size() * sizeof(float));
+    memcpy_sync(d_codes, codes.data(), codes.size());
+    memcpy_sync(d_scales, scales.data(), scales.size() * sizeof(float));
 
     strata::kernels::quantize_q8_0(d_x, d_act, n_in, nullptr);
 
     // ---- host reference: quantize the activation with the project's own rule, then dot
     std::vector<uint8_t> h_act((size_t) (n_in / 32) * 34);
-    check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                               .memcpy(h_act.data(), d_act, h_act.size())
-                               .wait()),
-          "c act back");
+    memcpy_sync(h_act.data(), d_act, h_act.size());
     auto act_val = [&](long long i) {
         const uint8_t* blk = &h_act[(size_t) (i / 32) * 34];
         const uint16_t dbits = (uint16_t) (blk[0] | (blk[1] << 8));
@@ -138,11 +99,7 @@ int main(int argc, char** argv) {
     }
     strata::kernels::s2_gemv_q8(d_act, d_codes, d_scales, d_y_q8, n_in, n_out, tpr, nullptr);
     std::vector<float> got((size_t) n_out);
-    check(DPCT_CHECK_ERROR(
-              (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                  .memcpy(got.data(), d_y_q8, got.size() * sizeof(float))
-                  .wait()),
-          "c y2");
+    memcpy_sync(got.data(), d_y_q8, got.size() * sizeof(float));
 
     int bad = 0;
     double worst = 0.0, sum_abs = 0.0;
@@ -194,26 +151,12 @@ int main(int argc, char** argv) {
     std::vector<uint16_t> hx((size_t) n_in);
     for (long long i = 0; i < n_in; ++i) hx[(size_t) i] = f32_to_f16(x[(size_t) i]);
     uint16_t* d_hx = nullptr;
-    check(DPCT_CHECK_ERROR(d_hx = sycl::malloc_device<uint16_t>(
-                               hx.size(), dpct::get_in_order_queue())),
-          "m hx");
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming
-    in the original code the source host memory is pageable memory. If the
-    memory is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-              d_hx, hx.data(), hx.size() * sizeof(uint16_t)).wait()),
-          "c hx");
+    d_hx = (uint16_t*) strata::ze::malloc_device(hx.size() * sizeof(uint16_t));
+    memcpy_sync(d_hx, hx.data(), hx.size() * sizeof(uint16_t));
     strata::kernels::SForm form{2, -1, 64, strata::kernels::Codebook::Affine, false};
     strata::kernels::s_gemv_split(d_hx, d_codes, d_scales, nullptr, d_y_fp16, n_in, n_out, form, tpr);
     std::vector<float> y16((size_t) n_out);
-    check(DPCT_CHECK_ERROR(
-              (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                  .memcpy(y16.data(), d_y_fp16, y16.size() * sizeof(float))
-                  .wait()),
-          "c y1");
+    memcpy_sync(y16.data(), d_y_fp16, y16.size() * sizeof(float));
 
     double diff = 0.0;
     for (long long o = 0; o < n_out; ++o) {

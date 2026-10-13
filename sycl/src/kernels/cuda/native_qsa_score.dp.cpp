@@ -18,19 +18,13 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
-#include "strata/sycl_queue.hpp"
+#include "strata/port.hpp"
 #include "strata/kernels/native_qsa_score.hpp"
-#include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <stdexcept>
 
 namespace strata::kernels {
 namespace {
-std::atomic<bool> enabled{false};
 constexpr int D=128, HEADS=4, R=4, ROWS=32, WARPS=2, STRIDE=36, COMBINE=68;
 struct TileA { uint32_t x[4]; };
 struct TileB { uint32_t x[2]; };
@@ -64,9 +58,6 @@ __dpct_inline__ void load_b(TileB &b, const float *p) {
 }
 __dpct_inline__ void mma(TileC &c, const TileA &a, const TileB &b) {
     // Deliberately no cvt.rn.tf32: pinned mma.cuh passes raw F32 bits directly.
-    /*
-    DPCT1053: Migration of device assembly code is not supported.
-    */
     asm("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%0,%1,%2,%3}, "
         "{%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
         : "+f"(c.x[0]), "+f"(c.x[1]), "+f"(c.x[2]), "+f"(c.x[3])
@@ -74,12 +65,6 @@ __dpct_inline__ void mma(TileC &c, const TileA &a, const TileB &b) {
           "r"(b.x[1]));
 }
 #endif
-/*
-DPCT1110: The total declared local variable size in device function
-score_kernel exceeds 128 bytes and may cause high register pressure. Consult
-with your hardware vendor to find the total register size available and adjust
-the code, or use smaller sub-group size to avoid high register pressure.
-*/
 __dpct_inline__ void score_kernel(const float *__restrict__ pooled,
                                   const float *__restrict__ query,
                                   const float *__restrict__ bias,
@@ -143,11 +128,6 @@ __dpct_inline__ void score_kernel(const float *__restrict__ pooled,
             for(int ia=0;ia<2;++ia)mma(c[ia],a[ia][k],b);
         }
     }
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
 #pragma unroll
     for(int ia=0;ia<2;++ia){
@@ -158,11 +138,6 @@ __dpct_inline__ void score_kernel(const float *__restrict__ pooled,
             shared[h*COMBINE+i]=c[ia].x[l];
         }
     }
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
     // In the reference: +0 then warp0 partial then warp1 partial, followed
     // by materialized ReLU, CONT(head0), ADD(head1), ADD(head2), ADD(head3).
@@ -172,50 +147,14 @@ __dpct_inline__ void score_kernel(const float *__restrict__ pooled,
         float h[HEADS];
 #pragma unroll
         for(int j=0;j<HEADS;++j){
-            /*
-            DPCT1013: The rounding mode could not be specified and the
-            generated code may have different accuracy than the original code.
-            Verify the correctness. SYCL math built-in function rounding mode is
-            aligned with OpenCL C 1.2 standard.
-            */
             float v = 0.0f + shared[j * COMBINE + lane];
-            /*
-            DPCT1013: The rounding mode could not be specified and the
-            generated code may have different accuracy than the original code.
-            Verify the correctness. SYCL math built-in function rounding mode is
-            aligned with OpenCL C 1.2 standard.
-            */
             v = v + shared[j * COMBINE + ROWS + lane];
             h[j] = sycl::fmax(v, 0.0f);
         }
-        /*
-        DPCT1013: The rounding mode could not be specified and the
-        generated code may have different accuracy than the original code.
-        Verify the correctness. SYCL math built-in function rounding mode is
-        aligned with OpenCL C 1.2 standard.
-        */
         float sum = h[0] + h[1] + h[2] + h[3];
-        /*
-        DPCT1013: The rounding mode could not be specified and the
-        generated code may have different accuracy than the original code.
-        Verify the correctness. SYCL math built-in function rounding mode is
-        aligned with OpenCL C 1.2 standard.
-        */
         if (bias) sum = sum + bias[row];
-        /*
-        DPCT1013: The rounding mode could not be specified and the
-        generated code may have different accuracy than the original code.
-        Verify the correctness. SYCL math built-in function rounding mode is
-        aligned with OpenCL C 1.2 standard.
-        */
         sum = sum + (row == full && n % R ? 1e9f : 0.0f);
         // The live causal mask is +0. Invalid/padded cells are never exported.
-        /*
-        DPCT1013: The rounding mode could not be specified and the
-        generated code may have different accuracy than the original code.
-        Verify the correctness. SYCL math built-in function rounding mode is
-        aligned with OpenCL C 1.2 standard.
-        */
         sum = sum + 0.0f;
 #pragma unroll
         for (int i = row * R; i < n && i < (row + 1) * R; ++i) cells[i] = sum;
@@ -258,72 +197,8 @@ __global__ void scalar_score_kernel(
     }
 }
 #endif
-struct Span{const void* p;size_t n;};
-void validate(Span s){
-    const auto p=reinterpret_cast<uintptr_t>(s.p);
-    if(!p||p%4||s.n>UINTPTR_MAX-p)throw std::invalid_argument("native QSA score requires aligned bounded spans");
-}
-bool overlaps(Span a,Span b){
-    const auto x=reinterpret_cast<uintptr_t>(a.p),y=reinterpret_cast<uintptr_t>(b.p);
-    return x<y+b.n&&y<x+a.n;
-}
 } // namespace
-void native_qsa_score_set_enabled(bool value){enabled.store(value,std::memory_order_relaxed);}
-bool native_qsa_score_enabled(){return enabled.load(std::memory_order_relaxed);}
-void native_qsa_score(const float* pooled,const float* query,const float* bias,
-                      const QsaShapes& s,const int32_t* step,int64_t max_blocks,int64_t max_cells,
-                      float* cells,void* stream){
-    if(!stream||s.idx_dim!=D||s.idx_n_head!=HEADS||s.idx_block!=R||s.idx_top_k!=2048||
-       max_cells<1||max_cells>INT32_MAX-3||max_blocks!=max_cells/R+1)
-        throw std::invalid_argument("native QSA score requires128dim/4heads/4cells/2048budget, exact capacities and explicit stream");
-    const Span spans[]={{pooled,size_t(max_blocks)*D*4},{query,HEADS*D*4},
-        {step,kStepCount*4},{cells,size_t(max_cells)*4},{bias,bias?size_t(max_blocks)*4:0}};
-    const int count=bias?5:4;
-    for(int i=0;i<count;++i)validate(spans[i]);
-    for(int i=0;i<count;++i)for(int j=i+1;j<count;++j)
-        if(overlaps(spans[i],spans[j]))throw std::invalid_argument("native QSA score spans overlap");
-#if defined(__HIPCC__)
-    scalar_score_kernel<<<unsigned(max_blocks),128,0,static_cast<cudaStream_t>(stream)>>>(
-        pooled,query,bias,step,int(max_cells),cells);
-#else
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
 
-        ((sycl::queue *)(strata::q_of(stream)))
-            ->parallel_for<dpct_kernel_name<class score_kernel_59cd1b>>(
-                sycl::nd_range<3>(
-                    sycl::range(1, 1,
-                                unsigned((max_blocks + ROWS - 1) / ROWS)) *
-                        sycl::range(1, WARPS, 32),
-                    sycl::range(1, WARPS, 32)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        score_kernel(pooled, query, bias, step, int(max_cells),
-                                     cells);
-                    });
-    }
-#endif
-    /*
-    DPCT1010: SYCL uses exceptions to report errors and does not use the
-    error codes. The cudaGetLastError function call was replaced with 0. You
-    need to rewrite this code.
-    */
-    const auto error = 0;
-    /*
-    DPCT1009: SYCL reports errors using exceptions and does not use error
-    codes. Please replace the "get_error_string_dummy(...)" with a real
-    error-handling function.
-    */
-    /*
-    DPCT1001: The statement could not be removed.
-    */
-    /*
-    DPCT1000: Error handling if-stmt was detected but could not be
-    rewritten.
-    */
-    if (error !=
-        0) throw std::runtime_error(dpct::get_error_string_dummy(error));
-}
+#include "native_qsa_score.kern.inc"
+
 } // namespace strata::kernels

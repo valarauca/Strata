@@ -3,13 +3,8 @@
 // Naive per the phase rule: dequantize on the fly, FP32 accumulation inside the row, no shared memory, no
 // vector loads, no __ldg hints.  Phase 3 changes this file; the parity test is what says whether a change is
 // still right.
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
+#include "strata/port.hpp"
 #include "strata/kernels/s2_gemv.hpp"
-
-#include <cstdio>
-#include <cstdlib>
 
 namespace strata::kernels {
 namespace {
@@ -51,35 +46,6 @@ __dpct_inline__ void s2_gemv_kernel(const uint16_t *__restrict__ x,
 
 }  // namespace
 
-void s2_gemv(const uint16_t *x, const uint8_t *codes, const float *scales,
-             float *y, int64_t n_in, int64_t n_out) try {
-    if (n_in <= 0 || n_out <= 0) return;
-    if (n_in % QK != 0) {
-        std::fprintf(stderr, "s2_gemv: n_in %lld is not a multiple of %d\n", (long long) n_in, QK);
-        std::exit(1);
-    }
-    const int threads = 128;
-    const long long blocks = (n_out + threads - 1) / threads;
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        dpct::get_in_order_queue()
-            .parallel_for<dpct_kernel_name<class s2_gemv_kernel_163eb8>>(
-                sycl::nd_range<3>(sycl::range(1, 1, (unsigned)blocks) *
-                                      sycl::range(1, 1, threads),
-                                  sycl::range(1, 1, threads)),
-                exp_props, [=](sycl::nd_item<3> item_ct1) {
-                    s2_gemv_kernel(x, codes, scales, y, n_in, n_out);
-                });
-    }
-    const dpct::err0 e =
-        DPCT_CHECK_ERROR(dpct::get_current_device().queues_wait_and_throw());
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
+#include "s2_gemv.kern.inc"
 
 }  // namespace strata::kernels

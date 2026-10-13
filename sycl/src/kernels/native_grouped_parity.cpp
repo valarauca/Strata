@@ -12,9 +12,7 @@
 //
 // Random bytes are valid codes for every format here (every grid index is in range); only the fp16 block scales are
 // set, small enough that the SwiGLU outputs keep a finite fp16 q8_1 scale.
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
+#include "strata/ze/ze.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 
 #include <algorithm>
@@ -33,18 +31,24 @@ namespace {
 
 int g_fail = 0;
 
-void ck(dpct::err0 e, const char *what) {
+/// cudaMemcpy: after the device's queued work, complete on return.
+void memcpy_sync(void* dst, const void* src, size_t bytes) {
+    strata::ze::device_sync();
+    strata::ze::copy_sync(dst, src, bytes);
+}
+
+/// cudaMemset: after the device's queued work, complete on return.
+void memset_sync(void* dst, int value, size_t bytes) {
+    strata::ze::device_sync();
+    strata::ze::default_stream().memset(dst, value, bytes);
+    strata::ze::default_stream().sync();
 }
 
 template<typename T>
 T* dalloc(size_t n) {
     T* p = nullptr;
-    ck(DPCT_CHECK_ERROR(p = (T *)sycl::malloc_device(
-                            n * sizeof(T) + 256, dpct::get_in_order_queue())),
-       "malloc");
-    ck(DPCT_CHECK_ERROR(
-           (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memset(p, 0, n * sizeof(T) + 256).wait()),
-       "memset");
+    p = (T*) strata::ze::malloc_device(n * sizeof(T) + 256);
+    memset_sync(p, 0, n * sizeof(T) + 256);
     return p;
 }
 
@@ -111,7 +115,7 @@ struct Setup {
     int32_t *start = nullptr, *n = nullptr, *dst = nullptr, *tok = nullptr;
 
     Setup(int gu, int dt, int64_t H, int64_t FF, int tokens, int k_per_token,
-          int blobs_n, std::mt19937 &rng, dpct::queue_ptr s) {
+          int blobs_n, std::mt19937 &rng, strata::ze::Stream* s) {
         L = k::native_expert_layout(gu, dt, H, FF);
         T = tokens; K = k_per_token; cap = T * K; n_blobs = blobs_n;
         slot = (L.bytes + 255) & ~(size_t) 255;
@@ -122,33 +126,17 @@ struct Setup {
             const auto down = random_rows(dt, H, FF, rng);
             blob.insert(blob.end(), down.begin(), down.end());
             if (blob.size() != L.bytes) { std::fprintf(stderr, "blob %zu != %zu bytes\n", blob.size(), L.bytes); std::exit(2); }
-            /*
-            DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-            assuming in the original code the source host memory is pageable
-            memory. If the memory is not pageable, call wait() on event return
-            by memcpy API to ensure synchronization behavior.
-            */
-            ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-                   blobs + slot * (size_t)b, blob.data(), blob.size()).wait()),
-               "blob");
+            memcpy_sync(blobs + slot * (size_t)b, blob.data(), blob.size());
         }
         std::normal_distribution<float> nd(0.f, 1.f);
         std::vector<float> x((size_t) T * H);
         for (auto& v : x) v = nd(rng);
         float* dx = dalloc<float>(x.size());
-        /*
-        DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-        assuming in the original code the source host memory is pageable memory.
-        If the memory is not pageable, call wait() on event return by memcpy API
-        to ensure synchronization behavior.
-        */
-        ck(DPCT_CHECK_ERROR(
-               (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(dx, x.data(), x.size() * 4).wait()),
-           "x");
+        memcpy_sync(dx, x.data(), x.size() * 4);
         xq = dalloc<uint8_t>((size_t) T * (H / 32) * 36);
         k::quantize_q8_1_rows(dx, T, H, xq, s);
-        ck(DPCT_CHECK_ERROR(s->wait()), "quantize");
-        sycl::free(dx, dpct::get_in_order_queue());
+        s->sync();
+        strata::ze::free(dx);
         scr_bytes = k::native_expert_scratch_bytes(cap, FF);
         scr = dalloc<uint8_t>(scr_bytes);
         out_floats = (size_t) cap * H;
@@ -160,15 +148,15 @@ struct Setup {
         tok = dalloc<int32_t>(cap);
     }
     ~Setup() {
-        sycl::free(blobs, dpct::get_in_order_queue());
-            sycl::free(xq, dpct::get_in_order_queue());
-            sycl::free(scr, dpct::get_in_order_queue());
-            sycl::free(out, dpct::get_in_order_queue());
-        sycl::free(ptr, dpct::get_in_order_queue());
-            sycl::free(start, dpct::get_in_order_queue());
-            sycl::free(n, dpct::get_in_order_queue());
-            sycl::free(dst, dpct::get_in_order_queue());
-            sycl::free(tok, dpct::get_in_order_queue());
+        strata::ze::free(blobs);
+        strata::ze::free(xq);
+        strata::ze::free(scr);
+        strata::ze::free(out);
+        strata::ze::free(ptr);
+        strata::ze::free(start);
+        strata::ze::free(n);
+        strata::ze::free(dst);
+        strata::ze::free(tok);
     }
     // a plan: `groups` groups of 1..T entries from entry `base` on (as many as fit in cap)
     int plan(int groups, int base, std::mt19937& rng) {
@@ -201,74 +189,32 @@ struct Setup {
         std::iota(ds.begin(), ds.end(), 0);
         std::shuffle(ds.begin(), ds.end(), rng);                  // scattered rows of `out`
         for (int e = 0; e < cap; ++e) tk_v.push_back(tk(rng));
-        /*
-        DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-        assuming in the original code the source host memory is pageable memory.
-        If the memory is not pageable, call wait() on event return by memcpy API
-        to ensure synchronization behavior.
-        */
-        if (ng) ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-                       ptr, p.data(), p.size() * 8).wait()),
-                   "ptr");
-        /*
-        DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-        assuming in the original code the source host memory is pageable memory.
-        If the memory is not pageable, call wait() on event return by memcpy API
-        to ensure synchronization behavior.
-        */
-        ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(start, st.data(),
-                                                              st.size() * 4).wait()),
-           "start");
-        ck(DPCT_CHECK_ERROR(
-               (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(n, &ng, 4).wait()),
-           "n");
-        /*
-        DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-        assuming in the original code the source host memory is pageable memory.
-        If the memory is not pageable, call wait() on event return by memcpy API
-        to ensure synchronization behavior.
-        */
-        ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(dst, ds.data(),
-                                                              ds.size() * 4).wait()),
-           "dst");
-        /*
-        DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-        assuming in the original code the source host memory is pageable memory.
-        If the memory is not pageable, call wait() on event return by memcpy API
-        to ensure synchronization behavior.
-        */
-        ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(tok, tk_v.data(),
-                                                              tk_v.size() * 4).wait()),
-           "tok");
+        if (ng) memcpy_sync(ptr, p.data(), p.size() * 8);
+        memcpy_sync(start, st.data(), st.size() * 4);
+        memcpy_sync(n, &ng, 4);
+        memcpy_sync(dst, ds.data(), ds.size() * 4);
+        memcpy_sync(tok, tk_v.data(), tk_v.size() * 4);
         return ng;
     }
-    void call(int64_t grid_groups, dpct::queue_ptr s) {
+    void call(int64_t grid_groups, strata::ze::Stream* s) {
         k::native_expert_grouped(L, ptr, start, n, dst, tok, cap, cap, xq, scr, out, s, grid_groups);
     }
     // `out` after one call from the NaN pattern, the scratch holding `junk` (what earlier calls left there)
     std::vector<uint32_t> result(bool v1, int64_t grid_groups, int junk,
-                                 dpct::queue_ptr s) {
-        ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                .memset(out, 0xFF, out_floats * 4)
-                                .wait()),
-           "memset");
-        ck(DPCT_CHECK_ERROR(
-               (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memset(scr, junk, scr_bytes).wait()),
-           "memset");
+                                 strata::ze::Stream* s) {
+        memset_sync(out, 0xFF, out_floats * 4);
+        memset_sync(scr, junk, scr_bytes);
         k::native_grouped_set_v1(v1);
         call(grid_groups, s);
         k::native_grouped_set_v1(false);
-        ck(DPCT_CHECK_ERROR(s->wait()), "sync");
+        s->sync();
         std::vector<uint32_t> o(out_floats);
-        ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                .memcpy(o.data(), out, o.size() * 4)
-                                .wait()),
-           "out");
+        memcpy_sync(o.data(), out, o.size() * 4);
         return o;
     }
 };
 
-void check(int gu, int dt, int64_t H, int64_t FF, dpct::queue_ptr s,
+void check(int gu, int dt, int64_t H, int64_t FF, strata::ze::Stream* s,
            std::mt19937 &rng) {
     Setup S(gu, dt, H, FF, 6, 4, 9, rng, s);   // 6 tokens x 4 experts: cap 24 entries
     int calls = 0, bad = 0;
@@ -313,23 +259,11 @@ struct Layers {
             std::vector<unsigned long long> p;
             for (int j = 0; j < per; ++j) {
                 uint8_t* d = arena + S.slot * (size_t) (l * per + j);
-                ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-                       d,
-                       S.blobs + S.slot * (size_t)((l * per + j) % S.n_blobs),
-                       S.L.bytes).wait()),
-                   "blob copy");
+                memcpy_sync(d, S.blobs + S.slot * (size_t)((l * per + j) % S.n_blobs), S.L.bytes);
                 p.push_back((unsigned long long) d);
             }
             unsigned long long* dp = dalloc<unsigned long long>(p.size());
-            /*
-            DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-            assuming in the original code the source host memory is pageable
-            memory. If the memory is not pageable, call wait() on event return
-            by memcpy API to ensure synchronization behavior.
-            */
-            ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-                   dp, p.data(), p.size() * 8).wait()),
-               "ptr");
+            memcpy_sync(dp, p.data(), p.size() * 8);
             ptr.push_back(dp);
         }
     }
@@ -337,57 +271,30 @@ struct Layers {
     Layers& operator=(const Layers&) = delete;
     ~Layers() {
         for (auto *p : ptr)
-            DPCT_CHECK_ERROR(sycl::free(p, dpct::get_in_order_queue()));
-        sycl::free(arena, dpct::get_in_order_queue());
+            strata::ze::free(p);
+        strata::ze::free(arena);
     }
 };
 
 // the 48 calls of one variant captured in one graph
-dpct::experimental::command_graph_exec_ptr
-make_graph(dpct::queue_ptr s, Setup &S, const Layers &Ls, bool v1, int64_t gy) {
+strata::ze::Graph* make_graph(strata::ze::Stream* s, Setup& S, const Layers& Ls, bool v1, int64_t gy) {
     k::native_grouped_set_v1(v1);
-    dpct::experimental::command_graph_ptr g;
-    dpct::experimental::command_graph_exec_ptr ge;
-    ck(DPCT_CHECK_ERROR(dpct::experimental::begin_recording(s)), "capture");
+    s->begin_capture();
     for (int l = 0; l < 48; ++l)
         k::native_expert_grouped(S.L, Ls.ptr[l], S.start, S.n, S.dst, S.tok, S.cap, S.cap, S.xq, S.scr, S.out, s, gy);
-    ck(DPCT_CHECK_ERROR(dpct::experimental::end_recording(s, &g)), "capture");
-    ck(DPCT_CHECK_ERROR(
-           ge = new sycl::ext::oneapi::experimental::command_graph<
-               sycl::ext::oneapi::experimental::graph_state::executable>(
-               g->finalize())),
-       "instantiate");
-    ck(DPCT_CHECK_ERROR(delete (g)), "graph");
+    strata::ze::Graph* ge = s->end_capture();
     k::native_grouped_set_v1(false);
     return ge;
 }
 
 // one launch of the graph: microseconds per call
-float launch_us(dpct::queue_ptr s,
-                dpct::experimental::command_graph_exec_ptr ge,
-                dpct::event_ptr e0, dpct::event_ptr e1) {
-    /*
-    DPCT1024: The original code returned the error code that was further
-    consumed by the program logic. This original code was replaced with 0. You
-    may need to rewrite the program logic consuming the error code.
-    */
-    ck(DPCT_CHECK_ERROR(dpct::sync_barrier(e0, s)), "record");
-    ck(DPCT_CHECK_ERROR(s->ext_oneapi_graph(*ge)), "launch");
-    /*
-    DPCT1024: The original code returned the error code that was further
-    consumed by the program logic. This original code was replaced with 0. You
-    may need to rewrite the program logic consuming the error code.
-    */
-    ck(DPCT_CHECK_ERROR(dpct::sync_barrier(e1, s)), "record");
-    ck(DPCT_CHECK_ERROR(e1->wait_and_throw()), "bench");
+float launch_us(strata::ze::Stream* s, strata::ze::Graph* ge, strata::ze::Event* e0, strata::ze::Event* e1) {
+    s->record(*e0);
+    s->launch(*ge);
+    s->record(*e1);
+    e1->sync();
     float ms = 0;
-    ck(DPCT_CHECK_ERROR(
-           ms = (e1->get_profiling_info<
-                     sycl::info::event_profiling::command_end>() -
-                 e0->get_profiling_info<
-                     sycl::info::event_profiling::command_start>()) /
-                1000000.0f),
-       "elapsed");
+    ms = e1->elapsed_ms_since(*e0);
     return 1e3f * ms / 48.0f;
 }
 
@@ -401,7 +308,7 @@ float median(std::vector<float> v) {
 // per gate/up call within one run), and whichever variant ran before the step would look faster.
 constexpr int kWarmPairs = 20, kPairs = 40;
 
-void bench(dpct::queue_ptr s, std::mt19937 &rng) {
+void bench(strata::ze::Stream* s, std::mt19937 &rng) {
     std::printf("\n--bench: microseconds per call, a window's 48 calls in a graph, each layer with its own experts (the\n"
                 "weights stream from DRAM as in the engine); v1 / new (grid_groups): medians of %d launches each,\n"
                 "alternating, after %d warm-up pairs - idle GPU assumed\n", kPairs, kWarmPairs);
@@ -414,16 +321,12 @@ void bench(dpct::queue_ptr s, std::mt19937 &rng) {
         {"1 group of 2 entries (a PCIe call)", {2}, 4},
         {"28 groups, 40 entries (a VRAM call)", vram, 0},
     };
-    dpct::event_ptr e0, e1;
-    ck(DPCT_CHECK_ERROR(e0 = new sycl::event()), "event");
-    ck(DPCT_CHECK_ERROR(e1 = new sycl::event()), "event");
+    strata::ze::Event* e0 = new strata::ze::Event(true);
+    strata::ze::Event* e1 = new strata::ze::Event(true);
     for (const auto& r : rows) {
         const int ng = S.plan_sizes(r.sizes, 0, rng);
         const Layers Ls(S, ng);                                       // 48 x 28 experts: 3.7 GB for the VRAM call
-        dpct::experimental::command_graph_exec_ptr ga = make_graph(s, S, Ls,
-                                                                   true, 0),
-                                                   gb = make_graph(s, S, Ls,
-                                                                   false, r.gy);
+        strata::ze::Graph* ga = make_graph(s, S, Ls, true, 0), *gb = make_graph(s, S, Ls, false, r.gy);
         std::vector<float> ta, tb;
         for (int i = 0; i < kWarmPairs + kPairs; ++i) {
             const bool a_first = i % 2 == 0;
@@ -432,21 +335,19 @@ void bench(dpct::queue_ptr s, std::mt19937 &rng) {
             ta.push_back(a_first ? x : y);
             tb.push_back(a_first ? y : x);
         }
-        ck(DPCT_CHECK_ERROR(delete (ga)), "graph");
-        ck(DPCT_CHECK_ERROR(delete (gb)), "graph");
+        delete ga;
+        delete gb;
         std::printf("  %-42s %8.2f / %8.2f us (grid_groups %lld)\n", r.what, median(ta), median(tb), (long long) r.gy);
     }
-    dpct::destroy_event(e0);
-    dpct::destroy_event(e1);
+    delete e0;
+    delete e1;
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
     const bool do_bench = argc > 1 && std::string(argv[1]) == "--bench";
-    dpct::queue_ptr s;
-    ck(DPCT_CHECK_ERROR(s = dpct::get_current_device().create_queue(true)),
-       "stream");
+    strata::ze::Stream* s = new strata::ze::Stream();
     std::mt19937 rng(316);
     for (int gu : {16, 17, 18, 21, 22, 23, 29, 42, 12, 13,
 #ifdef STRATA_Q6K_EXPERTS
@@ -458,6 +359,6 @@ int main(int argc, char** argv) {
     check(21, 23, 2560, 768, s, rng);
     if (do_bench) bench(s, rng);
     std::printf("native_grouped_parity: %d failures\n", g_fail);
-    dpct::get_current_device().destroy_queue(s);
+    delete s;
     return g_fail ? 1 : 0;
 }

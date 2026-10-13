@@ -28,9 +28,7 @@
 // reported as that coincidence rather than skipped.  The control needs a row long enough for the two layouts to
 // group blocks differently: IQ4_XS takes 16 blocks per iteration with 4 warps and 8 with 2, so at n_in = 2048 (8
 // blocks of 256) each thread holds at most one block in both layouts and they coincide; its case uses n_in = 4096.
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
+#include "strata/ze/ze.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 
@@ -76,21 +74,22 @@ uint16_t sane_half(std::mt19937& rng) {
 const int WIDTHS[] = {1, 2, 3, 4, 5, 6, 8};
 constexpr int COINCIDE_MAX_T = 4;
 
-bool ck(dpct::err0 e, const char *what) {
-    if (e == 0) return true;
-    /*
-    DPCT1009: SYCL reports errors using exceptions and does not use error
-    codes. Please replace the "get_error_string_dummy(...)" with a real
-    error-handling function.
-    */
-    std::printf("CUDA: %s: %s\n", what, dpct::get_error_string_dummy(e));
+bool ck(bool ok, const char* what) {
+    if (ok) return true;
+    std::printf("%s: out of device memory\n", what);
     return false;
+}
+
+/// cudaMemcpy: after the device's queued work, complete on return.
+void memcpy_sync(void* dst, const void* src, size_t bytes) {
+    strata::ze::device_sync();
+    strata::ze::copy_sync(dst, src, bytes);
 }
 
 // Returns the number of outputs that differ bit for bit; counts the non-finite outputs and the differences on
 // outputs that are finite in both paths.
-long long compare(const Case &c, int T, dpct::queue_ptr s, long long &nonfinite,
-                  long long &diff_finite, bool &ran) try {
+long long compare(const Case &c, int T, strata::ze::Stream* s, long long &nonfinite,
+                  long long &diff_finite, bool &ran) {
     ran = false;
     if (!strata::kernels::native_mmvq_supported(c.type)) return -1;
 
@@ -128,45 +127,18 @@ long long compare(const Case &c, int T, dpct::queue_ptr s, long long &nonfinite,
     float* dmulti = nullptr;
     float* dsingle = nullptr;
     const std::size_t ybytes = (std::size_t) T * c.n_out * 4;
-    if (!ck(DPCT_CHECK_ERROR(dw = (void *)sycl::malloc_device(
-                                 wbytes, dpct::get_in_order_queue())),
-            "malloc w") ||
-        !ck(DPCT_CHECK_ERROR(xq = (void *)sycl::malloc_device(
-                                 qall, dpct::get_in_order_queue())),
-            "malloc xq") ||
-        !ck(DPCT_CHECK_ERROR(dx = (float *)sycl::malloc_device(
-                                 x.size() * 4, dpct::get_in_order_queue())),
-            "malloc x") ||
-        !ck(DPCT_CHECK_ERROR(dmulti = (float *)sycl::malloc_device(
-                                 ybytes, dpct::get_in_order_queue())),
-            "malloc multi") ||
-        !ck(DPCT_CHECK_ERROR(dsingle = (float *)sycl::malloc_device(
-                                 ybytes, dpct::get_in_order_queue())),
-            "malloc single"))
+    if (!ck((dw = strata::ze::malloc_device(wbytes)) != nullptr, "malloc w") ||
+        !ck((xq = strata::ze::malloc_device(qall)) != nullptr, "malloc xq") ||
+        !ck((dx = (float*) strata::ze::malloc_device(x.size() * 4)) != nullptr, "malloc x") ||
+        !ck((dmulti = (float*) strata::ze::malloc_device(ybytes)) != nullptr, "malloc multi") ||
+        !ck((dsingle = (float*) strata::ze::malloc_device(ybytes)) != nullptr, "malloc single"))
         return -1;
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming
-    in the original code the source host memory is pageable memory. If the
-    memory is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    if (!ck(DPCT_CHECK_ERROR(
-                (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(dw, w.data(), wbytes).wait()),
-            "copy w") ||
-        /*
-        DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-        assuming in the original code the source host memory is pageable memory.
-        If the memory is not pageable, call wait() on event return by memcpy API
-        to ensure synchronization behavior.
-        */
-        !ck(DPCT_CHECK_ERROR(
-                (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(dx, x.data(), x.size() * 4).wait()),
-            "copy x"))
-        return -1;
+    memcpy_sync(dw, w.data(), wbytes);
+    memcpy_sync(dx, x.data(), x.size() * 4);
 
     // ONE quantization, shared by both paths: the quantization is not under test
     strata::kernels::quantize_q8_1_rows(dx, T, c.n_in, xq, s);
-    if (!ck(DPCT_CHECK_ERROR(s->wait()), "quantize")) return -1;
+    s->sync();
 
     try {
         strata::kernels::native_mmvq(c.type, dw, xq, dmulti, c.n_in, c.n_out, T, s);
@@ -177,18 +149,11 @@ long long compare(const Case &c, int T, dpct::queue_ptr s, long long &nonfinite,
         std::printf("%-12s T=%d: %s\n", c.name, T, e.what());
         return -1;
     }
-    if (!ck(DPCT_CHECK_ERROR(s->wait()), "mmvq")) return -1;
+    s->sync();
 
     std::vector<uint32_t> a((std::size_t) T * c.n_out), b(a.size());
-    if (!ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                 .memcpy(a.data(), dmulti, ybytes)
-                                 .wait()),
-            "read multi") ||
-        !ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                 .memcpy(b.data(), dsingle, ybytes)
-                                 .wait()),
-            "read single"))
-        return -1;
+    memcpy_sync(a.data(), dmulti, ybytes);
+    memcpy_sync(b.data(), dsingle, ybytes);
 
     long long diff = 0;
     nonfinite = 0;
@@ -204,18 +169,13 @@ long long compare(const Case &c, int T, dpct::queue_ptr s, long long &nonfinite,
             if (both_finite) ++diff_finite;
         }
     }
-    sycl::free(dw, dpct::get_in_order_queue());
-        sycl::free(xq, dpct::get_in_order_queue());
-        sycl::free(dx, dpct::get_in_order_queue());
-        sycl::free(dmulti, dpct::get_in_order_queue());
-        sycl::free(dsingle, dpct::get_in_order_queue());
+    strata::ze::free(dw);
+    strata::ze::free(xq);
+    strata::ze::free(dx);
+    strata::ze::free(dmulti);
+    strata::ze::free(dsingle);
     ran = true;
     return diff;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
 }
 
 struct Totals {
@@ -224,7 +184,7 @@ struct Totals {
     int powerless_cases = 0;   // cases where the control found no difference at any T > COINCIDE_MAX_T
 };
 
-int sweep(bool exact, dpct::queue_ptr s, Totals &t) {
+int sweep(bool exact, strata::ze::Stream* s, Totals &t) {
     strata::kernels::native_mmvq_set_multi_exact(exact);
     if (strata::kernels::native_mmvq_multi_exact() != exact) {
         std::printf("native_mmvq_multi_exact() does not reflect what was set\n");
@@ -260,10 +220,8 @@ int sweep(bool exact, dpct::queue_ptr s, Totals &t) {
 
 }  // namespace
 
-int main() try {
-    dpct::queue_ptr s;
-    if (!ck(DPCT_CHECK_ERROR(s = dpct::get_current_device().create_queue(true)),
-            "stream create")) return 1;
+int main() {
+    strata::ze::Stream* s = new strata::ze::Stream();
 
     Totals on, off;
     const int bad = sweep(true, s, on);
@@ -311,9 +269,4 @@ int main() try {
                 "power.\n",
                 COINCIDE_MAX_T);
     return 0;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
 }

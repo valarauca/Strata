@@ -14,9 +14,7 @@
 // change between requests.
 #pragma once
 
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
+#include "strata/port.hpp"
 #include <cstdint>
 #if defined(__HIPCC__) && defined(STRATA_HIP_GFX906)   // PR #638: the gfx906 compat build only
 #include <hip/hip_runtime.h>
@@ -26,9 +24,10 @@
 
 namespace strata::kernels {
 
-/// The table of the CURRENT device (a layer split sets one per device; null = the identity).
+/// Sets the table of the CURRENT device (a layer split sets one per device; null = the identity).
 void mrope_table_set(const int32_t* device_table);
-const int32_t* mrope_table();
+/// The table of GPU `dev`, the GPU of the stream the launch goes to.
+const int32_t* mrope_table(int dev);
 
 /// #280, opt-in (STRATA_ROPE_TABLE=1): the rotation angles, 32 pairs of a 64-wide rotary slice, from the session's
 /// float64 table (build_rope_table, [max_pos][32] cos and sin in VRAM, the rope scaling inside) of the CURRENT
@@ -44,19 +43,14 @@ struct RopeTab {
 void rope_table_set(const float* cos_tab, const float* sin_tab, int max_pos, const RopeScaling& scaling);
 /// Forgets the table `cos_tab` (on every device) - before the memory that holds it is freed (session_release).
 void rope_table_release(const float* cos_tab);
-/// The registered table when STRATA_ROPE_TABLE=1 and it was built with `scaling`; otherwise none (the default: the
-/// kernels compute the angle exactly as before).
-RopeTab rope_table_for(const RopeScaling& scaling);
+/// GPU `dev`'s registered table (`dev`: the GPU of the stream the launch goes to) when STRATA_ROPE_TABLE=1 and it was
+/// built with `scaling`; otherwise none (the default: the kernels compute the angle exactly as before).
+RopeTab rope_table_for(const RopeScaling& scaling, int dev);
 
 #if defined(SYCL_LANGUAGE_VERSION) || defined(__HIPCC__)
 /// ggml rope_multi, is_imrope, sections {11, 11, 10, 0}: sector = pair % 32; sector % 3 == 1 -> h (sector < 33),
 /// == 2 -> w (sector < 30), == 0 -> t (sector < 33).  For pairs 0..31 all three bounds hold, so it is pair % 3.
 __dpct_inline__ int mrope_pos(const int32_t *tab, int pos, int pair) {
-    /*
-    DPCT1098: The '*' expression is used instead of the __ldg call. These
-    two expressions do not provide the exact same functionality. Check the
-    generated code for potential precision and/or performance issues.
-    */
     return tab ? *(tab + (size_t)pos * 3 + pair % 3) : pos;
 }
 /// cos and sin of rotary position p, pair `pair` (0..31) from the table (scaling and magnitude included); false
@@ -64,17 +58,7 @@ __dpct_inline__ int mrope_pos(const int32_t *tab, int pos, int pair) {
 __dpct_inline__ bool rope_tab_cs(const RopeTab &t, int p, int pair, float &c,
                                  float &s) {
     if (t.cos == nullptr || p < 0 || p >= t.max_pos) return false;
-    /*
-    DPCT1098: The '*' expression is used instead of the __ldg call. These
-    two expressions do not provide the exact same functionality. Check the
-    generated code for potential precision and/or performance issues.
-    */
     c = *(t.cos + (size_t)p * 32 + pair);
-    /*
-    DPCT1098: The '*' expression is used instead of the __ldg call. These
-    two expressions do not provide the exact same functionality. Check the
-    generated code for potential precision and/or performance issues.
-    */
     s = *(t.sin + (size_t)p * 32 + pair);
     return true;
 }

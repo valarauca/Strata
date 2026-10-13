@@ -1,7 +1,8 @@
-// include/strata/sycl_math.hpp - the SYCL port's device math that dpct emulates but the hardware has.
+// include/strata/sycl_math.hpp - device math the hardware has (DP4A) and the sampler's accumulator type.
 #pragma once
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
+#include "strata/port.hpp"
+
+#if defined(SYCL_LANGUAGE_VERSION)
 #include <cstdint>
 
 namespace strata {
@@ -13,6 +14,9 @@ inline int32_t dp4a(A a, B b, C c) {
     return dpct::dp4a((int32_t) a, (int32_t) b, (int32_t) c);
 }
 }  // namespace strata
+
+
+#endif  // SYCL_LANGUAGE_VERSION
 
 namespace strata {
 // The accumulator of the sampler's top_p / temperature tail (exp, sum, cumulative scan over the <= 64 kept logits).  FP64 is

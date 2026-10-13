@@ -21,29 +21,15 @@
 // `w_down[k][i]` with i contiguous - `ref/gr.py`'s (hc_lr, hc*n_embd) row-major.  `hc_attn_up.weight` is
 // [320, 10240] so it holds `w_up[i][k]` with k contiguous - `ref/gr.py`'s (hc*n_embd, hc_lr) row-major.  Both
 // index with no permutation at all.
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
-#include "strata/sycl_queue.hpp"
+#include "strata/port.hpp"
 #include "strata/kernels/gr.hpp"
 #include "strata/kernels/bf16_bits.hpp"
-#include "strata/kernels/bf16_gemv.hpp"
-#include "strata/kernels/native_gr_norm.hpp"
-#include "strata/kernels/native_gr_postops.hpp"
-
-#include <cmath>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <stdexcept>
 
 namespace strata::kernels {
 namespace {
 
 constexpr int THREADS = 256;
 constexpr int WARPS = THREADS / 32;
-bool fp32_activations = false;
-bool native_mmvf = false;
 
 /// The bf16 conversions live in `strata/kernels/bf16_bits.hpp`, and this file used to carry its own copies.
 /// Two files with a private copy of a conversion whose failure mode is silent wrong bits is one too many -
@@ -75,57 +61,21 @@ __dpct_inline__ float sigmoid_f(float x) {
 }
 
 __dpct_inline__ double warp_sum(double v) {
-    /*
-DPCT1108: '__shfl_down_sync' was migrated with the experimental feature
-masked sub_group function which may not be supported by all compilers or
-runtimes. You may need to adjust the code.
-*/
-    /*
-DPCT1121: Make sure that the "v" which is used in the SYCL group
-function/algorithm is initialized.
-*/
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) v +=
         dpct::experimental::shift_sub_group_left(
             0xFFFFFFFFu, sycl::ext::oneapi::this_work_item::get_sub_group(), v,
             off);
-    /*
-    DPCT1108: '__shfl_sync' was migrated with the experimental feature masked
-    sub_group function which may not be supported by all compilers or runtimes.
-    You may need to adjust the code.
-    */
-    /*
-    DPCT1121: Make sure that the "v" which is used in the SYCL group
-    function/algorithm is initialized.
-    */
     return dpct::experimental::select_from_sub_group(
         0xFFFFFFFFu, sycl::ext::oneapi::this_work_item::get_sub_group(), v, 0);
 }
 
 __dpct_inline__ float warp_sumf(float v) {
-    /*
-DPCT1108: '__shfl_down_sync' was migrated with the experimental feature
-masked sub_group function which may not be supported by all compilers or
-runtimes. You may need to adjust the code.
-*/
-    /*
-DPCT1121: Make sure that the "v" which is used in the SYCL group
-function/algorithm is initialized.
-*/
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) v +=
         dpct::experimental::shift_sub_group_left(
             0xFFFFFFFFu, sycl::ext::oneapi::this_work_item::get_sub_group(), v,
             off);
-    /*
-    DPCT1108: '__shfl_sync' was migrated with the experimental feature masked
-    sub_group function which may not be supported by all compilers or runtimes.
-    You may need to adjust the code.
-    */
-    /*
-    DPCT1121: Make sure that the "v" which is used in the SYCL group
-    function/algorithm is initialized.
-    */
     return dpct::experimental::select_from_sub_group(
         0xFFFFFFFFu, sycl::ext::oneapi::this_work_item::get_sub_group(), v, 0);
 }
@@ -142,32 +92,17 @@ inline float block_sumf(float v, double *scratch_raw) {
     // The leading barrier is not decoration - see the note on `block_sum` above: the result is read straight out
     // of `scratch[0]` by every thread and a later call reuses the array, so without it a fast thread can
     // overwrite `scratch[0]` before a slow one has read the previous result.
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
     const int lane = item_ct1.get_local_id(2) & 31,
               warp = item_ct1.get_local_id(2) >> 5;
     v = warp_sumf(v);
     if (lane == 0) scratch[warp] = v;
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
     const int nw = ((int)item_ct1.get_local_range(2) + 31) >> 5;
     v = (item_ct1.get_local_id(2) < nw) ? scratch[item_ct1.get_local_id(2)]
                                         : 0.0f;
     if (warp == 0) v = warp_sumf(v);
     if (item_ct1.get_local_id(2) == 0) scratch[0] = v;
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
     return scratch[0];
 }
@@ -182,33 +117,18 @@ inline float block_sumf(float v, double *scratch_raw) {
 /// thread, and a later call reuses the same array.  Without a barrier on entry a fast thread can overwrite
 /// `scratch[0]` before a slow one has read the previous result - a race that is invisible in most runs.
 double block_sum(double v, double* scratch) {
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     item_ct1.barrier();
     const int lane = item_ct1.get_local_id(2) & 31,
               warp = item_ct1.get_local_id(2) >> 5;
     v = warp_sum(v);
     if (lane == 0) scratch[warp] = v;
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
     const int nw = ((int)item_ct1.get_local_range(2) + 31) >> 5;
     v = (item_ct1.get_local_id(2) < nw) ? scratch[item_ct1.get_local_id(2)]
                                         : 0.0;
     if (warp == 0) v = warp_sum(v);
     if (item_ct1.get_local_id(2) == 0) scratch[0] = v;
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
     item_ct1.barrier();
     return scratch[0];
 }
@@ -423,388 +343,6 @@ __dpct_inline__ void gr_write_kernel(const float *__restrict__ R,
 
 }  // namespace
 
-void gr_set_fp32_activations(bool enabled) { fp32_activations = enabled; }
-void gr_set_native_mmvf(bool enabled) { native_mmvf = enabled; }
-
-size_t gr_workspace_init(const GrShapes& s, void* base, GrWorkspace& out) {
-    const size_t hc_dim = (size_t) s.hc * (size_t) s.n_embd;
-    // ONE table, indexed by the same `k` that assigns the pointers below.  The first version of this function
-    // sized three locals named `xn`, `xq`, `lq` in a DIFFERENT order from the pointer assignments - `xq` got
-    // hc_lr*2 while `lq` got hc_dim*4 - so for the real geometry xq was given 640 bytes where it needed
-    // 20,480 and every region overlapped its neighbour.
-    //
-    // What that looked like is worth recording: `inject` came out ~20% wrong, and rewriting its reduction
-    // from block-wide to warp-wide produced BYTE-IDENTICAL wrong answers.  Two different reductions agreeing
-    // exactly is not a coincidence to investigate - it means the reduction is not where the bug is, and the
-    // inputs are.  Chasing the reduction instead cost most of a round.
-    const size_t sz[5] = {
-        hc_dim * sizeof(float),                // 0: xn
-        hc_dim * sizeof(uint16_t),             // 1: xq
-        (size_t) s.hc_lr * sizeof(uint16_t),   // 2: lq
-        hc_dim * sizeof(float),                // 3: gated
-        (size_t) s.hc_lr * sizeof(float),        // 4: lo (FP32 activation experiment)
-    };
-    size_t al[5], bytes = 0;
-    for (int k = 0; k < 5; ++k) {
-        al[k] = (sz[k] + 15) & ~(size_t) 15;
-        bytes += al[k];
-    }
-    out.bytes = bytes;
-    if (base != nullptr) {
-        unsigned char* p = (unsigned char*) base;
-        void* ptr[5];
-        for (int k = 0; k < 5; ++k) {
-            ptr[k] = p;
-            p += al[k];
-        }
-        out.xn = (float*) ptr[0];
-        out.xq = (uint16_t*) ptr[1];
-        out.lq = (uint16_t*) ptr[2];
-        out.gated = (float*) ptr[3];
-        out.lo = (float*) ptr[4];
-    }
-    return bytes;
-}
-
-void gr_read(const float *R, const float *w_norm, const uint16_t *w_down,
-             const uint16_t *w_up, const uint16_t *w_inject, float eps,
-             const GrShapes &s, const GrWorkspace &ws, float *mixed,
-             float *inject, void *stream) try {
-    if (s.n_embd <= 0 || s.hc <= 0 || s.hc_lr <= 0) return;
-    if (ws.xn == nullptr || ws.xq == nullptr || ws.lq == nullptr || ws.gated == nullptr || ws.lo == nullptr) {
-        std::fprintf(stderr, "gr_read: GrWorkspace is not initialised (see gr_workspace_init)\n");
-        std::exit(1);
-    }
-    if (ws.bytes < gr_workspace_bytes(s)) {
-        std::fprintf(stderr, "gr_read: GrWorkspace is %zu bytes but this geometry needs %zu\n",
-                     ws.bytes, gr_workspace_bytes(s));
-        std::exit(1);
-    }
-    const int n_embd = (int) s.n_embd, hc = (int) s.hc, hc_lr = (int) s.hc_lr;
-    const int hc_dim = (int) (s.hc * s.n_embd);
-    dpct::queue_ptr st = strata::q_of(stream);
-
-    // One setting selects every projection in this call. Captured graphs retain these kernel variants.
-    const bool use_native = native_mmvf;
-    const bool use_fp32 = fp32_activations || use_native;
-    if (use_native) {
-        if ((hc_dim & 1) != 0 || (hc_lr & 1) != 0)
-            throw std::invalid_argument("gr_read native MMVF requires even hc*n_embd and hc_lr");
-        native_gr_rms_norm_weighted(R, w_norm, ws.xn, n_embd, hc, eps, stream);
-        bf16_gemv_fp32_mmvf(ws.xn, w_down, ws.lo, hc_dim, hc_lr, stream);
-        native_gr_down_silu(ws.lo, hc_lr, hc, stream);
-        bf16_gemv_fp32_mmvf(ws.lo, w_up, ws.gated, hc_lr, hc_dim, stream);
-        // The existing null-injection contract identifies the final mixer.
-        // Pinned qwen4exp uses fused HC pre for layers and the unfused graph for il=-1.
-        native_gr_pre_gated(ws.xn, ws.gated, mixed, n_embd, hc, w_inject != nullptr, stream);
-    } else if (use_fp32) {
-        {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
-            dpct::has_capability_or_fail(st->get_device(),
-                                         {sycl::aspect::fp64});
-
-            st->parallel_for<dpct_kernel_name<class gr_norm_kernel_588e81,
-                                              dpct_kernel_scalar<true>>>(
-                sycl::nd_range<3>(sycl::range(1, 1, hc) *
-                                      sycl::range(1, 1, THREADS),
-                                  sycl::range(1, 1, THREADS)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        gr_norm_kernel<true>(R, w_norm, eps, n_embd, ws.xn,
-                                             ws.xq);
-                    });
-        }
-        {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
-
-            st->parallel_for<
-                dpct_kernel_name<class gr_down_kernel_6ff92b, float>>(
-                sycl::nd_range<3>(sycl::range(1, 1, hc_lr) *
-                                      sycl::range(1, 1, THREADS),
-                                  sycl::range(1, 1, THREADS)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        gr_down_kernel<float>(ws.xn, w_down, hc_dim, hc_lr, hc,
-                                              ws.lo);
-                    });
-        }
-        {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
-
-            st->parallel_for<
-                dpct_kernel_name<class gr_gate_kernel_abf73c, float>>(
-                sycl::nd_range<3>(
-                    sycl::range(1, 1, (hc_dim + WARPS - 1) / WARPS) *
-                        sycl::range(1, 1, THREADS),
-                    sycl::range(1, 1, THREADS)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        gr_gate_kernel<float>(ws.lo, w_up, ws.xn, hc_dim, hc_lr,
-                                              ws.gated);
-                    });
-        }
-    } else {
-        {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
-            dpct::has_capability_or_fail(st->get_device(),
-                                         {sycl::aspect::fp64});
-
-            st->parallel_for<dpct_kernel_name<class gr_norm_kernel_70bea5,
-                                              dpct_kernel_scalar<false>>>(
-                sycl::nd_range<3>(sycl::range(1, 1, hc) *
-                                      sycl::range(1, 1, THREADS),
-                                  sycl::range(1, 1, THREADS)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        gr_norm_kernel<false>(R, w_norm, eps, n_embd, ws.xn,
-                                              ws.xq);
-                    });
-        }
-        {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
-
-            st->parallel_for<
-                dpct_kernel_name<class gr_down_kernel_518fbb, uint16_t>>(
-                sycl::nd_range<3>(sycl::range(1, 1, hc_lr) *
-                                      sycl::range(1, 1, THREADS),
-                                  sycl::range(1, 1, THREADS)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        gr_down_kernel<uint16_t>(ws.xq, w_down, hc_dim, hc_lr,
-                                                 hc, ws.lq);
-                    });
-        }
-        {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
-
-            st->parallel_for<
-                dpct_kernel_name<class gr_gate_kernel_feafeb, uint16_t>>(
-                sycl::nd_range<3>(
-                    sycl::range(1, 1, (hc_dim + WARPS - 1) / WARPS) *
-                        sycl::range(1, 1, THREADS),
-                    sycl::range(1, 1, THREADS)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        gr_gate_kernel<uint16_t>(ws.lq, w_up, ws.xn, hc_dim,
-                                                 hc_lr, ws.gated);
-                    });
-        }
-    }
-    if (!use_native)
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        st->parallel_for<dpct_kernel_name<class gr_mean_kernel_f4c4e8>>(
-            sycl::nd_range<3>(
-                sycl::range(1, 1, (n_embd + THREADS - 1) / THREADS) *
-                    sycl::range(1, 1, THREADS),
-                sycl::range(1, 1, THREADS)),
-            exp_props, [=](sycl::nd_item<3> item_ct1) {
-                gr_mean_kernel(ws.gated, n_embd, hc, mixed);
-            });
-    }
-    // Absent for the final mixer, and then nothing is written - computing an injection nobody reads would be
-    // a claim, not a convenience.
-    if (w_inject != nullptr) {
-        const int nthreads = 32 * hc;
-        if (use_native)
-            bf16_gemv_fp32_mmvf(ws.xn, w_inject, inject, hc_dim, hc, stream);
-        else if (use_fp32)
-            /*
-            DPCT1049: The work-group size passed to the SYCL kernel may
-            exceed the limit. To get the device limit, query
-            info::device::max_work_group_size. Adjust the work-group size if
-            needed.
-            */
-        {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
-
-            st->parallel_for<
-                dpct_kernel_name<class gr_inject_kernel_569ce0, float>>(
-                sycl::nd_range<3>(sycl::range(1, 1, nthreads),
-                                  sycl::range(1, 1, nthreads)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        gr_inject_kernel<float>(ws.xn, w_inject, hc_dim, hc,
-                                                inject);
-                    });
-        } else
-        /*
-        DPCT1049: The work-group size passed to the SYCL kernel may
-        exceed the limit. To get the device limit, query
-        info::device::max_work_group_size. Adjust the work-group size if
-        needed.
-        */
-        {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
-
-            st->parallel_for<
-                dpct_kernel_name<class gr_inject_kernel_d9aa02, uint16_t>>(
-                sycl::nd_range<3>(sycl::range(1, 1, nthreads),
-                                  sycl::range(1, 1, nthreads)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        gr_inject_kernel<uint16_t>(ws.xq, w_inject, hc_dim, hc,
-                                                   inject);
-                    });
-        }
-    }
-
-    /*
-    DPCT1010: SYCL uses exceptions to report errors and does not use the
-    error codes. The cudaGetLastError function call was replaced with 0. You
-    need to rewrite this code.
-    */
-    const dpct::err0 e = 0;
-
-    if (stream == nullptr) {
-        const dpct::err0 se = DPCT_CHECK_ERROR(
-            dpct::get_current_device().queues_wait_and_throw());
-    }
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
-
-static bool no_multi_gr() {
-    static const bool off = [] {
-        const char* v = std::getenv("STRATA_NO_MULTI_GR");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
-    return off;
-}
-
-void gr_read_multi(const float *R, const float *w_norm, const uint16_t *w_down,
-                   const uint16_t *w_up, const uint16_t *w_inject, float eps,
-                   const GrShapes &s, const GrWorkspace &ws, float *xn_multi,
-                   float *lo_multi, float *gated_multi, float *mixed,
-                   float *inject, int n_tok, void *stream) try {
-    if (n_tok <= 0 || s.n_embd <= 0 || s.hc <= 0 || s.hc_lr <= 0) return;
-    if (!no_multi_gr() && native_mmvf && n_tok > 1 && xn_multi != nullptr && lo_multi != nullptr && gated_multi != nullptr) {
-        const int n_embd = (int) s.n_embd, hc = (int) s.hc, hc_lr = (int) s.hc_lr;
-        const int hc_dim = (int) (s.hc * s.n_embd);
-        if ((hc_dim & 1) != 0 || (hc_lr & 1) != 0)
-            throw std::invalid_argument("gr_read native MMVF requires even hc*n_embd and hc_lr");
-        native_gr_rms_norm_weighted_multi(R, w_norm, xn_multi, n_embd, hc, n_tok, eps, stream);
-        bf16_gemv_fp32_mmvf_multi(xn_multi, hc_dim, w_down, lo_multi, hc_lr, hc_dim, hc_lr, n_tok, stream);
-        native_gr_down_silu(lo_multi, hc_lr * n_tok, hc, stream);
-        bf16_gemv_fp32_mmvf_multi(lo_multi, hc_lr, w_up, gated_multi, hc_dim, hc_lr, hc_dim, n_tok, stream);
-        native_gr_pre_gated_multi(xn_multi, gated_multi, mixed, n_embd, hc, n_tok, w_inject != nullptr, stream);
-        if (w_inject != nullptr)
-            bf16_gemv_fp32_mmvf_multi(xn_multi, hc_dim, w_inject, inject, hc, hc_dim, hc, n_tok, stream);
-        /*
-        DPCT1010: SYCL uses exceptions to report errors and does not use
-        the error codes. The cudaGetLastError function call was replaced with 0.
-        You need to rewrite this code.
-        */
-        const dpct::err0 e = 0;
-
-        if (stream == nullptr) {
-            const dpct::err0 se = DPCT_CHECK_ERROR(
-                dpct::get_current_device().queues_wait_and_throw());
-        }
-        return;
-    }
-    const size_t hc_dim = (size_t) s.hc * (size_t) s.n_embd;
-    for (int t = 0; t < n_tok; ++t) {
-        gr_read(R + (size_t) t * hc_dim, w_norm, w_down, w_up, w_inject, eps, s, ws,
-                mixed + (size_t) t * s.n_embd, inject ? inject + (size_t) t * s.hc : nullptr, stream);
-    }
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
-
-void gr_write(const float *R, const float *block_out, const float *inject,
-              const GrShapes &s, float *R_out, void *stream) try {
-    if (s.n_embd <= 0 || s.hc <= 0) return;
-    const long long n = (long long) s.hc * s.n_embd;
-    const int blocks = (int) ((n + THREADS - 1) / THREADS);
-    if (native_mmvf)
-        native_gr_post(R, block_out, inject, R_out, (int) s.n_embd, (int) s.hc, stream);
-    else {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        strata::q_of(stream)
-            ->submit([&](sycl::handler &cgh) {
-                /*
-                DPCT1083: The size of local memory in the migrated code may
-                be different from the original code. Check that the allocated
-                memory size in the migrated code is correct.
-                */
-                sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
-                    sycl::range((size_t)s.hc * sizeof(float)), cgh);
-
-                cgh.parallel_for<
-                    dpct_kernel_name<class gr_write_kernel_bd7975>>(
-                    sycl::nd_range<3>(sycl::range(1, 1, blocks) *
-                                          sycl::range(1, 1, THREADS),
-                                      sycl::range(1, 1, THREADS)),
-                    exp_props, [=](sycl::nd_item<3> item_ct1) {
-                        gr_write_kernel(
-                            R, block_out, inject, (int)s.n_embd, (int)s.hc,
-                            R_out,
-                            dpct_local_acc_ct1
-                                .get_multi_ptr<sycl::access::decorated::no>()
-                                .get());
-                    });
-            });
-    }
-    if (stream == nullptr) {
-        const dpct::err0 e = DPCT_CHECK_ERROR(
-            dpct::get_current_device().queues_wait_and_throw());
-    }
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
-
-void gr_write_multi(const float *R, const float *block_out, const float *inject,
-                    const GrShapes &s, float *R_out, int n_tok,
-                    void *stream) try {
-    if (n_tok <= 0 || s.n_embd <= 0 || s.hc <= 0) return;
-    if (!no_multi_gr() && native_mmvf && n_tok > 1) {
-        native_gr_post_multi(R, block_out, inject, R_out, (int) s.n_embd, (int) s.hc, n_tok, stream);
-        if (stream == nullptr) {
-            const dpct::err0 e = DPCT_CHECK_ERROR(
-                dpct::get_current_device().queues_wait_and_throw());
-        }
-        return;
-    }
-    const size_t hc_dim = (size_t) s.hc * (size_t) s.n_embd;
-    for (int t = 0; t < n_tok; ++t) {
-        gr_write(R + (size_t) t * hc_dim, block_out + (size_t) t * s.n_embd, inject + (size_t) t * s.hc, s,
-                 R_out + (size_t) t * hc_dim, stream);
-    }
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
+#include "gr.kern.inc"
 
 }  // namespace strata::kernels

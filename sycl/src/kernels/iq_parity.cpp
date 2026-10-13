@@ -12,9 +12,7 @@
 // MMVQ dot (q8_1 activations) must match the float matrix-vector product over that reference within the
 // activation rounding (a few 1e-3 relative), for 1 to 8 columns, every column of a multi-column call bitwise
 // equal to a one-column call on it.
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
+#include "strata/ze/ze.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 
@@ -25,12 +23,21 @@
 #include <string>
 #include <vector>
 
+namespace {
+
+/// cudaMemcpy: after the device's queued work, complete on return.
+void memcpy_sync(void* dst, const void* src, size_t bytes) {
+    strata::ze::device_sync();
+    strata::ze::copy_sync(dst, src, bytes);
+}
+
+}  // namespace
+
 int main(int argc, char** argv) {
     const std::string dir = argc > 1 ? argv[1] : "logs/iq_fixture";
     const char* names[] = {"IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ1_M", "IQ4_NL", "IQ4_XS", "Q2_0", "Q3_K"};
     int failures = 0, missing = 0;
-    dpct::queue_ptr s;
-    s = dpct::get_current_device().create_queue(true);
+    strata::ze::Stream* s = new strata::ze::Stream();
     for (const char* nm : names) {
         std::FILE* f = std::fopen((dir + "/" + nm + ".bin").c_str(), "rb");
         std::FILE* g = std::fopen((dir + "/" + nm + ".f32").c_str(), "rb");
@@ -55,24 +62,14 @@ int main(int argc, char** argv) {
         std::fclose(g);
         void* dw = nullptr;
         float* dq = nullptr;
-        dw =
-            (void *)sycl::malloc_device(raw.size(), dpct::get_in_order_queue());
-        dq = (float *)sycl::malloc_device(ref.size() * 4,
-                                          dpct::get_in_order_queue());
-        /*
-        DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-        assuming in the original code the source host memory is pageable memory.
-        If the memory is not pageable, call wait() on event return by memcpy API
-        to ensure synchronization behavior.
-        */
-        (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(dw, raw.data(), raw.size()).wait();
+        dw = strata::ze::malloc_device(raw.size());
+        dq = (float*) strata::ze::malloc_device(ref.size() * 4);
+        memcpy_sync(dw, raw.data(), raw.size());
         double dq_err = 0.0;
         if (strata::kernels::iq_supported(type) && ((size_t) rows * cols) % 256 == 0) {
             strata::kernels::iq_dequant_f32(type, dw, (int64_t) rows * cols, dq, s);
             std::vector<float> got(ref.size());
-            (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                .memcpy(got.data(), dq, got.size() * 4)
-                .wait();
+            memcpy_sync(got.data(), dq, got.size() * 4);
             double num = 0, den = 0;
             for (size_t i = 0; i < ref.size(); ++i) { num += std::fabs(got[i] - ref[i]); den += std::fabs(ref[i]); }
             dq_err = num / (den + 1e-30);
@@ -87,19 +84,10 @@ int main(int argc, char** argv) {
         float* dx = nullptr;
         void* xq = nullptr;
         float* dy = nullptr;
-        dx = (float *)sycl::malloc_device(x.size() * 4,
-                                          dpct::get_in_order_queue());
-        xq = (void *)sycl::malloc_device((size_t)MC * cols / 32 * 36,
-                                         dpct::get_in_order_queue());
-        dy = (float *)sycl::malloc_device((size_t)MC * rows * 4,
-                                          dpct::get_in_order_queue());
-        /*
-        DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-        assuming in the original code the source host memory is pageable memory.
-        If the memory is not pageable, call wait() on event return by memcpy API
-        to ensure synchronization behavior.
-        */
-        (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(dx, x.data(), x.size() * 4).wait();
+        dx = (float*) strata::ze::malloc_device(x.size() * 4);
+        xq = strata::ze::malloc_device((size_t)MC * cols / 32 * 36);
+        dy = (float*) strata::ze::malloc_device((size_t)MC * rows * 4);
+        memcpy_sync(dx, x.data(), x.size() * 4);
         strata::kernels::quantize_q8_1_rows(dx, MC, cols, xq, s);
         std::vector<float> y((size_t) MC * rows), yn(y.size());
         int multi_bad = 0;
@@ -107,16 +95,12 @@ int main(int argc, char** argv) {
             for (int c = 0; c < MC; ++c)
                 strata::kernels::native_mmvq(type, dw, (const uint8_t*) xq + (size_t) c * cols / 32 * 36,
                                              dy + (size_t) c * rows, cols, rows, 1, s);
-            s->wait();
-            (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                .memcpy(y.data(), dy, y.size() * 4)
-                .wait();
+            s->sync();
+            memcpy_sync(y.data(), dy, y.size() * 4);
             for (int nc = 2; nc <= MC; ++nc) {
                 strata::kernels::native_mmvq(type, dw, xq, dy, cols, rows, nc, s);
-                s->wait();
-                (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                    .memcpy(yn.data(), dy, yn.size() * 4)
-                    .wait();
+                s->sync();
+                memcpy_sync(yn.data(), dy, yn.size() * 4);
                 if (strata::kernels::native_mmvq_multi_exact() &&
                     std::memcmp(yn.data(), y.data(), (size_t) nc * rows * 4) != 0) {
                     std::printf("%-8s mmvq ncols %d: not bitwise equal to the one-column calls\n", nm, nc);
@@ -137,11 +121,11 @@ int main(int argc, char** argv) {
         std::printf("%-8s type %2d %4d x %5d  dequant rel %.2e  mmvq rel %.2e (ncols 1..%d)  %s\n", nm, type, rows, cols,
                     dq_err, mm_err, MC, ok ? "ok" : "FAIL");
         if (!ok) ++failures;
-        sycl::free(dw, dpct::get_in_order_queue());
-            sycl::free(dq, dpct::get_in_order_queue());
-            sycl::free(dx, dpct::get_in_order_queue());
-            sycl::free(xq, dpct::get_in_order_queue());
-            sycl::free(dy, dpct::get_in_order_queue());
+        strata::ze::free(dw);
+        strata::ze::free(dq);
+        strata::ze::free(dx);
+        strata::ze::free(xq);
+        strata::ze::free(dy);
     }
     std::printf("iq_parity: %d failures\n", failures);
     // no fixture at all: the generator was skipped (no numpy / vendored gguf-py) - a skip (3), not a failure

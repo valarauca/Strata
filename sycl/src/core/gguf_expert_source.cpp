@@ -8,8 +8,7 @@
 #include <utility>
 #include <fcntl.h>
 #include <unistd.h>
-#include <dpct/dpct.hpp>
-#include <sycl/sycl.hpp>
+#include "strata/ze/ze.hpp"
 #include <thread>
 
 namespace strata::core {
@@ -21,7 +20,7 @@ constexpr size_t kRing = 512;   // blobs alive at once: the prompt path holds a 
 GgufExpertSource::~GgufExpertSource() { close(); }
 
 void GgufExpertSource::close() {
-    for (uint8_t* c : mirror_chunks_) if (c) sycl::free(c, dpct::get_in_order_queue());
+    for (uint8_t* c : mirror_chunks_) if (c) strata::ze::free(c);
     mirror_chunks_.clear();
     mirror_bytes_ = 0; mirror_ptr_.clear(); layer_first_.clear();
     for (int fd : fds_) if (fd >= 0) ::close(fd);
@@ -116,12 +115,13 @@ const uint8_t* GgufExpertSource::blob(int64_t layer, int64_t expert) {
 }
 
 int64_t GgufExpertSource::mirror(const std::vector<std::pair<int64_t, int64_t>>& pairs, uint64_t cap, int threads,
-                                 std::string& err) {
+                                 std::string& err, bool append) {
     const auto& lay = strata::kernels::cpu::expert_layout();
     std::vector<std::pair<int64_t, int64_t>> take;
     uint64_t total = 0;
     for (const auto& [l, e] : pairs) {
         if (l < 0 || l >= n_layers_ || e < 0 || e >= n_expert_) continue;
+        if (append && pinned(l, e)) continue;
         const uint64_t b = (lay.bytes[(size_t) l] + 255) / 256 * 256;
         if (total + b > cap) break;
         take.push_back({l, e});
@@ -138,7 +138,7 @@ int64_t GgufExpertSource::mirror(const std::vector<std::pair<int64_t, int64_t>>&
     struct ChunkCleanup {
         std::vector<uint8_t*>& v;
         bool armed = true;
-        ~ChunkCleanup() { if (armed) for (uint8_t* c : v) if (c) sycl::free(c, dpct::get_in_order_queue()); }
+        ~ChunkCleanup() { if (armed) for (uint8_t* c : v) if (c) strata::ze::free(c); }
     } cleanup{chunks};
     std::vector<uint8_t*> ptrs(take.size(), nullptr);
     uint64_t placed = 0;
@@ -149,15 +149,9 @@ int64_t GgufExpertSource::mirror(const std::vector<std::pair<int64_t, int64_t>>&
         if (cur == nullptr || cur_off + b > cur_size) {
             // never smaller than one blob, so a single blob past kChunk still fits its chunk
             const uint64_t want = std::max(b, std::min<uint64_t>(kChunk, total - placed));
-            uint8_t* nc = nullptr;
-            try {
-                nc = (uint8_t*) sycl::malloc_host((size_t) want, dpct::get_in_order_queue());
-            } catch (const sycl::exception& ex) {
-                err = std::string("mirror: ") + ex.what();
-            }
+            uint8_t* nc = (uint8_t*) strata::ze::malloc_host((size_t) want);
             if (nc == nullptr) {
-                if (err.empty())
-                    err = "mirror: no pinned host memory for " + std::to_string(want >> 20) + " MiB";
+                err = "mirror: no pinned host memory for " + std::to_string(want >> 20) + " MiB";
                 return -1;
             }
             chunks.push_back(nc);
@@ -187,12 +181,19 @@ int64_t GgufExpertSource::mirror(const std::vector<std::pair<int64_t, int64_t>>&
         err = "mirror: reading an expert from the GGUF failed";
         return -1;
     }
-    for (uint8_t* c : mirror_chunks_) if (c) sycl::free(c, dpct::get_in_order_queue());
-    mirror_chunks_ = std::move(chunks);
+    if (append) {
+        mirror_chunks_.insert(mirror_chunks_.end(), chunks.begin(), chunks.end());
+        mirror_bytes_ += total;
+    } else {
+        for (uint8_t* c : mirror_chunks_) if (c) strata::ze::free(c);
+        mirror_chunks_ = std::move(chunks);
+        mirror_bytes_ = total;
+        mirror_ptr_.clear();
+        layer_first_.clear();
+    }
     cleanup.armed = false;                                  // the chunks now belong to the object
-    mirror_bytes_ = total;
-    mirror_ptr_.assign((size_t) (n_layers_ * n_expert_), nullptr);
-    layer_first_.assign((size_t) n_layers_, nullptr);
+    if (mirror_ptr_.empty()) mirror_ptr_.assign((size_t) (n_layers_ * n_expert_), nullptr);
+    if (layer_first_.empty()) layer_first_.assign((size_t) n_layers_, nullptr);
     for (size_t j = 0; j < take.size(); ++j) {
         const auto [l, e] = take[j];
         mirror_ptr_[(size_t) (l * n_expert_ + e)] = ptrs[j];

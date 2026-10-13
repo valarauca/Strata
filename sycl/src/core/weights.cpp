@@ -1,7 +1,5 @@
 // src/core/weights.cpp - the dense-weight loader.  See the header for the engine-vs-pack distinction.
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
+#include "strata/ze/ze.hpp"
 #include "strata/core/weights.hpp"
 
 #include "strata/kernels/f16_bits.hpp"
@@ -145,7 +143,7 @@ bool WeightTable::index_code_bits(const std::string& pack_dir, const std::string
 
 bool WeightTable::load(const std::string &pack_dir, void *arena_base,
                        uint64_t arena_bytes, std::string &err,
-                       const std::set<std::string> *skip) try {
+                       const std::set<std::string> *skip) {
     const std::string path = pack_dir + "/index.txt";
     std::FILE* idx = std::fopen(path.c_str(), "rb");
     if (!idx) { err = "cannot open " + path + " (run tools/pack_index.py)"; return false; }
@@ -225,23 +223,11 @@ bool WeightTable::load(const std::string &pack_dir, void *arena_base,
     // one of the 90 widened tensors - a heap corruption that would have been blamed on whatever ran next.
     void* stage_in = nullptr;
     void* stage_out = nullptr;
-    /*
-    DPCT1048: The original value cudaHostAllocDefault is not meaningful in the
-    migrated code and was removed or replaced with 0. You may need to check the
-    migrated code.
-    */
-    if (DPCT_CHECK_ERROR(stage_in = (void *)sycl::malloc_host(
-                             CHUNK, dpct::get_in_order_queue())) != 0 ||
-        /*
-        DPCT1048: The original value cudaHostAllocDefault is not meaningful in
-        the migrated code and was removed or replaced with 0. You may need to
-        check the migrated code.
-        */
-        DPCT_CHECK_ERROR(stage_out = (void *)sycl::malloc_host(
-                             CHUNK * 2, dpct::get_in_order_queue())) != 0) {
+    if ((stage_in = strata::ze::malloc_host(CHUNK)) == nullptr ||
+        (stage_out = strata::ze::malloc_host(CHUNK * 2)) == nullptr) {
         err = "cudaHostAlloc for the staging buffers failed";
-        if (stage_in) sycl::free(stage_in, dpct::get_in_order_queue());
-        if (stage_out) sycl::free(stage_out, dpct::get_in_order_queue());
+        if (stage_in) strata::ze::free(stage_in);
+        if (stage_out) strata::ze::free(stage_out);
         return false;
     }
 
@@ -284,8 +270,8 @@ bool WeightTable::load(const std::string &pack_dir, void *arena_base,
         if (r.code_bits != 0 && r.dst_bytes == 0) {
             // plan v0.3 P6: a native pack's row that carries a shape only - the GGUF form must serve it
             err = r.name + ": this pack holds the tensor only in its GGUF form (run with --native SHARD1)";
-            sycl::free(stage_in, dpct::get_in_order_queue());
-                sycl::free(stage_out, dpct::get_in_order_queue());
+            strata::ze::free(stage_in);
+                strata::ze::free(stage_out);
             return false;
         }
         if (r.file != cur_file) {
@@ -295,8 +281,8 @@ bool WeightTable::load(const std::string &pack_dir, void *arena_base,
             cur = std::fopen(p.c_str(), "rb");
             if (!cur) {
                 err = "cannot open " + p;
-                sycl::free(stage_in, dpct::get_in_order_queue());
-                sycl::free(stage_out, dpct::get_in_order_queue());
+                strata::ze::free(stage_in);
+                strata::ze::free(stage_out);
                 return false;
             }
             cur_file = r.file;
@@ -368,8 +354,8 @@ bool WeightTable::load(const std::string &pack_dir, void *arena_base,
             bad = true;
         }
         if (bad) {
-            sycl::free(stage_in, dpct::get_in_order_queue());
-            sycl::free(stage_out, dpct::get_in_order_queue());
+            strata::ze::free(stage_in);
+            strata::ze::free(stage_out);
             return false;
         }
 
@@ -378,8 +364,8 @@ bool WeightTable::load(const std::string &pack_dir, void *arena_base,
             const bool widening = (s.conv == Conv::WidenF16);
             if (widening && (s.src_bytes & 1ull)) {
                 err = r.name + ": an fp16 plane with an odd source byte count";
-                sycl::free(stage_in, dpct::get_in_order_queue());
-                    sycl::free(stage_out, dpct::get_in_order_queue());
+                strata::ze::free(stage_in);
+                    strata::ze::free(stage_out);
                 return false;
             }
             uint64_t done = 0;
@@ -391,15 +377,15 @@ bool WeightTable::load(const std::string &pack_dir, void *arena_base,
                     if (n == 1) {
                         err =
                             r.name + ": an fp16 plane ending on a half element";
-                        sycl::free(stage_in, dpct::get_in_order_queue());
-                        sycl::free(stage_out, dpct::get_in_order_queue());
+                        strata::ze::free(stage_in);
+                        strata::ze::free(stage_out);
                         return false;
                     }
                     n -= 1;
                 }
                 if (!read_at(cur, r.src_off + s.src_off + done, stage_in, (size_t) n, err, r.name.c_str())) {
-                    sycl::free(stage_in, dpct::get_in_order_queue());
-                        sycl::free(stage_out, dpct::get_in_order_queue());
+                    strata::ze::free(stage_in);
+                        strata::ze::free(stage_out);
                     return false;
                 }
                 const uint8_t* src = (const uint8_t*) stage_in;
@@ -460,20 +446,7 @@ bool WeightTable::load(const std::string &pack_dir, void *arena_base,
                 }
 
                 const double u0 = now_ms();
-                /*
-                DPCT1114: cudaMemcpy is migrated to asynchronization
-                memcpy, assuming in the original code the source host memory is
-                pageable memory. If the memory is not pageable, call wait() on
-                event return by memcpy API to ensure synchronization behavior.
-                */
-                if (DPCT_CHECK_ERROR(dpct::get_in_order_queue().memcpy(
-                        dst_base + r.dst_off + out_at, host_src, out_bytes).wait()) !=
-                    0) {
-                    err = "cudaMemcpy failed for " + r.name;
-                    sycl::free(stage_in, dpct::get_in_order_queue());
-                        sycl::free(stage_out, dpct::get_in_order_queue());
-                    return false;
-                }
+                strata::ze::copy_sync(dst_base + r.dst_off + out_at, host_src, out_bytes);
                 upload_ms += now_ms() - u0;
                 done += n;
             }
@@ -508,22 +481,14 @@ bool WeightTable::load(const std::string &pack_dir, void *arena_base,
         }
     }
     if (cur) std::fclose(cur);
-    sycl::free(stage_in, dpct::get_in_order_queue());
-    sycl::free(stage_out, dpct::get_in_order_queue());
+    strata::ze::free(stage_in);
+    strata::ze::free(stage_out);
 
     report_.arena_bytes = pool;
     report_.read_ms = now_ms() - t_read0 - upload_ms;
     report_.upload_ms = upload_ms;
-    if (DPCT_CHECK_ERROR(dpct::get_current_device().queues_wait_and_throw()) !=
-        0) {
-        err = "cudaDeviceSynchronize after the load failed"; return false;
-    }
+    strata::ze::device_sync();
     return true;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
 }
 
 const WeightRef* WeightTable::find(const std::string& name) const {

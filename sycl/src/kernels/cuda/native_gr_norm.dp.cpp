@@ -22,17 +22,11 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
-#include "strata/sycl_queue.hpp"
+#include "strata/port.hpp"
 #include "strata/kernels/native_gr_norm.hpp"
 
-#include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <stdexcept>
-#include <string>
 
 namespace strata::kernels {
 namespace {
@@ -40,11 +34,6 @@ namespace {
 __dpct_inline__ float norm_warp_sum(float value) {
 #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
-        /*
-        DPCT1108: '__shfl_xor_sync' was migrated with the experimental
-        feature masked sub_group function which may not be supported by all
-        compilers or runtimes. You may need to adjust the code.
-        */
         value += dpct::experimental::permute_sub_group_by_xor(
             0xffffffffu, sycl::ext::oneapi::this_work_item::get_sub_group(),
             value, offset);
@@ -93,80 +82,8 @@ __dpct_inline__ void weighted_rms_norm(const float *__restrict__ input,
     }
 }
 
-void check_pointer(const void* p) {
-    if (!p || reinterpret_cast<std::uintptr_t>(p) % alignof(float) != 0)
-        throw std::invalid_argument("native GR RMSNorm requires non-null four-byte aligned pointers");
-}
-
 } // namespace
 
-void native_gr_rms_norm_weighted(const float* input, const float* gamma, float* output,
-                                 int n_cols, int n_rows, float epsilon, void* stream) {
-    native_gr_rms_norm_weighted_multi(input, gamma, output, n_cols, n_rows, 1, epsilon, stream);
-}
-
-void native_gr_rms_norm_weighted_multi(const float* input, const float* gamma, float* output,
-                                       int n_cols, int n_rows, int n_tok, float epsilon, void* stream) {
-    if (n_cols <= 0 || n_rows <= 0 || n_tok <= 0 || !std::isfinite(epsilon) || epsilon < 0.0f)
-        throw std::invalid_argument("native GR RMSNorm requires positive dimensions and finite nonnegative epsilon");
-    check_pointer(input);
-    check_pointer(gamma);
-    check_pointer(output);
-    const auto cuda_stream = strata::q_of(stream);
-    const dpct::dim3 grid{unsigned(n_rows), unsigned(n_tok), 1u};
-    if (n_cols < 1024)
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        cuda_stream->parallel_for<dpct_kernel_name<
-            class weighted_rms_norm_60b509, dpct_kernel_scalar<256>>>(
-            sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
-                              sycl::range(1, 1, 256)),
-            exp_props,
-            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
-                weighted_rms_norm<256>(input, gamma, output, n_cols, epsilon);
-            });
-    } else
-    /*
-    DPCT1049: The work-group size passed to the SYCL kernel may exceed
-    the limit. To get the device limit, query
-    info::device::max_work_group_size. Adjust the work-group size if needed.
-    */
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        cuda_stream->parallel_for<dpct_kernel_name<
-            class weighted_rms_norm_9382c8, dpct_kernel_scalar<1024>>>(
-            sycl::nd_range<3>(grid * sycl::range(1, 1, 1024),
-                              sycl::range(1, 1, 1024)),
-            exp_props,
-            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
-                weighted_rms_norm<1024>(input, gamma, output, n_cols, epsilon);
-            });
-    }
-    /*
-    DPCT1010: SYCL uses exceptions to report errors and does not use the
-    error codes. The cudaGetLastError function call was replaced with 0. You
-    need to rewrite this code.
-    */
-    const auto error = 0;
-    /*
-    DPCT1000: Error handling if-stmt was detected but could not be
-    rewritten.
-    */
-    if (error != 0)
-        /*
-        DPCT1009: SYCL reports errors using exceptions and does not use
-        error codes. Please replace the "get_error_string_dummy(...)" with a
-        real error-handling function.
-        */
-        /*
-        DPCT1001: The statement could not be removed.
-        */
-        throw std::runtime_error(std::string("native GR RMSNorm launch: ") +
-                                 dpct::get_error_string_dummy(error));
-}
+#include "native_gr_norm.kern.inc"
 
 } // namespace strata::kernels

@@ -1,4 +1,4 @@
-// --remote-expert-opt (Remote Expert Decode Optimization) needs a second CUDA device as an expert tier; the SYCL port
+// --remote-expert-opt (Remote Expert Decode Optimization) needs a second CUDA device as an expert tier; the Intel engine
 // has no such tier (the peer-expert and remote-expert helpers are single-device stubs). The class exists so the shared
 // headers and generate.cpp build; init() refuses with a message, so the option reports itself unsupported.
 #include "strata/core/remote_expert_opt.hpp"
@@ -10,7 +10,7 @@ RemoteExpertOpt::~RemoteExpertOpt() = default;
 void RemoteExpertOpt::attach(RemoteExperts&) {}
 
 bool RemoteExpertOpt::init(std::string& err) {
-    err = "--remote-expert-opt is not supported by the SYCL engine (no second-device expert tier)";
+    err = "--remote-expert-opt is not supported by the Intel engine (no second-device expert tier)";
     return false;
 }
 

@@ -1,8 +1,6 @@
 // src/core/mtp.cpp - see include/strata/core/mtp.hpp.
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
-#include "strata/sycl_queue.hpp"
+#include "strata/ze/ze.hpp"
+#include "strata/intel_gpu.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/on_device.hpp"
@@ -81,22 +79,12 @@ struct Bump {
     }
 };
 
-bool mapped(size_t bytes, void **h, void **d) try {
-    /*
-    DPCT1048: The original value cudaHostAllocMapped is not meaningful in the
-    migrated code and was removed or replaced with 0. You may need to check the
-    migrated code.
-    */
-    if (DPCT_CHECK_ERROR(*h = strata::host_malloc_polled(
-                             bytes, dpct::get_in_order_queue())) !=
-        0 || *h == nullptr) return false;   // the host polls what the draft steps write: uncached host memory (sycl_queue.hpp)
+bool mapped(size_t bytes, void **h, void **d) {
+    *h = strata::host_malloc_polled(bytes);
+    if (*h == nullptr) return false;   // the host polls what the draft steps write: uncached host memory (intel_gpu.hpp)
     std::memset(*h, 0, bytes);
-    return DPCT_CHECK_ERROR(*d = (void *)*h) == 0;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+    *d = *h;
+    return true;
 }
 
 strata::kernels::QsaShapes shapes_of(const ModelGeometry& g) {
@@ -142,41 +130,41 @@ bool read_file(const std::string& path, std::vector<uint8_t>& out) {
 }  // namespace
 
 MtpDrafter::~MtpDrafter() {
-    if (cs_) cs_->wait();
+    if (cs_) cs_->sync();
     for (auto &e : prefill_exec_) if (e) delete (e);
     for (auto &e : prefill_dev_exec_) if (e) delete (e);
-    if (pf_dev_) sycl::free(pf_dev_, dpct::get_in_order_queue());
-    if (dense4_) sycl::free(dense4_, dpct::get_in_order_queue());
+    if (pf_dev_) strata::ze::free(pf_dev_);
+    if (dense4_) strata::ze::free(dense4_);
     for (auto &e : round_exec_) if (e) delete (e);
     for (auto &e : step_exec_) if (e) delete (e);
     for (auto &e : round_exec_c_) if (e) delete (e);
     for (auto &e : step_exec_c_) if (e) delete (e);
-    if (cparams_) sycl::free(cparams_, dpct::get_in_order_queue());
-    if (cring_) sycl::free(cring_, dpct::get_in_order_queue());
-    if (dinv_) sycl::free(dinv_, dpct::get_in_order_queue());
-    if (cscratch_) sycl::free(cscratch_, dpct::get_in_order_queue());
-    if (h_cparams_) sycl::free(h_cparams_, dpct::get_in_order_queue());
-    if (h_chist_) sycl::free(h_chist_, dpct::get_in_order_queue());
-    if (cs_) dpct::get_current_device().destroy_queue(cs_);
-    if (side_) dpct::get_current_device().destroy_queue(side_);
-    if (sh_fork_) dpct::destroy_event(sh_fork_);
-    if (sh_join_) dpct::destroy_event(sh_join_);
-    if (owns_weights_ && dense_) sycl::free(dense_, dpct::get_in_order_queue());
+    if (cparams_) strata::ze::free(cparams_);
+    if (cring_) strata::ze::free(cring_);
+    if (dinv_) strata::ze::free(dinv_);
+    if (cscratch_) strata::ze::free(cscratch_);
+    if (h_cparams_) strata::ze::free(h_cparams_);
+    if (h_chist_) strata::ze::free(h_chist_);
+    if (cs_) delete cs_;
+    if (side_ && side_ != &strata::ze::default_stream(side_->device())) delete side_;
+    if (sh_fork_) delete (sh_fork_);
+    if (sh_join_) delete (sh_join_);
+    if (owns_weights_ && dense_) strata::ze::free(dense_);
     if (owns_weights_ && experts_)
-        sycl::free(experts_, dpct::get_in_order_queue());
-    if (state_arena_) sycl::free(state_arena_, dpct::get_in_order_queue());
-    if (arena_) sycl::free(arena_, dpct::get_in_order_queue());
-    if (head_logits_) sycl::free(head_logits_, dpct::get_in_order_queue());
+        strata::ze::free(experts_);
+    if (state_arena_) strata::ze::free(state_arena_);
+    if (arena_) strata::ze::free(arena_);
+    if (head_logits_) strata::ze::free(head_logits_);
     if (owns_draft_head_ && dhead_) {
       strata::kernels::native_q6_k_unpack(dhead_);
-      sycl::free(dhead_, dpct::get_in_order_queue());
+      strata::ze::free(dhead_);
     }
     if (owns_draft_head_ && dvocab_)
-        sycl::free(dvocab_, dpct::get_in_order_queue());
-    if (ev_chain_) dpct::destroy_event(ev_chain_);
-    for (dpct::event_ptr e : ev_step_) if (e) dpct::destroy_event(e);
+        strata::ze::free(dvocab_);
+    if (ev_chain_) delete (ev_chain_);
+    for (strata::ze::Event* e : ev_step_) if (e) delete (e);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_row_, h_out_, h_prob_, h_force_};
-    for (void *h : hosts) if (h) strata::host_free_polled(h, dpct::get_in_order_queue());
+    for (void *h : hosts) if (h) strata::host_free_polled(h);
 }
 
 const float* MtpDrafter::f32(const char* name) const {
@@ -222,9 +210,9 @@ bool MtpDrafter::make_q4_dense(const std::vector<uint8_t>& blob, std::string& er
         }
         q4_off_.push_back({t->name, off});
     }
-    dense4_ = (uint8_t*) strata::malloc_device_guarded((size_t) total, dpct::get_in_order_queue());   // SYCL port: cudaMalloc/cudaMemcpy
+    dense4_ = (uint8_t*) strata::ze::malloc_device_guarded((size_t) total, -1, "mtp Q4_0 projections");
     if (dense4_ == nullptr) { err = "mtp: the Q4_0 projections do not fit"; return false; }
-    dpct::get_in_order_queue().memcpy(dense4_, host.data(), (size_t) total).wait();
+    strata::ze::copy_sync(dense4_, host.data(), (size_t) total);
     vram_ += total;
     std::fprintf(stderr, "strata mtp: --mtp-q4: %zu projections as Q4_0 (%.1f MiB)\n", plan.size(), (double) total / 1048576.0);
     return true;
@@ -243,16 +231,14 @@ bool MtpDrafter::make_q4_head(std::string& err) {
     if (tt == nullptr || tt->to_float == nullptr || N % 32 != 0) { err = "mtp: --mtp-q4 cannot read the head's format"; return false; }
     const size_t in_row = head_->row_bytes(), out_row = (size_t) (N / 32) * 18;
     std::vector<uint8_t> src((size_t) n_dvocab_ * in_row), dst((size_t) n_dvocab_ * out_row);
-    try { dpct::get_in_order_queue().memcpy(src.data(), dhead_, src.size()).wait(); }   // SYCL port: cudaMemcpy
-    catch (sycl::exception const&) { err = "mtp: reading the draft head"; return false; }
+    strata::ze::copy_sync(src.data(), dhead_, src.size());
     std::vector<float> row((size_t) N);
     for (int64_t r = 0; r < n_dvocab_; ++r) {
         tt->to_float(src.data() + (size_t) r * in_row, row.data(), N);
         ggml_quantize_chunk(GGML_TYPE_Q4_0, row.data(), dst.data() + (size_t) r * out_row, 0, 1, N, nullptr);
     }
     // the Q4_0 rows replace the subset in place (they are smaller)
-    try { dpct::get_in_order_queue().memcpy(dhead_, dst.data(), dst.size()).wait(); }
-    catch (sycl::exception const&) { err = "mtp: writing the draft head"; return false; }
+    strata::ze::copy_sync(dhead_, dst.data(), dst.size());
     dhead_type_ = GGML_Q4_0;
     std::fprintf(stderr, "strata mtp: --mtp-q4: draft head over %lld tokens as Q4_0 (%.1f MiB read per step, was %.1f)\n",
                  (long long) n_dvocab_, (double) dst.size() / 1048576.0, (double) src.size() / 1048576.0);
@@ -265,9 +251,9 @@ bool MtpDrafter::make_q4_head(std::string& err) {
 
 bool MtpDrafter::load(const std::string &rt_dir, const ModelGeometry &g,
                       SessionState &ss, int max_t, std::string &err,
-                      int64_t window, const MtpDrafter *shared) try {
+                      int64_t window, const MtpDrafter *shared) {
     device_ =
-        dpct::get_current_device_id(); // a layer split's last stage on another
+        strata::ze::current_device(); // a layer split's last stage on another
                                        // GPU: the drafter lives there
     g_ = &g;
     ss_ = &ss;
@@ -305,40 +291,16 @@ bool MtpDrafter::load(const std::string &rt_dir, const ModelGeometry &g,
         }
         std::vector<uint8_t> blob;
         if (!read_file(rt_dir + "/dense.bin", blob)) { err = "mtp: cannot read dense.bin"; return false; }
-        const dpct::err0 alloc =
-            DPCT_CHECK_ERROR(dense_ = (uint8_t *)strata::malloc_device_guarded(
-                                 blob.size(), dpct::get_in_order_queue()));
-        /*
-        DPCT1000: Error handling if-stmt was detected but could not be
-        rewritten.
-        */
-        if (alloc != 0) {
+        dense_ = (uint8_t*) strata::ze::malloc_device_guarded(blob.size(), -1, "mtp dense weights");
+        if (dense_ == nullptr) {
             size_t free_bytes = 0, total_bytes = 0;
-            /*
-            DPCT1106: 'cudaMemGetInfo' was migrated with the Intel
-            extensions for device information which may not be supported by all
-            compilers or runtimes. You may need to adjust the code.
-            */
-            const dpct::err0 info =
-                DPCT_CHECK_ERROR(dpct::get_current_device().get_memory_info(
-                    free_bytes, total_bytes));
-            /*
-            DPCT1009: SYCL reports errors using exceptions and does not use
-            error codes. Please replace the "get_error_string_dummy(...)" with a
-            real error-handling function.
-            */
-            /*
-            DPCT1001: The statement could not be removed.
-            */
-            err = "mtp: dense weights allocation failed (" +
-                  std::string(dpct::get_error_string_dummy(alloc)) +
-                  "), requested " + std::to_string(blob.size() >> 20) +
-                  " MiB, CUDA0 free " +
-                  (info == 0 ? std::to_string(free_bytes >> 20) + " MiB"
-                             : "unknown");
+            const bool info = strata::ze::mem_get_info(strata::ze::current_device(), &free_bytes, &total_bytes);
+            err = "mtp: dense weights allocation failed (out of device memory), requested " +
+                  std::to_string(blob.size() >> 20) + " MiB, GPU " + std::to_string(device_) + " free " +
+                  (info ? std::to_string(free_bytes >> 20) + " MiB" : "unknown");
             return false;
         }
-        dpct::get_in_order_queue().memcpy(dense_, blob.data(), blob.size()).wait();
+        strata::ze::copy_sync(dense_, blob.data(), blob.size());
         vram_ += blob.size();
         if (q4_ && !make_q4_dense(blob, err)) return false;
     }
@@ -353,8 +315,8 @@ bool MtpDrafter::load(const std::string &rt_dir, const ModelGeometry &g,
             FILE* f;
             ~Closer() { if (f != nullptr) std::fclose(f); }
         } closer{f};
-        if (DPCT_CHECK_ERROR(experts_ = (uint8_t *)strata::malloc_device_guarded(
-                                 bytes, dpct::get_in_order_queue())) != 0) {
+        experts_ = (uint8_t*) strata::ze::malloc_device_guarded(bytes, -1, "mtp experts");
+        if (experts_ == nullptr) {
             err = "mtp: the 512 experts do not fit in VRAM"; return false;
         }
 #if !defined(_WIN32)
@@ -364,9 +326,7 @@ bool MtpDrafter::load(const std::string &rt_dir, const ModelGeometry &g,
         for (uint64_t off = 0; off < bytes;) {
             const uint64_t n = std::min<uint64_t>(chunk.size(), bytes - off);
             if (std::fread(chunk.data(), 1, (size_t) n, f) != (size_t) n) { err = "mtp: experts.bin is truncated"; return false; }
-            dpct::get_in_order_queue()
-                .memcpy(experts_ + off, chunk.data(), n)
-                .wait();
+            strata::ze::copy_sync(experts_ + off, chunk.data(), n);
             off += n;
         }
         vram_ += bytes;
@@ -390,23 +350,19 @@ bool MtpDrafter::load(const std::string &rt_dir, const ModelGeometry &g,
     qsa_set_kv_hybrid(false);
     if (kv_hybrid_was) qsa_set_kv_int8(true);   // the drafter under --kv k8v4: plain INT8
     uint64_t sb = qsa_state_bytes(g, max_cells, false, ring);
-    if (DPCT_CHECK_ERROR(state_arena_ = (void *)strata::malloc_device_guarded(
-                             sb, dpct::get_in_order_queue())) != 0) {
+    state_arena_ = strata::ze::malloc_device_guarded(sb, -1, "mtp K/V state");
+    if (state_arena_ == nullptr) {
         err = "mtp: the K/V state does not fit"; return false;
     }
     if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[ss.qsa_primary()], ring) == 0) {
         if (st_.kv_mode == 0) { err = "mtp: state init failed"; return false; }
         std::fprintf(stderr, "strata mtp: no pinned RAM left for the draft layer's K/V copy; keeping it in VRAM\n");
-        /*
-        DPCT1026: The call to cudaGetLastError was removed because this
-        functionality is redundant in SYCL.
-        */
-        sycl::free(state_arena_, dpct::get_in_order_queue());
+        strata::ze::free(state_arena_);
         st_ = QsaState{};
         ring = -1;   // fully resident
         sb = qsa_state_bytes(g, max_cells, false, ring);
-        if (DPCT_CHECK_ERROR(state_arena_ = (void *)strata::malloc_device_guarded(
-                                 sb, dpct::get_in_order_queue())) != 0) {
+        state_arena_ = strata::ze::malloc_device_guarded(sb, -1, "mtp K/V state");
+        if (state_arena_ == nullptr) {
             err = "mtp: the K/V state does not fit"; return false;
         }
         if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[ss.qsa_primary()], ring) == 0) { err = "mtp: state init failed"; return false; }
@@ -414,7 +370,7 @@ bool MtpDrafter::load(const std::string &rt_dir, const ModelGeometry &g,
     qsa_set_kv_int8(kv_int8_was);
     qsa_set_kv_hybrid(kv_hybrid_was);
     qsa_state_zero(st_, g, nullptr);
-    dpct::get_current_device().queues_wait_and_throw();
+    strata::ze::device_sync();
     vram_ += sb;
 
     // ---- buffers
@@ -465,11 +421,11 @@ bool MtpDrafter::load(const std::string &rt_dir, const ModelGeometry &g,
     };
     Bump count;
     carve(count);
-    if (DPCT_CHECK_ERROR(arena_ = (void *)strata::malloc_device_guarded(
-                             count.used, dpct::get_in_order_queue())) != 0) {
+    arena_ = strata::ze::malloc_device_guarded(count.used, -1, "mtp arena");
+    if (arena_ == nullptr) {
         err = "mtp: buffers do not fit"; return false;
     }
-    strata::big_fill_zero(dpct::get_in_order_queue(), arena_, count.used);
+    strata::ze::fill_zero(strata::ze::default_stream(), arena_, count.used);
     Bump real;
     real.base = (uint8_t*) arena_;
     carve(real);
@@ -478,55 +434,22 @@ bool MtpDrafter::load(const std::string &rt_dir, const ModelGeometry &g,
         std::vector<int32_t> id((size_t) (T * (uint64_t) cap_));
         for (uint64_t t = 0; t < T; ++t)
             for (int64_t i = 0; i < cap_; ++i) id[(size_t) (t * (uint64_t) cap_ + (uint64_t) i)] = (int32_t) i;
-        /*
-        DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-        assuming in the original code the source host memory is pageable memory.
-        If the memory is not pageable, call wait() on event return by memcpy API
-        to ensure synchronization behavior.
-        */
-        dpct::get_in_order_queue().memcpy(ident_, id.data(), id.size() * 4).wait();
+        strata::ze::copy_sync(ident_, id.data(), id.size() * 4);
     }
     // --pipeline-windows 2 (the forcing graphs): the chain shares its card with stage 1's windows and the next launch
     // on stage 0 waits for it, so its stream gets the highest priority there (STRATA_MTP_PRIORITY=0: the default)
     bool prio = false;
 #if !defined(STRATA_USE_HIP)   // (HIP: the default priority)
     static const bool hi_prio = [] { const char* v = std::getenv("STRATA_MTP_PRIORITY"); return v == nullptr || std::atoi(v) != 0; }();
-    int prio_lo = 0, prio_hi = 0;
-    /*
-    DPCT1027: The call to cudaDeviceGetStreamPriorityRange was replaced with
-    0 because SYCL currently does not support get queue priority range.
-    */
-    if (force_on_ && hi_prio && 0 == 0)
-        /*
-        DPCT1025: The SYCL queue is created ignoring the flag and priority
-        options.
-        */
-        prio = DPCT_CHECK_ERROR(
-                   cs_ = dpct::get_current_device().create_queue(true)) == 0;
-    /*
-    DPCT1026: The call to cudaGetLastError was removed because this
-    functionality is redundant in SYCL.
-    */
+    if (force_on_ && hi_prio) {
+        cs_ = new strata::ze::Stream(-1, strata::ze::Stream::Engine::Compute, true);
+        prio = true;
+    }
 #endif
-    /*
-    DPCT1025: The SYCL queue is created ignoring the flag and priority
-    options.
-    */
-    if (!prio && DPCT_CHECK_ERROR(cs_ = dpct::get_current_device().create_queue(
-                                      true)) != 0) {
-      err = "mtp: stream"; return false;
-    }
-    /*
-    DPCT1025: The SYCL queue is created ignoring the flag and priority
-    options.
-    */
-    if (DPCT_CHECK_ERROR(
-            side_ = dpct::get_current_device().create_queue(true)) != 0 ||
-        DPCT_CHECK_ERROR(sh_fork_ = new sycl::event()) != 0 ||
-        DPCT_CHECK_ERROR(sh_join_ = new sycl::event()) != 0) {
-        err = "mtp: streams";
-        return false;
-    }
+    if (!prio) cs_ = new strata::ze::Stream();
+    side_ = new strata::ze::Stream();
+    sh_fork_ = new strata::ze::Event();
+    sh_join_ = new strata::ze::Event();
     const double files_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_files).count();
     if (shared != nullptr) {
         std::fprintf(stderr, "strata mtp: shared draft weights, %.0f MiB of private state and buffers\n",
@@ -539,11 +462,6 @@ bool MtpDrafter::load(const std::string &rt_dir, const ModelGeometry &g,
                                        1048576.0 / files_s : 0.0);
     }
     return true;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
 }
 
 namespace {
@@ -562,18 +480,12 @@ bool MtpDrafter::top2_env() {
 
 // STRATA_MTP_TOP2=1 (a diagnostic for tree drafts): draft j's runner-up under the draft layer, from the head logits
 // the step just wrote (row 0), on the host.  Slow; only for measuring what a second branch would have caught.
-void MtpDrafter::record_top2(int j) try {
+void MtpDrafter::record_top2(int j) {
     const int64_t nv = dhead_ != nullptr ? n_dvocab_ : n_vocab_;
     if ((int64_t) lg_host_.size() < nv) lg_host_.resize((size_t) nv);
     if ((int) top2_.size() < max_t_) top2_.assign((size_t) max_t_, -1);
     if (j < 0 || j >= max_t_) return;
-    if (DPCT_CHECK_ERROR(dpct::get_in_order_queue()
-                             .memcpy(lg_host_.data(), head_logits_,
-                                     (size_t)nv * sizeof(float))
-                             .wait()) != 0) {
-        top2_[(size_t) j] = -1;
-        return;
-    }
+    strata::ze::copy_sync(lg_host_.data(), head_logits_, (size_t) nv * sizeof(float));
     int64_t b1 = -1, b2 = -1;
     for (int64_t i = 0; i < nv; ++i) {
         const float v = lg_host_[(size_t) i];
@@ -581,11 +493,6 @@ void MtpDrafter::record_top2(int j) try {
         else if (b2 < 0 || v > lg_host_[(size_t) b2]) b2 = i;
     }
     top2_[(size_t) j] = b2 < 0 ? -1 : dhead_ != nullptr ? dvocab_host_[(size_t) b2] : (int32_t) b2;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
 }
 
 uint64_t MtpDrafter::bind_bytes(uint64_t head_row_bytes, int64_t n_vocab) const {
@@ -605,7 +512,7 @@ uint64_t MtpDrafter::bind_bytes(uint64_t head_row_bytes, int64_t n_vocab) const 
     return bytes;
 }
 
-bool MtpDrafter::setup_coupled(std::string& err) try {
+bool MtpDrafter::setup_coupled(std::string& err) {
     const int64_t nv = dhead_ != nullptr ? n_dvocab_ : n_vocab_;
     const size_t scratch = strata::kernels::coupled_draft_scratch_bytes((int) nv);
     if (scratch == 0) {
@@ -613,55 +520,41 @@ bool MtpDrafter::setup_coupled(std::string& err) try {
                              "argmax drafts\n", (long long) nv);
         return true;
     }
-    sycl::queue& q = dpct::get_in_order_queue();
+    strata::ze::Stream& q = strata::ze::default_stream();
     const size_t ring = (size_t) (kCoupledHistCap + max_t_) * sizeof(int32_t);
-    cparams_ = sycl::malloc_device<strata::kernels::SamplerParams>(1, q);
-    cring_ = (int32_t*) sycl::malloc_device(ring, q);
-    cscratch_ = sycl::malloc_device(scratch, q);
+    cparams_ = (strata::kernels::SamplerParams*) strata::ze::malloc_device(sizeof(strata::kernels::SamplerParams), q.device());
+    cring_ = (int32_t*) strata::ze::malloc_device(ring, q.device());
+    cscratch_ = strata::ze::malloc_device(scratch, q.device());
     if (cparams_ == nullptr || cring_ == nullptr || cscratch_ == nullptr ||
         !mapped(sizeof(strata::kernels::SamplerParams), (void**) &h_cparams_, (void**) &m_cparams_) ||
         !mapped((size_t) kCoupledHistCap * sizeof(int32_t), (void**) &h_chist_, (void**) &m_chist_)) {
         err = "mtp: the coupled draft sampler's buffers do not fit";
         return false;
     }
-    q.memset(cring_, 0xff, ring).wait();   // -1: no token
+    q.memset(cring_, 0xff, ring);   // -1: no token
+    q.sync();
     std::fill(h_chist_, h_chist_ + kCoupledHistCap, -1);
     vram_ += sizeof(strata::kernels::SamplerParams) + ring + scratch;
     if (dhead_ != nullptr) {   // token id -> subset index (-1: not in the draft head), for the penalties
         std::vector<int32_t> sub((size_t) n_dvocab_), inv((size_t) n_vocab_, -1);
-        q.memcpy(sub.data(), dvocab_, sub.size() * sizeof(int32_t)).wait();
+        q.memcpy(sub.data(), dvocab_, sub.size() * sizeof(int32_t));
+        q.sync();
         for (size_t i = 0; i < sub.size(); ++i)
             if (sub[i] >= 0 && sub[i] < n_vocab_ && inv[(size_t) sub[i]] < 0) inv[(size_t) sub[i]] = (int32_t) i;
-        dinv_ = (int32_t*) sycl::malloc_device(inv.size() * sizeof(int32_t), q);
+        dinv_ = (int32_t*) strata::ze::malloc_device(inv.size() * sizeof(int32_t), q.device());
         if (dinv_ == nullptr) {
             err = "mtp: the coupled draft sampler's token map does not fit";
             return false;
         }
-        q.memcpy(dinv_, inv.data(), inv.size() * sizeof(int32_t)).wait();
+        q.memcpy(dinv_, inv.data(), inv.size() * sizeof(int32_t));
+        q.sync();
         vram_ += inv.size() * sizeof(int32_t);
     }
-    if (DPCT_CHECK_ERROR(dpct::get_current_device().queues_wait_and_throw()) !=
-        0) {
-        /*
-        DPCT1009: SYCL reports errors using exceptions and does not use
-        error codes. Please replace the "get_error_string_dummy(...)" with a
-        real error-handling function.
-        */
-        /*
-        DPCT1010: SYCL uses exceptions to report errors and does not use the
-        error codes. The cudaGetLastError function call was replaced with 0. You
-        need to rewrite this code.
-        */
-        err = std::string("mtp: coupled setup: ") + dpct::get_error_string_dummy(0);
-        return false;
-    }
+    strata::ze::device_sync();
     coupled_ok_ = true;
     std::fprintf(stderr, "strata mtp: coupled draft sampling on (STRATA_SPEC_COUPLED): sampled requests draft with the "
                          "target's chain and Philox draw over %lld tokens\n", (long long) nv);
     return true;
-} catch (sycl::exception const& e) {
-    err = std::string("mtp: coupled setup: ") + e.what();
-    return false;
 }
 
 void MtpDrafter::set_draft_sampling(const strata::kernels::SamplerParams& sp) {
@@ -683,8 +576,7 @@ namespace {
 // head does not fit" with no hint.  Text only, after the failure: nothing changes for a start that fits.
 void draft_head_hint(int64_t n_tokens, int64_t row_bytes) {
     size_t free_b = 0, total_b = 0;
-    bool have_free = true;   // SYCL port: the device's own free-memory figure
-    try { dpct::get_current_device().get_memory_info(free_b, total_b); } catch (...) { have_free = false; }
+    const bool have_free = strata::ze::mem_get_info(strata::ze::current_device(), &free_b, &total_b);
     auto mib = [&](int64_t n) { return (double) (n * row_bytes) / 1048576.0; };
     std::string free_s;
     if (have_free) {
@@ -719,7 +611,7 @@ void draft_head_hint(int64_t n_tokens, int64_t row_bytes) {
 
 bool MtpDrafter::bind(const WeightTable &wt, const NativeHead *head,
                       const float *window_R, std::string &err,
-                      const MtpDrafter *shared) try {
+                      const MtpDrafter *shared) {
     const OnDevice on_device(device_);
     wt_ = &wt;
     head_ = head;
@@ -728,12 +620,12 @@ bool MtpDrafter::bind(const WeightTable &wt, const NativeHead *head,
     if (!wo) { err = "mtp: output.weight is missing"; return false; }
     n_vocab_ = wo->ne1;
     if (head == nullptr || !head->loaded()) { err = "mtp: the draft layer needs the native head (--native)"; return false; }
-    if (head_logits_ == nullptr &&
-        DPCT_CHECK_ERROR(head_logits_ = sycl::malloc_device<float>(
-                             (size_t)max_t_ * (size_t)n_vocab_,
-                             dpct::get_in_order_queue())) != 0) {
-        err = "mtp: the draft logits do not fit";
-        return false;
+    if (head_logits_ == nullptr) {
+        head_logits_ = (float*) strata::ze::malloc_device((size_t) max_t_ * (size_t) n_vocab_ * sizeof(float));
+        if (head_logits_ == nullptr) {
+            err = "mtp: the draft logits do not fit";
+            return false;
+        }
     }
     if (shared != nullptr) {
         if (shared->head_ != head || shared->device_ != device_ ||
@@ -753,22 +645,18 @@ bool MtpDrafter::bind(const WeightTable &wt, const NativeHead *head,
         if (read_file(vocab_file(), raw) && raw.size() >= 4 && raw.size() % 4 == 0) {
             n_dvocab_ = (int64_t) (raw.size() / 4);
             const int64_t row_bytes = (int64_t) head->row_bytes();   // a vocabulary row of the native head
-            if (DPCT_CHECK_ERROR(dvocab_ = (int32_t *)sycl::malloc_device(
-                                     raw.size(), dpct::get_in_order_queue())) !=
-                    0 ||
-                DPCT_CHECK_ERROR(dhead_ = (uint8_t *)sycl::malloc_device(
-                                     (size_t)(n_dvocab_ * row_bytes),
-                                     dpct::get_in_order_queue())) != 0 ||
-                dvocab_ == nullptr || dhead_ == nullptr) {   // Level Zero returns null when the VRAM is full
+            dvocab_ = (int32_t*) strata::ze::malloc_device(raw.size());
+            dhead_ = dvocab_ != nullptr ? (uint8_t*) strata::ze::malloc_device((size_t) (n_dvocab_ * row_bytes)) : nullptr;
+            if (dvocab_ == nullptr || dhead_ == nullptr) {   // Level Zero returns null when the VRAM is full
                 err = "mtp: the draft head does not fit";
                 draft_head_hint(n_dvocab_, row_bytes);
                 return false;
             }
-            dpct::get_in_order_queue().memcpy(dvocab_, raw.data(), raw.size()).wait();
+            strata::ze::copy_sync(dvocab_, raw.data(), raw.size());
             dvocab_host_.resize((size_t) n_dvocab_);
             std::memcpy(dvocab_host_.data(), raw.data(), raw.size());
             strata::kernels::gather_rows((const uint8_t*) head->weights(), row_bytes, dvocab_, n_dvocab_, dhead_, nullptr);
-            dpct::get_current_device().queues_wait_and_throw();
+            strata::ze::device_sync();
             vram_ += (uint64_t) (n_dvocab_ * row_bytes) + raw.size();
             std::fprintf(stderr, "strata mtp: draft head over %lld tokens (%.1f MiB)\n", (long long) n_dvocab_,
                          (double) (n_dvocab_ * row_bytes) / 1048576.0);
@@ -782,14 +670,9 @@ bool MtpDrafter::bind(const WeightTable &wt, const NativeHead *head,
     if (coupled_draft_env() && cparams_ == nullptr && !setup_coupled(err)) return false;
     return true;
 }
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
 
 // The layer for T rows.  full = false stops after the K/V append (the prompt only needs the cache).
-bool MtpDrafter::record_forward(int T, int step_row0, dpct::queue_ptr cs,
+bool MtpDrafter::record_forward(int T, int step_row0, strata::ze::Stream* cs,
                                 std::string &err) {
     // step_row0 >= 0: the full layer on step rows [step_row0, +T); step_row0 < 0: K/V only on rows [-1 - step_row0, +T)
     const bool full = step_row0 >= 0;
@@ -798,7 +681,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, dpct::queue_ptr cs,
     return !full || record_rest(step_row0, cs, err);
 }
 
-bool MtpDrafter::record_front(int T, int row0, dpct::queue_ptr cs,
+bool MtpDrafter::record_front(int T, int row0, strata::ze::Stream* cs,
                               std::string &err) {
     using namespace strata::kernels;
     const ModelGeometry& g = *g_;
@@ -907,7 +790,7 @@ bool MtpDrafter::record_front(int T, int row0, dpct::queue_ptr cs,
 }
 
 void MtpDrafter::norm_rope(float *data, const float *gamma, int rows, int cols,
-                           const int32_t *p, dpct::queue_ptr cs) {
+                           const int32_t *p, strata::ze::Stream* cs) {
     using namespace strata::kernels;
     const QsaShapes s = shapes_of(*g_);
     native_qsa_rms_norm_weighted(data, gamma, data, cols, rows, EPS, cs);
@@ -915,7 +798,7 @@ void MtpDrafter::norm_rope(float *data, const float *gamma, int rows, int cols,
     else rope_neox_apply(data, data, rows, cols, (int) s.n_rot, st_.cos_tab, st_.sin_tab, p, cs);
 }
 
-bool MtpDrafter::record_rest(int step_row, dpct::queue_ptr cs,
+bool MtpDrafter::record_rest(int step_row, strata::ze::Stream* cs,
                              std::string &err) {
     using namespace strata::kernels;
     const ModelGeometry& g = *g_;
@@ -939,19 +822,7 @@ bool MtpDrafter::record_rest(int step_row, dpct::queue_ptr cs,
             native_qsa_rms_norm_rope(qfull_, (int) (2 * HD), f32("self_attn.q_norm.weight"), qcur_, (int) (T * NH),
                                      (int) HD, (int) s.n_rot, EPS, rope_scaling(), pos, cs);
         } else {
-            /*
-            DPCT1124: cudaMemcpy2DAsync is migrated to asynchronous memcpy
-            API. While the origin API might be synchronous, it depends on the
-            type of operand memory, so you may need to call wait() on event
-            return by memcpy API to ensure synchronization behavior.
-            */
-            if (DPCT_CHECK_ERROR(dpct::async_dpct_memcpy(
-                    qcur_, (size_t)HD * 4, qfull_, (size_t)HD * 2 * 4,
-                    (size_t)HD * 4, (size_t)(T * NH), dpct::device_to_device,
-                    *cs)) != 0) {
-                err = "mtp: q split failed";
-                return false;
-            }
+            cs->memcpy_2d(qcur_, (size_t) HD * 4, qfull_, (size_t) HD * 2 * 4, (size_t) HD * 4, (size_t) (T * NH));
             norm_rope(qcur_, f32("self_attn.q_norm.weight"), (int) (T * NH), (int) HD, pos, cs);
         }
         if (st_.kv_rot) fwht256_inplace_cuda(qcur_, (int64_t) T * NH, cs);
@@ -1008,20 +879,10 @@ bool MtpDrafter::record_rest(int step_row, dpct::queue_ptr cs,
             return v == nullptr || std::atoi(v) != 0;
 #endif
         }();
-        dpct::queue_ptr sh_cs = cs;
+        strata::ze::Stream* sh_cs = cs;
         if (branch_on) {
-            /*
-            DPCT1024: The original code returned the error code that was
-            further consumed by the program logic. This original code was
-            replaced with 0. You may need to rewrite the program logic consuming
-            the error code.
-            */
-            if (DPCT_CHECK_ERROR(dpct::sync_barrier(sh_fork_, cs)) != 0 ||
-                DPCT_CHECK_ERROR(
-                    (side_)->ext_oneapi_submit_barrier({*sh_fork_})) != 0) {
-                err = "mtp: the shared expert's branch";
-                return false;
-            }
+            cs->record(*sh_fork_);
+            side_->wait(*sh_fork_);
             sh_cs = side_;
         }
         auto shared_rows = [&]() {
@@ -1034,15 +895,7 @@ bool MtpDrafter::record_rest(int step_row, dpct::queue_ptr cs,
         };
         if (branch_on) {
             shared_rows();
-            /*
-            DPCT1024: The original code returned the error code that was
-            further consumed by the program logic. This original code was
-            replaced with 0. You may need to rewrite the program logic consuming
-            the error code.
-            */
-            if (DPCT_CHECK_ERROR(dpct::sync_barrier(sh_join_, side_)) != 0) {
-              err = "mtp: the shared expert's branch"; return false;
-            }
+            side_->record(*sh_join_);
         }
         // #783 PR-c (stuchapin909): a multi-token window routes in two launches (one router GEMV reading the weight once,
         // one top-10 over all rows - each row bitwise the single-token call) and combines in one
@@ -1062,10 +915,7 @@ bool MtpDrafter::record_rest(int step_row, dpct::queue_ptr cs,
         moe_grouped_s2(grp_ptr_, grp_start_, grp_counts_, hit_dst_, hit_slot_, (int64_t) T * K, (int64_t) T * K, hit_xq_,
                        hit_xs_, hit_scratch_, parts_, cs);
         if (branch_on) {
-            if (DPCT_CHECK_ERROR(cs->ext_oneapi_submit_barrier({*sh_join_})) !=
-                0) {
-              err = "mtp: the shared expert's join"; return false;
-            }
+            cs->wait(*sh_join_);
         } else {
             shared_rows();
         }
@@ -1152,87 +1002,44 @@ bool MtpDrafter::record_rest(int step_row, dpct::queue_ptr cs,
 }
 
 namespace {
-bool finish_capture(dpct::queue_ptr cs, bool ok,
-                    dpct::experimental::command_graph_exec_ptr &exec,
-                    const char *what, std::string &err) try {
-    dpct::experimental::command_graph_ptr graph = nullptr;
-    const dpct::err0 ce =
-        DPCT_CHECK_ERROR(dpct::experimental::end_recording(cs, &graph));
+bool finish_capture(strata::ze::Stream* cs, bool ok,
+                    strata::ze::Graph* &exec,
+                    const char *what, std::string &err) {
+    strata::ze::Graph* graph = cs->end_capture();
     if (!ok) {
-        if (graph) delete (graph);
+        delete graph;
         return false;
     }
-    if (ce != 0 ||
-        DPCT_CHECK_ERROR(
-            exec = new sycl::ext::oneapi::experimental::command_graph<
-                sycl::ext::oneapi::experimental::graph_state::executable>(
-                graph->finalize())) != 0) {
-        if (graph) delete (graph);
-        /*
-        DPCT1009: SYCL reports errors using exceptions and does not use
-        error codes. Please replace the "get_error_string_dummy(...)" with a
-        real error-handling function.
-        */
-        err = std::string("mtp: ") + what +
-              " capture: " + dpct::get_error_string_dummy(ce);
-        return false;
-    }
-    delete (graph);
-    // an explicit upload: the first launch's implicit one blocked behind a device-side spin (verify.cpp)
-    /*
-    DPCT1007: Migration of cudaGraphUpload is not supported.
-    */
-    // no cudaGraphUpload on SYCL: a finalized command_graph is already resident
-    cs->wait();
+    exec = graph;
+    cs->sync();
     return true;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
 }
 }  // namespace
 
-bool MtpDrafter::capture_prefill(int T, std::string &err) try {
+bool MtpDrafter::capture_prefill(int T, std::string &err) {
     if (prefill_exec_[T]) return true;
     using namespace strata::kernels;
-    if (DPCT_CHECK_ERROR(dpct::experimental::begin_recording(cs_)) != 0) {
-        err = "mtp: begin capture"; return false;
-    }
+    cs_->begin_capture();
     copy_i32_from_mapped(tok_, m_tok_, T, cs_);
     copy_i32_from_mapped(step_, m_step_, (int64_t) T * 4, cs_);
     copy_i32_from_mapped(pos_, m_pos_, (int64_t) T * g_->n_head, cs_);
     const bool ok = record_forward(T, -1, cs_, err);   // K/V only, rows [0, T)
     return finish_capture(cs_, ok, prefill_exec_[T], "prefill", err);
 }
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
 
-bool MtpDrafter::capture_prefill_dev(int T, std::string &err) try {
+bool MtpDrafter::capture_prefill_dev(int T, std::string &err) {
     if (prefill_dev_exec_[T]) return true;
-    if (DPCT_CHECK_ERROR(dpct::experimental::begin_recording(cs_)) != 0) {
-        err = "mtp: begin capture"; return false;
-    }
+    cs_->begin_capture();
     const bool ok = record_forward(T, -1, cs_, err);   // K/V only, rows [0, T); tok_/step_/pos_ filled before launch
     return finish_capture(cs_, ok, prefill_dev_exec_[T], "prefill (device inputs)", err);
 }
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
 
-bool MtpDrafter::capture_round(int T, bool coupled, std::string &err) try {
-    dpct::experimental::command_graph_exec_ptr& exec = coupled ? round_exec_c_[T] : round_exec_[T];
+bool MtpDrafter::capture_round(int T, bool coupled, std::string &err) {
+    strata::ze::Graph*& exec = coupled ? round_exec_c_[T] : round_exec_[T];
     if (exec) return true;
     using namespace strata::kernels;
     const int64_t HCN = g_->hc * g_->n_embd;
-    if (DPCT_CHECK_ERROR(dpct::experimental::begin_recording(cs_)) != 0) {
-        err = "mtp: begin capture"; return false;
-    }
+    cs_->begin_capture();
     bool ok = true;
     // coupled: the request's chain and the penalty history's base, for this round's drafts
     if (coupled) coupled_draft_stage(m_cparams_, m_chist_, cparams_, cring_, kCoupledHistCap, cs_);
@@ -1270,23 +1077,16 @@ bool MtpDrafter::capture_round(int T, bool coupled, std::string &err) try {
     if (ok && force_on_ && !coupled) force_token(tok_, m_force_, 0, cs_);   // chain_launch: step 1's input
     return finish_capture(cs_, ok, exec, coupled ? "round (coupled)" : "round", err);
 }
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
 
 // Chain step j (1..max_t-2): one row at the cell staged in step row `max_t + j - 1`, from the previous step's
 // residual and token (left in Rin_[0] / tok_[0] by mtp_select); draft j and its probability to the mapped outputs.
-bool MtpDrafter::capture_step(int j, bool coupled, std::string &err) try {
-    dpct::experimental::command_graph_exec_ptr& exec = coupled ? step_exec_c_[j] : step_exec_[j];
+bool MtpDrafter::capture_step(int j, bool coupled, std::string &err) {
+    strata::ze::Graph*& exec = coupled ? step_exec_c_[j] : step_exec_[j];
     if (exec) return true;
     using namespace strata::kernels;
     const int64_t HCN = g_->hc * g_->n_embd;
     const int row = max_t_ + j - 1;
-    if (DPCT_CHECK_ERROR(dpct::experimental::begin_recording(cs_)) != 0) {
-        err = "mtp: begin capture"; return false;
-    }
+    cs_->begin_capture();
 #if defined(STRATA_USE_HIP)
     copy_i32_from_mapped(step_ + row * 4, m_step_ + row * 4, 4, cs_);
     copy_i32_from_mapped(pos_ + row * g_->n_head, m_pos_ + row * g_->n_head, g_->n_head, cs_);
@@ -1303,11 +1103,6 @@ bool MtpDrafter::capture_step(int j, bool coupled, std::string &err) try {
     if (ok && force_on_ && !coupled) force_token(tok_, m_force_, j, cs_);   // chain_launch: step j+1's input
     return finish_capture(cs_, ok, exec, coupled ? "step (coupled)" : "step", err);
 }
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
 
 void MtpDrafter::kv_restore(int64_t upto) {
     const OnDevice on_device(device_);
@@ -1316,19 +1111,18 @@ void MtpDrafter::kv_restore(int64_t upto) {
     const strata::kernels::QsaShapes s = shapes_of(*g_);
     const int64_t b1 = (upto + s.page_size - 1) / s.page_size, b0 = std::max<int64_t>(0, b1 - st_.n_slots);
     strata::kernels::kv_ring_restore(qsa_attn_pools(st_), st_.host, qsa_kv_format(st_), b0, b1, st_.n_slots, s, cs_);
-    cs_->wait();
+    cs_->sync();
 }
 
-bool MtpDrafter::prepare_prefill(std::string &err) try {
+bool MtpDrafter::prepare_prefill(std::string &err) {
     const OnDevice on_device(device_);
     const int64_t per_row = 1 + 4 + g_->n_head;
     if (pf_cap_ < (int64_t) max_t_ * per_row) {
-        if (pf_dev_) sycl::free(pf_dev_, dpct::get_in_order_queue());
+        if (pf_dev_) strata::ze::free(pf_dev_);
         pf_dev_ = nullptr;
         pf_cap_ = 0;
-        if (DPCT_CHECK_ERROR(pf_dev_ = sycl::malloc_device<int32_t>(
-                                 (size_t)(max_t_ * per_row),
-                                 dpct::get_in_order_queue())) != 0) {
+        pf_dev_ = (int32_t*) strata::ze::malloc_device((size_t) (max_t_ * per_row) * sizeof(int32_t));
+        if (pf_dev_ == nullptr) {
             err = "mtp prefill: the input records do not fit";
             return false;
         }
@@ -1337,11 +1131,6 @@ bool MtpDrafter::prepare_prefill(std::string &err) try {
     for (int T = 1; T <= max_t_; ++T)
         if (!capture_prefill_dev(T, err)) return false;   // (STRATA_MTP_PREFILL_SYNC's loop syncs anyway)
     return true;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
 }
 
 bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err,
@@ -1372,12 +1161,11 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
     const int64_t NHp = g_->n_head, per_row = 1 + 4 + NHp;
     if (!per_group_sync && n > 0) {
         if (pf_cap_ < n * per_row) {
-            if (pf_dev_) sycl::free(pf_dev_, dpct::get_in_order_queue());
+            if (pf_dev_) strata::ze::free(pf_dev_);
             pf_dev_ = nullptr;
             pf_cap_ = 0;
-            if (DPCT_CHECK_ERROR(pf_dev_ = sycl::malloc_device<int32_t>(
-                                     (size_t)(n * per_row),
-                                     dpct::get_in_order_queue())) != 0) {
+            pf_dev_ = (int32_t*) strata::ze::malloc_device((size_t) (n * per_row) * sizeof(int32_t));
+            if (pf_dev_ == nullptr) {
                 err = "mtp prefill: the input records do not fit";
                 return false;
             }
@@ -1396,95 +1184,72 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
             stp[i * 4 + 3] = (int32_t) (cell + 1);
             for (int64_t h = 0; h < NHp; ++h) ps[i * NHp + h] = (int32_t) cell;
         }
-        /*
-        DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy API.
-        While the origin API might be synchronous, it depends on the type of
-        operand memory, so you may need to call wait() on event return by memcpy
-        API to ensure synchronization behavior.
-        */
-        if (DPCT_CHECK_ERROR(cs_->memcpy(pf_dev_, rec.data(),
-                                         rec.size() * sizeof(int32_t))) != 0) {
-            err = "mtp prefill: the input records upload failed";
-            return false;
-        }
+        cs_->memcpy(pf_dev_, rec.data(), rec.size() * sizeof(int32_t));
         const int32_t* d_tk = pf_dev_;
         const int32_t* d_stp = d_tk + n;
         const int32_t* d_ps = d_stp + 4 * n;
+        static const bool trace = std::getenv("STRATA_DRAFT_PREFILL_TRACE") != nullptr;
+        const int64_t ngroups = (n + max_t_ - 1) / max_t_;
+        uint64_t* marks = trace && sync ? (uint64_t*) strata::ze::malloc_host((size_t) ngroups * 2 * sizeof(uint64_t)) : nullptr;
+        if (marks) std::memset(marks, 0, (size_t) ngroups * 2 * sizeof(uint64_t));
+        int64_t gi = 0;
+        const Clock::time_point tq = Clock::now();
         for (int64_t c = 0; c < n; c += max_t_) {
             const int T = (int) std::min<int64_t>(max_t_, n - c);
             if (cell0 + c + T <= first_needed) continue;
             if (!capture_prefill_dev(T, err)) return false;
-            /*
-            DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy
-            API. While the origin API might be synchronous, it depends on the
-            type of operand memory, so you may need to call wait() on event
-            return by memcpy API to ensure synchronization behavior.
-            */
-            if (DPCT_CHECK_ERROR(cs_->memcpy(tok_, d_tk + c, (size_t)T * 4)) !=
-                    0 ||
-                /*
-                DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy
-                API. While the origin API might be synchronous, it depends on
-                the type of operand memory, so you may need to call wait() on
-                event return by memcpy API to ensure synchronization behavior.
-                */
-                DPCT_CHECK_ERROR(
-                    cs_->memcpy(step_, d_stp + c * 4, (size_t)T * 16)) != 0 ||
-                /*
-                DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy
-                API. While the origin API might be synchronous, it depends on
-                the type of operand memory, so you may need to call wait() on
-                event return by memcpy API to ensure synchronization behavior.
-                */
-                DPCT_CHECK_ERROR(cs_->memcpy(pos_, d_ps + c * NHp,
-                                             (size_t)(T * NHp) * 4)) != 0 ||
-                /*
-                DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy
-                API. While the origin API might be synchronous, it depends on
-                the type of operand memory, so you may need to call wait() on
-                event return by memcpy API to ensure synchronization behavior.
-                */
-                DPCT_CHECK_ERROR(
-                    cs_->memcpy(Rin_, R_rows + (size_t)c * HCN,
-                                (size_t)T * HCN * sizeof(float))) != 0 ||
-                DPCT_CHECK_ERROR(
-                    (cs_)->ext_oneapi_graph(*prefill_dev_exec_[T])) != 0) {
-                /*
-                DPCT1009: SYCL reports errors using exceptions and does not
-                use error codes. Please replace the
-                "get_error_string_dummy(...)" with a real error-handling
-                function.
-                */
-                /*
-                DPCT1010: SYCL uses exceptions to report errors and does not
-                use the error codes. The cudaGetLastError function call was
-                replaced with 0. You need to rewrite this code.
-                */
-                err = std::string("mtp prefill: ") +
-                      dpct::get_error_string_dummy(0);
-                return false;
-            }
+            cs_->memcpy(tok_, d_tk + c, (size_t) T * 4);
+            cs_->memcpy(step_, d_stp + c * 4, (size_t) T * 16);
+            cs_->memcpy(pos_, d_ps + c * NHp, (size_t) (T * NHp) * 4);
+            cs_->memcpy(Rin_, R_rows + (size_t) c * HCN, (size_t) T * HCN * sizeof(float));
+            if (marks) cs_->write_timestamp(marks + 2 * gi);
+            cs_->launch(*prefill_dev_exec_[T]);
+            if (marks) cs_->write_timestamp(marks + 2 * gi + 1);
+            ++gi;
         }
         if (!sync) {   // the caller orders on stream(); the records are staged (a pageable copy returns once taken)
-            (void)DPCT_CHECK_ERROR(((cs_)->ext_oneapi_empty()));
             ms_prefill += ms_since(t0);
             return true;
         }
-        if (DPCT_CHECK_ERROR(cs_->wait()) != 0) {
-            /*
-            DPCT1009: SYCL reports errors using exceptions and does not use
-            error codes. Please replace the "get_error_string_dummy(...)" with a
-            real error-handling function.
-            */
-            /*
-            DPCT1010: SYCL uses exceptions to report errors and does not use
-            the error codes. The cudaGetLastError function call was replaced
-            with 0. You need to rewrite this code.
-            */
-            err =
-                std::string("mtp prefill: ") + dpct::get_error_string_dummy(0);
-            return false;
+        if (marks) {
+            std::fprintf(stderr, "strata mtp: prefill trace: GPU %d, %lld groups of up to %d rows queued in %.1f ms (cells %lld-%lld)\n",
+                         device_, (long long) gi, max_t_, ms_since(tq), (long long) cell0, (long long) (cell0 + n));
+            const Clock::time_point tw = Clock::now();
+            bool done = false;
+            auto last_mark = [&] {
+                int64_t last = -1;
+                for (int64_t i = 0; i < 2 * gi; ++i)
+                    if (((volatile uint64_t*) marks)[i] != 0) last = i;
+                return last;
+            };
+            while (!(done = cs_->sync_for(5000)) && ms_since(tw) < 50000.0) {
+                const int64_t last = last_mark();
+                std::fprintf(stderr, "strata mtp: prefill trace: %.0f ms waiting, last mark %lld of %lld (group %lld, %s)\n",
+                             ms_since(tw), (long long) last, (long long) (2 * gi), (long long) (last / 2),
+                             last < 0 ? "none" : last % 2 == 0 ? "inputs copied, graph not done" : "graph done");
+            }
+            if (!done) {
+                const int64_t last = last_mark();
+                std::fprintf(stderr, "strata mtp: prefill trace: the GPU stopped after mark %lld of %lld (group %lld of %lld)\n",
+                             (long long) last, (long long) (2 * gi), (long long) (last / 2), (long long) gi);
+                err = "mtp prefill: the GPU stopped (STRATA_DRAFT_PREFILL_TRACE)";
+                return false;
+            }
+            const strata::ze::DeviceInfo& di = strata::ze::device_info(device_);
+            std::vector<double> ms;
+            for (int64_t i = 0; i < gi; ++i)
+                ms.push_back((double) ((marks[2 * i + 1] - marks[2 * i]) & di.timestamp_mask) * (double) di.timer_ns_num /
+                             (double) di.timer_ns_den / 1e6);
+            std::vector<double> sorted = ms;
+            std::sort(sorted.begin(), sorted.end());
+            const size_t worst = (size_t) (std::max_element(ms.begin(), ms.end()) - ms.begin());
+            std::fprintf(stderr, "strata mtp: prefill trace: done after %.1f ms; graph ms per group min %.3f median %.3f max %.3f "
+                                 "(group %zu)\n", ms_since(tw), sorted.front(), sorted[sorted.size() / 2], sorted.back(), worst);
+            strata::ze::free(marks);
+            ms_prefill += ms_since(t0);
+            return true;
         }
+        cs_->sync();
         ms_prefill += ms_since(t0);
         return true;
     }
@@ -1501,31 +1266,9 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
             h_step_[t * 4 + 3] = (int32_t) (cell + 1);
             for (int64_t h = 0; h < g_->n_head; ++h) h_pos_[t * g_->n_head + h] = (int32_t) cell;
         }
-        /*
-        DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy API.
-        While the origin API might be synchronous, it depends on the type of
-        operand memory, so you may need to call wait() on event return by memcpy
-        API to ensure synchronization behavior.
-        */
-        if (DPCT_CHECK_ERROR(cs_->memcpy(Rin_, R_rows + (size_t)c * HCN,
-                                         (size_t)T * HCN * sizeof(float))) !=
-                0 ||
-            DPCT_CHECK_ERROR((cs_)->ext_oneapi_graph(*prefill_exec_[T])) != 0 ||
-            DPCT_CHECK_ERROR(cs_->wait()) != 0) {
-            /*
-            DPCT1009: SYCL reports errors using exceptions and does not use
-            error codes. Please replace the "get_error_string_dummy(...)" with a
-            real error-handling function.
-            */
-            /*
-            DPCT1010: SYCL uses exceptions to report errors and does not use
-            the error codes. The cudaGetLastError function call was replaced
-            with 0. You need to rewrite this code.
-            */
-            err =
-                std::string("mtp prefill: ") + dpct::get_error_string_dummy(0);
-            return false;
-        }
+        cs_->memcpy(Rin_, R_rows + (size_t) c * HCN, (size_t) T * HCN * sizeof(float));
+        cs_->launch(*prefill_exec_[T]);
+        cs_->sync();
     }
     ms_prefill += ms_since(t0);
     return true;
@@ -1581,40 +1324,9 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
 
     int n = 0;
     if (min_p <= 0.0f && max_steps > 0) {
-        if (DPCT_CHECK_ERROR((cs_)->ext_oneapi_graph(
-                *(cp ? round_exec_c_[T] : round_exec_[T]))) != 0) {
-            /*
-            DPCT1009: SYCL reports errors using exceptions and does not use
-            error codes. Please replace the "get_error_string_dummy(...)" with a
-            real error-handling function.
-            */
-            /*
-            DPCT1010: SYCL uses exceptions to report errors and does not use
-            the error codes. The cudaGetLastError function call was replaced
-            with 0. You need to rewrite this code.
-            */
-            err = std::string("mtp draft: ") + dpct::get_error_string_dummy(0);
-            return false;
-        }
-        for (int j = 1; j < max_steps; ++j) {
-            if (DPCT_CHECK_ERROR((cs_)->ext_oneapi_graph(
-                    *(cp ? step_exec_c_[j] : step_exec_[j]))) != 0) {
-                /*
-                DPCT1009: SYCL reports errors using exceptions and does not
-                use error codes. Please replace the
-                "get_error_string_dummy(...)" with a real error-handling
-                function.
-                */
-                /*
-                DPCT1010: SYCL uses exceptions to report errors and does not
-                use the error codes. The cudaGetLastError function call was
-                replaced with 0. You need to rewrite this code.
-                */
-                err = std::string("mtp draft step: ") + dpct::get_error_string_dummy(0);
-                return false;
-            }
-        }
-        (void)DPCT_CHECK_ERROR(((cs_)->ext_oneapi_empty()));
+        cs_->launch(*(cp ? round_exec_c_[T] : round_exec_[T]));
+        for (int j = 1; j < max_steps; ++j)
+            cs_->launch(*(cp ? step_exec_c_[j] : step_exec_[j]));
         prefetch_ple(tokens[a]);
         for (int j = 0; j + 1 < max_steps; ++j) {
             uint32_t spins = 0;
@@ -1622,66 +1334,29 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
 #if defined(_WIN32) || defined(__x86_64__)
                 _mm_pause();
 #endif
-                if ((++spins & 1023u) == 0 &&
-                    ((cs_)->ext_oneapi_empty() ? 0 : 1) != 1) break;   /* SYCL port: DPCT_CHECK_ERROR of ext_oneapi_empty() was always 0, so the wait gave up after 1024 spins and read a draft the GPU had not written */
+                if ((++spins & 1023u) == 0 && cs_->idle()) break;
             }
             drafts[j] = ((volatile int32_t*) h_out_)[j];
             if (probs) probs[j] = ((volatile float*) h_prob_)[j];
             prefetch_ple(drafts[j]);
         }
-        if (DPCT_CHECK_ERROR(cs_->wait()) != 0) {
-            /*
-            DPCT1009: SYCL reports errors using exceptions and does not use
-            error codes. Please replace the "get_error_string_dummy(...)" with a
-            real error-handling function.
-            */
-            /*
-            DPCT1010: SYCL uses exceptions to report errors and does not use
-            the error codes. The cudaGetLastError function call was replaced
-            with 0. You need to rewrite this code.
-            */
-            err = std::string("mtp draft: ") + dpct::get_error_string_dummy(0);
-            return false;
-        }
+        cs_->sync();
         const int last = max_steps - 1;
         drafts[last] = ((volatile int32_t*) h_out_)[last];
         if (probs) probs[last] = ((volatile float*) h_prob_)[last];
         prefetch_ple(drafts[last]);
         n = max_steps;
     } else if (max_steps > 0) {
-        if (DPCT_CHECK_ERROR((cs_)->ext_oneapi_graph(
-                *(cp ? round_exec_c_[T] : round_exec_[T]))) != 0) {
-            /*
-            DPCT1009: SYCL reports errors using exceptions and does not use
-            error codes. Please replace the "get_error_string_dummy(...)" with a
-            real error-handling function.
-            */
-            /*
-            DPCT1010: SYCL uses exceptions to report errors and does not use
-            the error codes. The cudaGetLastError function call was replaced
-            with 0. You need to rewrite this code.
-            */
-            err = std::string("mtp draft: ") + dpct::get_error_string_dummy(0);
-            return false;
-        }
-        (void)DPCT_CHECK_ERROR(((cs_)->ext_oneapi_empty()));
+        cs_->launch(*(cp ? round_exec_c_[T] : round_exec_[T]));
         prefetch_ple(tokens[a]);
         auto wait_step = [&](int j) {
-            try {
-        uint32_t spins = 0;
+            uint32_t spins = 0;
             while (((volatile int32_t*) h_out_)[j] < 0) {
 #if defined(_WIN32) || defined(__x86_64__)
                 _mm_pause();
 #endif
-                if ((++spins & 1023u) == 0 &&
-                    ((cs_)->ext_oneapi_empty() ? 0 : 1) != 1) break;   /* SYCL port: DPCT_CHECK_ERROR of ext_oneapi_empty() was always 0, so the wait gave up after 1024 spins and read a draft the GPU had not written */
+                if ((++spins & 1023u) == 0 && cs_->idle()) break;
             }
-        }
-        catch (sycl::exception const &exc) {
-          std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-                    << ", line:" << __LINE__ << std::endl;
-          std::exit(1);
-        }
         };
         wait_step(0);
         drafts[0] = ((volatile int32_t*) h_out_)[0];
@@ -1689,23 +1364,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         if (probs) probs[0] = pj;
         n = 1;
         for (int j = 1; j < max_steps && pj >= min_p; ++j) {
-            if (DPCT_CHECK_ERROR((cs_)->ext_oneapi_graph(
-                    *(cp ? step_exec_c_[j] : step_exec_[j]))) != 0) {
-                /*
-                DPCT1009: SYCL reports errors using exceptions and does not
-                use error codes. Please replace the
-                "get_error_string_dummy(...)" with a real error-handling
-                function.
-                */
-                /*
-                DPCT1010: SYCL uses exceptions to report errors and does not
-                use the error codes. The cudaGetLastError function call was
-                replaced with 0. You need to rewrite this code.
-                */
-                err = std::string("mtp draft step: ") + dpct::get_error_string_dummy(0);
-                return false;
-            }
-            (void)DPCT_CHECK_ERROR(((cs_)->ext_oneapi_empty()));
+            cs_->launch(*(cp ? step_exec_c_[j] : step_exec_[j]));
             prefetch_ple(drafts[j - 1]);
             wait_step(j);
             drafts[j] = ((volatile int32_t*) h_out_)[j];
@@ -1714,20 +1373,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
             ++n;
         }
         prefetch_ple(drafts[n - 1]);
-        if (DPCT_CHECK_ERROR(cs_->wait()) != 0) {
-            /*
-            DPCT1009: SYCL reports errors using exceptions and does not use
-            error codes. Please replace the "get_error_string_dummy(...)" with a
-            real error-handling function.
-            */
-            /*
-            DPCT1010: SYCL uses exceptions to report errors and does not use
-            the error codes. The cudaGetLastError function call was replaced
-            with 0. You need to rewrite this code.
-            */
-            err = std::string("mtp draft: ") + dpct::get_error_string_dummy(0);
-            return false;
-        }
+        cs_->sync();
     }
     for (int j = n; j < max_t_ - 1; ++j) { drafts[j] = 0; if (probs) probs[j] = 0.0f; }
     if (n_drafts) *n_drafts = n;
@@ -1736,56 +1382,28 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     return true;
 }
 
-bool MtpDrafter::stage_source_R(int T, std::string &err) try {
+bool MtpDrafter::stage_source_R(int T, std::string &err) {
     if (src_R_ == nullptr || src_R_ == window_R_) return true;
-    /*
-    DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy API. While
-    the origin API might be synchronous, it depends on the type of operand
-    memory, so you may need to call wait() on event return by memcpy API to
-    ensure synchronization behavior.
-    */
-    if (DPCT_CHECK_ERROR(cs_->memcpy((void *)window_R_, src_R_,
-                                     (size_t)T * (size_t)(g_->hc * g_->n_embd) *
-                                         sizeof(float))) != 0) {
-        err = "mtp: staging the window's residual rows failed";
-        return false;
-    }
+    cs_->memcpy((void*) window_R_, src_R_, (size_t) T * (size_t) (g_->hc * g_->n_embd) * sizeof(float));
     return true;
 }
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
 
-bool MtpDrafter::prepare_chain(std::string &err) try {
+bool MtpDrafter::prepare_chain(std::string &err) {
     const OnDevice on_device(device_);
     if (!force_on_ || h_force_ == nullptr) { err = "mtp: chains need set_force_capture before load"; return false; }
     for (int T = 1; T <= max_t_; ++T)
         if (!capture_round(T, false, err)) return false;
     for (int j = 1; j <= max_t_ - 2; ++j)
         if (!capture_step(j, false, err)) return false;
-    if (ev_chain_ == nullptr &&
-        DPCT_CHECK_ERROR(ev_chain_ = new sycl::event()) != 0) {
-        err = "mtp: event creation failed";
-        return false;
-    }
-    for (dpct::event_ptr &e : ev_step_)
-        if (e == nullptr && DPCT_CHECK_ERROR(e = new sycl::event()) != 0) {
-            err = "mtp: event creation failed";
-            return false;
-        }
+    if (ev_chain_ == nullptr) ev_chain_ = new strata::ze::Event();
+    for (strata::ze::Event* &e : ev_step_)
+        if (e == nullptr) e = new strata::ze::Event();
     return true;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
 }
 
 bool MtpDrafter::chain_launch(int T, const int32_t *tokens, int64_t p, int a,
                               const int32_t *force, int n_force, int n_out,
-                              int n_early, std::string &err) try {
+                              int n_early, std::string &err) {
     const OnDevice on_device(device_);
     if (chain_live_) { err = "mtp: a chain is already in flight"; return false; }
     if (!force_on_ || ev_chain_ == nullptr) { err = "mtp: chains need prepare_chain"; return false; }
@@ -1818,44 +1436,13 @@ bool MtpDrafter::chain_launch(int T, const int32_t *tokens, int64_t p, int a,
     std::atomic_thread_fence(std::memory_order_seq_cst);
     if (!stage_source_R(T, err)) return false;
     chain_early_ = std::max(0, std::min(n_early, n_out));
-    bool ok = DPCT_CHECK_ERROR((cs_)->ext_oneapi_graph(*round_exec_[T])) == 0;
-    /*
-    DPCT1024: The original code returned the error code that was further
-    consumed by the program logic. This original code was replaced with 0. You
-    may need to rewrite the program logic consuming the error code.
-    */
-    if (ok && chain_early_ >= 1) ok =
-        DPCT_CHECK_ERROR(dpct::sync_barrier(ev_step_[0], cs_)) == 0;
-    for (int j = 1; ok && j < n_out; ++j) {
-        ok = DPCT_CHECK_ERROR((cs_)->ext_oneapi_graph(*step_exec_[j])) == 0;
-        /*
-        DPCT1024: The original code returned the error code that was further
-        consumed by the program logic. This original code was replaced with 0.
-        You may need to rewrite the program logic consuming the error code.
-        */
-        if (ok && j < chain_early_) ok =
-            DPCT_CHECK_ERROR(dpct::sync_barrier(ev_step_[j], cs_)) == 0;
+    cs_->launch(*round_exec_[T]);
+    if (chain_early_ >= 1) cs_->record(*ev_step_[0]);
+    for (int j = 1; j < n_out; ++j) {
+        cs_->launch(*step_exec_[j]);
+        if (j < chain_early_) cs_->record(*ev_step_[j]);
     }
-    /*
-    DPCT1024: The original code returned the error code that was further
-    consumed by the program logic. This original code was replaced with 0. You
-    may need to rewrite the program logic consuming the error code.
-    */
-    if (!ok || DPCT_CHECK_ERROR(dpct::sync_barrier(ev_chain_, cs_)) != 0) {
-        /*
-        DPCT1009: SYCL reports errors using exceptions and does not use
-        error codes. Please replace the "get_error_string_dummy(...)" with a
-        real error-handling function.
-        */
-        /*
-        DPCT1010: SYCL uses exceptions to report errors and does not use the
-        error codes. The cudaGetLastError function call was replaced with 0. You
-        need to rewrite this code.
-        */
-        err = std::string("mtp chain: ") + dpct::get_error_string_dummy(0);
-        return false;
-    }
-    (void)DPCT_CHECK_ERROR(((cs_)->ext_oneapi_empty())); // WDDM: submit now
+    cs_->record(*ev_chain_);
     steps_seen_ = 0;
     chain_live_ = true;
     chain_n_ = n_out;
@@ -1863,82 +1450,24 @@ bool MtpDrafter::chain_launch(int T, const int32_t *tokens, int64_t p, int a,
     ++rounds;
     return true;
 }
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
 
-int MtpDrafter::chain_outputs_ready(std::string &err) try {
+int MtpDrafter::chain_outputs_ready(std::string &err) {
     if (!chain_live_) return chain_n_;
     const OnDevice on_device(device_);
     while (steps_seen_ < chain_early_) {
-        const dpct::err0 q = dpct::sycl_event_query(ev_step_[steps_seen_]);
-        /*
-        DPCT1001: The statement could not be removed.
-        */
-        /*
-        DPCT1002: Special case error handling if-stmt was detected. You may
-        need to rewrite this code.
-        */
-        if (q == 1) break;
-        /*
-        DPCT1009: SYCL reports errors using exceptions and does not use
-        error codes. Please replace the "get_error_string_dummy(...)" with a
-        real error-handling function.
-        */
-        /*
-        DPCT1001: The statement could not be removed.
-        */
-        /*
-        DPCT1000: Error handling if-stmt was detected but could not be
-        rewritten.
-        */
-        if (q != 0) {
-          err = std::string("mtp chain: ") + dpct::get_error_string_dummy(q);
-          return -1;
-        }
+        if (!ev_step_[steps_seen_]->query()) break;
         chain_tok_[steps_seen_] = ((volatile int32_t*) h_out_)[steps_seen_];
         chain_prob_[steps_seen_] = ((volatile float*) h_prob_)[steps_seen_];
         ++steps_seen_;
     }
     return steps_seen_;
 }
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
 
-int MtpDrafter::chain_poll(std::string &err) try {
+int MtpDrafter::chain_poll(std::string &err) {
     if (!chain_live_) return 1;
     const OnDevice on_device(device_);
-    const dpct::err0 q = dpct::sycl_event_query(ev_chain_);
-    /*
-    DPCT1001: The statement could not be removed.
-    */
-    /*
-    DPCT1002: Special case error handling if-stmt was detected. You may need
-    to rewrite this code.
-    */
-    if (q == 1) return 0;
+    if (!ev_chain_->query()) return 0;
     chain_live_ = false;
-    /*
-    DPCT1009: SYCL reports errors using exceptions and does not use error
-    codes. Please replace the "get_error_string_dummy(...)" with a real
-    error-handling function.
-    */
-    /*
-    DPCT1001: The statement could not be removed.
-    */
-    /*
-    DPCT1000: Error handling if-stmt was detected but could not be
-    rewritten.
-    */
-    if (q != 0) {
-      err = std::string("mtp chain: ") + dpct::get_error_string_dummy(q);
-      return -1;
-    }
     for (int j = 0; j < chain_n_; ++j) {
         chain_tok_[j] = ((volatile int32_t*) h_out_)[j];
         chain_prob_[j] = ((volatile float*) h_prob_)[j];
@@ -1946,32 +1475,18 @@ int MtpDrafter::chain_poll(std::string &err) try {
     for (int j = chain_n_; j < 8; ++j) { chain_tok_[j] = 0; chain_prob_[j] = 0.0f; }
     return 1;
 }
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
 
 bool MtpDrafter::draft_first(int T, const float *R_row, int32_t token,
                              int64_t cell, int32_t *drafts, std::string &err,
-                             float *probs, float min_p, int *n_drafts) try {
+                             float *probs, float min_p, int *n_drafts) {
     const OnDevice on_device(device_);
     // row 0 is the real pair; rows 1.. repeat it and only write cells the next round overwrites
     const int64_t HCN = g_->hc * g_->n_embd;
-    for (int t = 0; t < T; ++t)
-        if (DPCT_CHECK_ERROR(dpct::get_in_order_queue().memcpy(
-                (void *)(window_R_ + (size_t)t * HCN), R_row,
-                (size_t)HCN * sizeof(float)).wait()) != 0) {
-            err = "mtp: staging the first residual failed";
-            return false;
-        }
+    for (int t = 0; t < T; ++t) {
+        strata::ze::copy_sync((void*) (window_R_ + (size_t) t * HCN), R_row, (size_t) HCN * sizeof(float));
+    }
     std::vector<int32_t> toks((size_t) T, token);
     return draft(T, toks.data(), cell, 0, drafts, err, probs, min_p, n_drafts);
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
 }
 
 }  // namespace strata::core

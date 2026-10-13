@@ -13,22 +13,15 @@
 // partials are reduced through shuffle; the CPU walks every chunk in order with its own accumulator shape.
 // The two agree to float rounding and not to the bit, which is the same contract `s_gemv_parity` carries for
 // the same reason.  `bench/micro/moe_hit_parity.cu` is the check.
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
+#include "strata/port.hpp"
 #include "strata/sycl_math.hpp"
-#include "strata/sycl_queue.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/f16_bits.hpp"
 
-#include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 
-#include <atomic>
 #include <cstdint>
-#include <cstdio>
-#include <cstdlib>
 #include <cstring>
 
 namespace strata::kernels {
@@ -110,15 +103,6 @@ row_dot_s2_q8(const uint8_t *__restrict__ codes,
 
 __dpct_inline__ float warp_sum(float v) {
 #pragma unroll
-    /*
-    DPCT1108: '__shfl_down_sync' was migrated with the experimental feature
-    masked sub_group function which may not be supported by all compilers or
-    runtimes. You may need to adjust the code.
-    */
-    /*
-    DPCT1121: Make sure that the "v" which is used in the SYCL group
-    function/algorithm is initialized.
-    */
     for (int off = 16; off > 0; off >>= 1) v +=
         dpct::experimental::shift_sub_group_left(
             0xFFFFFFFFu, sycl::ext::oneapi::this_work_item::get_sub_group(), v,
@@ -217,11 +201,6 @@ __dpct_inline__ void swiglu_quantize_q8_0_scaled_kernel(
 
     float amax = sycl::fabs(xv);
 #pragma unroll
-    /*
-    DPCT1108: '__shfl_xor_sync' was migrated with the experimental feature
-    masked sub_group function which may not be supported by all compilers or
-    runtimes. You may need to adjust the code.
-    */
     for (int off = 16; off > 0; off >>= 1) amax =
         sycl::fmax(amax, dpct::experimental::permute_sub_group_by_xor(
                              0xffffffffu,
@@ -323,17 +302,7 @@ __dpct_inline__ int load_x_chunk(const uint8_t *__restrict__ xb, int X[8]) {
     const unsigned sh = (unsigned) off * 8;
     unsigned v[9];
 #pragma unroll
-    /*
-    DPCT1098: The '*' expression is used instead of the __ldg call. These
-    two expressions do not provide the exact same functionality. Check the
-    generated code for potential precision and/or performance issues.
-    */
     for (int j = 0; j < 8; ++j) v[j] = *(p + j);
-    /*
-    DPCT1098: The '*' expression is used instead of the __ldg call. These
-    two expressions do not provide the exact same functionality. Check the
-    generated code for potential precision and/or performance issues.
-    */
     v[8] = off != 0 ? *(p + 8) : 0u;
     unsigned n[8];
     int hx = 0;
@@ -377,12 +346,6 @@ __dpct_inline__ int chunk_s(const int m[8], const int X[8]) {
 /// `gu_kernel`, new: ONE WARP PER (gate, up) PAIR - row-slots `2r` and `2r + 1`, adjacent in the blob - so each
 /// activation chunk is loaded and regrouped once for both rows.  Per row, the lane's chunks, their order, the float
 /// expression and the shuffle reduction are `row_dot_s2_q8`'s; the outputs land where `gu_kernel` puts them.
-/*
-DPCT1110: The total declared local variable size in device function
-gu_pair_kernel exceeds 128 bytes and may cause high register pressure. Consult
-with your hardware vendor to find the total register size available and adjust
-the code, or use smaller sub-group size to avoid high register pressure.
-*/
 __dpct_inline__ void
 gu_pair_kernel(const uint8_t *__restrict__ blob_base,
                const int32_t *__restrict__ slot_index, long long blob_bytes,
@@ -430,12 +393,6 @@ gu_pair_kernel(const uint8_t *__restrict__ blob_base,
 }
 
 /// `down_kernel`, new: ONE WARP PER PAIR OF ROWS `r, r + 1` of one hit, the intermediate's chunk loaded once for both.
-/*
-DPCT1110: The total declared local variable size in device function
-down_pair_kernel exceeds 128 bytes and may cause high register pressure. Consult
-with your hardware vendor to find the total register size available and adjust
-the code, or use smaller sub-group size to avoid high register pressure.
-*/
 __dpct_inline__ void down_pair_kernel(const uint8_t *__restrict__ blob_base,
                                       const int32_t *__restrict__ slot_index,
                                       const int32_t *__restrict__ dst_index,
@@ -494,12 +451,6 @@ __dpct_inline__ void activation_correction_kernel(const uint8_t *q8,
     int sum = 0;
 #pragma unroll
     for (int j = 0; j < 32; ++j) sum += q[j];
-    /*
-    DPCT1013: The rounding mode could not be specified and the generated
-    code may have different accuracy than the original code. Verify the
-    correctness. SYCL math built-in function rounding mode is aligned with
-    OpenCL C 1.2 standard.
-    */
     hx[c] = scales[c] * (float)sum;
 }
 
@@ -524,80 +475,23 @@ __dpct_inline__ float row_dot_cpu_order(const uint8_t *codes,
                            (const int8_t*) (xq + (size_t) (2 * b) * 34 + 2) + lane * 4);
         const int hi = dot4(codes + b * 16 + 8 + lane,
                            (const int8_t*) (xq + (size_t) (2 * b + 1) * 34 + 2) + lane * 4);
-        /*
-        DPCT1013: The rounding mode could not be specified and the generated
-        code may have different accuracy than the original code. Verify the
-        correctness. SYCL math built-in function rounding mode is aligned with
-        OpenCL C 1.2 standard.
-        */
         acc = sycl::fma(d * xs[2 * b], (float)lo, acc);
-        /*
-        DPCT1013: The rounding mode could not be specified and the generated
-        code may have different accuracy than the original code. Verify the
-        correctness. SYCL math built-in function rounding mode is aligned with
-        OpenCL C 1.2 standard.
-        */
         acc = sycl::fma(d * xs[2 * b + 1], (float)hi, acc);
         if (lane == 0)
-            /*
-            DPCT1013: The rounding mode could not be specified and the
-            generated code may have different accuracy than the original code.
-            Verify the correctness. SYCL math built-in function rounding mode is
-            aligned with OpenCL C 1.2 standard.
-            */
             corr = corr + d * hx[2 * b] + hx[2 * b + 1];
     }
     // _mm_add_ps(low128, high128), then two _mm_hadd_ps. The pair order is 4, 1, 2;
     // a standard shuffle tree in the order 4, 2, 1 is a different floating-point expression.
     constexpr unsigned mask = 0xffffffffu;
-    /*
-    DPCT1108: '__shfl_down_sync' was migrated with the experimental feature
-    masked sub_group function which may not be supported by all compilers or
-    runtimes. You may need to adjust the code.
-    */
-    /*
-    DPCT1013: The rounding mode could not be specified and the generated
-    code may have different accuracy than the original code. Verify the
-    correctness. SYCL math built-in function rounding mode is aligned with
-    OpenCL C 1.2 standard.
-    */
     acc = acc + dpct::experimental::shift_sub_group_left(
                     mask, sycl::ext::oneapi::this_work_item::get_sub_group(),
                     acc, 4, 8);
-    /*
-    DPCT1108: '__shfl_down_sync' was migrated with the experimental feature
-    masked sub_group function which may not be supported by all compilers or
-    runtimes. You may need to adjust the code.
-    */
-    /*
-    DPCT1013: The rounding mode could not be specified and the generated
-    code may have different accuracy than the original code. Verify the
-    correctness. SYCL math built-in function rounding mode is aligned with
-    OpenCL C 1.2 standard.
-    */
     acc = acc + dpct::experimental::shift_sub_group_left(
                     mask, sycl::ext::oneapi::this_work_item::get_sub_group(),
                     acc, 1, 8);
-    /*
-    DPCT1108: '__shfl_down_sync' was migrated with the experimental feature
-    masked sub_group function which may not be supported by all compilers or
-    runtimes. You may need to adjust the code.
-    */
-    /*
-    DPCT1013: The rounding mode could not be specified and the generated
-    code may have different accuracy than the original code. Verify the
-    correctness. SYCL math built-in function rounding mode is aligned with
-    OpenCL C 1.2 standard.
-    */
     acc = acc + dpct::experimental::shift_sub_group_left(
                     mask, sycl::ext::oneapi::this_work_item::get_sub_group(),
                     acc, 2, 8);
-    /*
-    DPCT1013: The rounding mode could not be specified and the generated
-    code may have different accuracy than the original code. Verify the
-    correctness. SYCL math built-in function rounding mode is aligned with
-    OpenCL C 1.2 standard.
-    */
     return acc - corr; // Only lane zero is consumed.
 }
 
@@ -637,12 +531,6 @@ __dpct_inline__ void cpu_order_swiglu_kernel(float *gu, int pairs) {
     // Accurate fp32 exponential; __expf's approximation would introduce an additional source of error.
     // CPU/GPU libc last-bit differences are diagnosed separately by the micro, not hidden with FP64 here.
     const float eg = sycl::native::exp(-g);
-    /*
-    DPCT1013: The rounding mode could not be specified and the generated
-    code may have different accuracy than the original code. Verify the
-    correctness. SYCL math built-in function rounding mode is aligned with
-    OpenCL C 1.2 standard.
-    */
     gu[i] = g / (1.0f + eg) * gu[pairs + i];
 }
 
@@ -658,19 +546,7 @@ __dpct_inline__ void cpu_order_quantize_kernel(const float *x, uint8_t *blocks,
     float amax = 0.0f;
 #pragma unroll
     for (int j = 0; j < 32; ++j) amax = sycl::fmax(amax, sycl::fabs(xb[j]));
-    /*
-    DPCT1013: The rounding mode could not be specified and the generated
-    code may have different accuracy than the original code. Verify the
-    correctness. SYCL math built-in function rounding mode is aligned with
-    OpenCL C 1.2 standard.
-    */
     const float s = amax > 0.0f ? amax / 127.0f : 0.0f;
-    /*
-    DPCT1013: The rounding mode could not be specified and the generated
-    code may have different accuracy than the original code. Verify the
-    correctness. SYCL math built-in function rounding mode is aligned with
-    OpenCL C 1.2 standard.
-    */
     const float inv = s > 0.0f ? 1.0f / s : 0.0f;
     scales[c] = s;
     const uint16_t bits = sycl::bit_cast<unsigned short, sycl::half>(
@@ -680,259 +556,16 @@ __dpct_inline__ void cpu_order_quantize_kernel(const float *x, uint8_t *blocks,
     out[1] = (uint8_t) (bits >> 8);
     int sum = 0;
     for (int j = 0; j < 32; ++j) {
-        /*
-        DPCT1013: The rounding mode could not be specified and the generated
-        code may have different accuracy than the original code. Verify the
-        correctness. SYCL math built-in function rounding mode is aligned with
-        OpenCL C 1.2 standard.
-        */
         const float t = xb[j] * inv;
-        /*
-        DPCT1013: The rounding mode could not be specified and the generated
-        code may have different accuracy than the original code. Verify the
-        correctness. SYCL math built-in function rounding mode is aligned with
-        OpenCL C 1.2 standard.
-        */
         int v = (int) (t + (t >= 0.0f ? 0.5f : -0.5f));   // SYCL port: dpct dropped the parentheses (it rounded every value to 0)
         v = v < -127 ? -127 : (v > 127 ? 127 : v);
         out[2 + j] = (uint8_t) (int8_t) v;
         sum += v;
     }
-    /*
-    DPCT1013: The rounding mode could not be specified and the generated
-    code may have different accuracy than the original code. Verify the
-    correctness. SYCL math built-in function rounding mode is aligned with
-    OpenCL C 1.2 standard.
-    */
     hx[c] = s * (float)sum;
 }
 
-constexpr int THREADS = 256;
-
-void check(const char* who, void* stream) {
-    /*
-    DPCT1010: SYCL uses exceptions to report errors and does not use the
-    error codes. The cudaGetLastError function call was replaced with 0. You
-    need to rewrite this code.
-    */
-    const dpct::err0 e = 0;
-
-    // Deliberately NOT synchronising for a non-null stream: this is called once per layer from a captured
-    // graph's worth of work, and `finish()`'s null-stream sync in `s_gemv.cu` is the pattern that made a whole
-    // round of measurements the driver's cost instead of the kernel's (Memory/ERRORS.md RC-7).
-    (void) stream;
-}
-
-// The previous kernels stay selectable for A/B - `STRATA_OLD_GROUPED=1` in the environment, or
-// `moe_grouped_select_old` (the parity test runs both in one process).  The environment is read once, on first use;
-// the choice is made at each launch, so a captured graph keeps the kernels it was captured with.
-std::atomic<int> g_select_old{-1};
-// Which kernels the last launch of an entry point used: 1 = new, 0 = previous, -1 = none since the last query.
-std::atomic<int> g_last_path{-1};
-
-bool old_kernels() {
-    const int s = g_select_old.load(std::memory_order_relaxed);
-    if (s >= 0) return s != 0;
-    static const bool env = [] {
-        const char* e = std::getenv("STRATA_OLD_GROUPED");
-        return e != nullptr && e[0] == '1';
-    }();
-    return env;
-}
-
-// `STRATA_GROUPED_PAIR_MIN_HITS=N`: the per-hit path keeps the previous one-warp-per-row kernels below N hits of
-// capacity.  The new per-hit kernels launch half the warps (two rows each), so one hit's gate/up is 80 blocks - fewer
-// than an RTX 5090's SMs - and whether that costs time at one to three hits is what `--bench` measures.  Bitwise
-// the same either way; default 0 (always the new kernels).  Ignored while `moe_grouped_select_old` forces a choice.
-long long pair_min_hits() {
-    if (g_select_old.load(std::memory_order_relaxed) >= 0) return 0;
-    static const long long n = [] {
-        const char* e = std::getenv("STRATA_GROUPED_PAIR_MIN_HITS");
-        return e != nullptr ? std::atoll(e) : 0LL;
-    }();
-    return n;
-}
-
-// The new kernels read the activations as aligned words (`load_x_chunk`), so they need 4-byte aligned activation
-// rows - the input's and the intermediate's in `scratch`; the per-hit ones also read a blob's codes as uint2, which
-// needs an 8-byte aligned arena and slot size (the grouped kernels above already did).  Anything else keeps the
-// previous kernels rather than issuing a misaligned load.
-bool new_grouped(const void* x_q8_0, const void* scratch) {
-    const bool fast = !old_kernels() && ((uintptr_t) x_q8_0 & 3) == 0 && ((uintptr_t) scratch & 3) == 0;
-    g_last_path.store(fast ? 1 : 0, std::memory_order_relaxed);
-    return fast;
-}
-
-bool new_hit(const void* blob_base, long long blob_bytes, const void* x_q8_0, const void* scratch, long long cap) {
-    const bool fast = new_grouped(x_q8_0, scratch) && ((uintptr_t) blob_base & 7) == 0 && (blob_bytes & 7) == 0 &&
-                      cap >= pair_min_hits();
-    g_last_path.store(fast ? 1 : 0, std::memory_order_relaxed);
-    return fast;
-}
-
-// The per-hit path's two projections, previous or new kernels (one warp per row, or per pair of rows).
-void launch_hit_gu(bool fast, const uint8_t *blob_base,
-                   const int32_t *slot_index, long long blob_bytes,
-                   const uint8_t *x_q8_0, const float *x_scales, float *gate_up,
-                   long long cap, const int32_t *d_count,
-                   const int32_t *dst_index, int tok_div, dpct::queue_ptr cs) {
-    const int warps = THREADS / 32;
-    if (fast) {
-        const long long pairs = cap * (long long) FF;
-        {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
-
-            cs->parallel_for<dpct_kernel_name<class gu_pair_kernel_787004>>(
-                sycl::nd_range<3>(
-                    sycl::range(1, 1, (unsigned)((pairs + warps - 1) / warps)) *
-                        sycl::range(1, 1, THREADS),
-                    sycl::range(1, 1, THREADS)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        gu_pair_kernel(blob_base, slot_index, blob_bytes,
-                                       x_q8_0, x_scales, gate_up, (int)cap,
-                                       d_count, dst_index, tok_div);
-                    });
-        }
-    } else {
-        const long long rows = cap * 2LL * FF;
-        {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
-
-            cs->parallel_for<dpct_kernel_name<class gu_kernel_55bc52>>(
-                sycl::nd_range<3>(
-                    sycl::range(1, 1, (unsigned)((rows + warps - 1) / warps)) *
-                        sycl::range(1, 1, THREADS),
-                    sycl::range(1, 1, THREADS)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        gu_kernel(blob_base, slot_index, blob_bytes, x_q8_0,
-                                  x_scales, gate_up, (int)cap, d_count,
-                                  dst_index, tok_div);
-                    });
-        }
-    }
-}
-
-void launch_hit_down(bool fast, const uint8_t *blob_base,
-                     const int32_t *slot_index, const int32_t *dst_index,
-                     long long blob_bytes, const uint8_t *h_q8_0,
-                     const float *h_scales, float *out, long long cap,
-                     const int32_t *d_count, dpct::queue_ptr cs) {
-    const int warps = THREADS / 32;
-    if (fast) {
-        const long long pairs = cap * (long long) (H / 2);
-        {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
-
-            cs->parallel_for<dpct_kernel_name<class down_pair_kernel_7d15d9>>(
-                sycl::nd_range<3>(
-                    sycl::range(1, 1, (unsigned)((pairs + warps - 1) / warps)) *
-                        sycl::range(1, 1, THREADS),
-                    sycl::range(1, 1, THREADS)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        down_pair_kernel(blob_base, slot_index, dst_index,
-                                         blob_bytes, h_q8_0, h_scales, out,
-                                         (int)cap, d_count);
-                    });
-        }
-    } else {
-        const long long rows = cap * (long long) H;
-        {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
-
-            cs->parallel_for<dpct_kernel_name<class down_kernel_b3587f>>(
-                sycl::nd_range<3>(
-                    sycl::range(1, 1, (unsigned)((rows + warps - 1) / warps)) *
-                        sycl::range(1, 1, THREADS),
-                    sycl::range(1, 1, THREADS)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        down_kernel(blob_base, slot_index, dst_index,
-                                    blob_bytes, h_q8_0, h_scales, out, (int)cap,
-                                    d_count);
-                    });
-        }
-    }
-}
-
 }  // namespace
-
-void moe_grouped_select_old(int old) { g_select_old.store(old < 0 ? -1 : (old != 0 ? 1 : 0)); }
-
-int moe_grouped_last_path() { return g_last_path.exchange(-1, std::memory_order_relaxed); }
-
-uint64_t moe_hit_grouped_scratch_bytes(int64_t n_hits, int64_t n_embd, int64_t n_ff) {
-    if (n_hits <= 0) return 0;
-    const uint64_t gu = (uint64_t) n_hits * (uint64_t) (2 * n_ff) * 4;
-    const uint64_t q8 = (uint64_t) n_hits * (uint64_t) (n_ff / 32) * 34;
-    // R4.2h: the fp32 scales for the INTERMEDIATE's own quantization, one per 32-element chunk per hit.
-    const uint64_t hs = (uint64_t) n_hits * (uint64_t) (n_ff / 32) * 4;
-    const uint64_t xh = (uint64_t) (n_embd / 32) * 4;
-    return ((gu + 15) & ~15ull) + ((q8 + 15) & ~15ull) + 2 * ((hs + 15) & ~15ull) +
-           ((xh + 15) & ~15ull);
-}
-
-void moe_hit_grouped_s2(const uint8_t* blob_base, const int32_t* slot_index, const int32_t* dst_index,
-                        int64_t n_hits, int64_t blob_bytes, const uint8_t* x_q8_0, void* scratch, float* out,
-                        void* stream, const float* x_scales) {
-    if (n_hits <= 0) return;
-    dpct::queue_ptr cs = strata::q_of(stream);
-    const bool fast = new_hit(blob_base, blob_bytes, x_q8_0, scratch, n_hits);
-
-    const uint64_t gu_bytes = ((uint64_t) n_hits * (uint64_t) (2 * FF) * 4 + 15) & ~15ull;
-    const uint64_t q8_bytes = ((uint64_t) n_hits * (uint64_t) (FF / 32) * 34 + 15) & ~15ull;
-    float* gate_up = (float*) scratch;
-    uint8_t* h_q8_0 = (uint8_t*) scratch + gu_bytes;
-    float* h_scales = (float*) ((uint8_t*) scratch + gu_bytes + q8_bytes);
-
-    // 1. gate + up, one launch for every row of every hit.
-    {
-        launch_hit_gu(fast, blob_base, slot_index, blob_bytes, x_q8_0, x_scales, gate_up, n_hits, nullptr, nullptr,
-                      0, cs);
-        check("moe_hit_grouped_s2/gu", stream);
-    }
-    // 2. silu(gate) * up.
-    {
-        const long long pairs = n_hits * (long long) FF;
-        const unsigned blocks = (unsigned) ((pairs + THREADS - 1) / THREADS);
-        {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
-
-            cs->parallel_for<dpct_kernel_name<class swiglu_kernel_792534>>(
-                sycl::nd_range<3>(sycl::range(1, 1, blocks) *
-                                      sycl::range(1, 1, THREADS),
-                                  sycl::range(1, 1, THREADS)),
-                exp_props, [=](sycl::nd_item<3> item_ct1) {
-                    swiglu_kernel(gate_up, pairs);
-                });
-        }
-        check("moe_hit_grouped_s2/swiglu", stream);
-    }
-    // 3. the intermediate's own contract, which is `ggml_mul_mat`'s rule and NOT a choice: the down weight is
-    //    Q2_0, whose `vec_dot_type` is Q8_0.  `gate_up` holds the pairs; the product went into the first half.
-    //    **R4.2h: the CPU quantizes this intermediate into `a2` with fp32 scales too** (`expert.cpp:232`), so
-    //    when the caller supplies `x_scales` the intermediate gets the CPU's contract as well - otherwise the
-    //    down projection would keep the very disagreement the gate/up projection just had removed.
-    if (x_scales != nullptr) quantize_q8_0_scaled(gate_up, h_q8_0, h_scales, n_hits * (int64_t) FF, stream);
-    else quantize_q8_0(gate_up, h_q8_0, n_hits * (int64_t) FF, stream);
-    // 4. down.
-    {
-        launch_hit_down(fast, blob_base, slot_index, dst_index, blob_bytes, h_q8_0,
-                        x_scales != nullptr ? h_scales : nullptr, out, n_hits, nullptr, cs);
-        check("moe_hit_grouped_s2/down", stream);
-    }
-}
 
 namespace {
 // Plan v0.3 P4 token graph: which of this layer's routed experts are resident, decided ON THE DEVICE from the
@@ -1024,134 +657,6 @@ __dpct_inline__ void add_hits_kernel(float *__restrict__ parts,
 }
 }  // namespace
 
-void moe_hit_select(const int32_t* ids, const int32_t* res_row, int k, int n_expert, int32_t* slot, int32_t* dst,
-                    int32_t* count, void* stream) {
-    if (k < 1 || k > 32) { std::fprintf(stderr, "moe_hit_select: k must be 1..32\n"); std::exit(1); }
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class hit_select_kernel_f87f42>>(
-                sycl::nd_range<3>(sycl::range(1, 1, 32), sycl::range(1, 1, 32)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        hit_select_kernel(ids, res_row, k, n_expert, slot, dst,
-                                          count);
-                    });
-    }
-    check("moe_hit_select", stream);
-}
-
-void moe_hit_grouped_s2_dev(const uint8_t* blob_base, const int32_t* slot_index, const int32_t* dst_index,
-                            const int32_t* d_count, int64_t cap, int64_t blob_bytes, const uint8_t* x_q8_0,
-                            void* scratch, float* out, void* stream, const float* x_scales) {
-    if (cap <= 0) return;
-    dpct::queue_ptr cs = strata::q_of(stream);
-    const bool fast = new_hit(blob_base, blob_bytes, x_q8_0, scratch, cap);
-    const uint64_t gu_bytes = ((uint64_t) cap * (uint64_t) (2 * FF) * 4 + 15) & ~15ull;
-    const uint64_t q8_bytes = ((uint64_t) cap * (uint64_t) (FF / 32) * 34 + 15) & ~15ull;
-    float* gate_up = (float*) scratch;
-    uint8_t* h_q8_0 = (uint8_t*) scratch + gu_bytes;
-    float* h_scales = (float*) ((uint8_t*) scratch + gu_bytes + q8_bytes);
-    {
-        launch_hit_gu(fast, blob_base, slot_index, blob_bytes, x_q8_0, x_scales, gate_up, cap, d_count, nullptr, 0,
-                      cs);
-        check("moe_hit_grouped_s2_dev/gu", stream);
-    }
-    {
-        const long long pairs = cap * (long long) FF;
-        {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
-
-            cs->parallel_for<dpct_kernel_name<class swiglu_kernel_5aa9a9>>(
-                sycl::nd_range<3>(
-                    sycl::range(1, 1,
-                                (unsigned)((pairs + THREADS - 1) / THREADS)) *
-                        sycl::range(1, 1, THREADS),
-                    sycl::range(1, 1, THREADS)),
-                exp_props, [=](sycl::nd_item<3> item_ct1) {
-                    swiglu_kernel(gate_up, pairs);
-                });
-        }
-        check("moe_hit_grouped_s2_dev/swiglu", stream);
-    }
-    if (x_scales != nullptr) quantize_q8_0_scaled(gate_up, h_q8_0, h_scales, cap * (int64_t) FF, stream);
-    else quantize_q8_0(gate_up, h_q8_0, cap * (int64_t) FF, stream);
-    {
-        launch_hit_down(fast, blob_base, slot_index, dst_index, blob_bytes, h_q8_0,
-                        x_scales != nullptr ? h_scales : nullptr, out, cap, d_count, cs);
-        check("moe_hit_grouped_s2_dev/down", stream);
-    }
-}
-
-void moe_hit_select_multi(const int32_t* ids, const int32_t* res_row, int n, int n_expert, int32_t* slot, int32_t* dst,
-                          int32_t* count, void* stream) {
-    if (n < 1 || n > 128) { std::fprintf(stderr, "moe_hit_select_multi: n must be 1..128\n"); std::exit(1); }
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        strata::q_of(stream)
-            ->parallel_for<
-                dpct_kernel_name<class hit_select_multi_kernel_4749ea>>(
-                sycl::nd_range<3>(sycl::range(1, 1, 128),
-                                  sycl::range(1, 1, 128)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        hit_select_multi_kernel(ids, res_row, n, n_expert, slot,
-                                                dst, count);
-                    });
-    }
-    check("moe_hit_select_multi", stream);
-}
-
-void moe_hit_grouped_s2_multi(const uint8_t* blob_base, const int32_t* slot_index, const int32_t* dst_index,
-                              const int32_t* d_count, int64_t cap, int64_t blob_bytes, const uint8_t* x_q8_0,
-                              const float* x_scales, int k_per_token, void* scratch, float* out, void* stream) {
-    if (cap <= 0) return;
-    dpct::queue_ptr cs = strata::q_of(stream);
-    const bool fast = new_hit(blob_base, blob_bytes, x_q8_0, scratch, cap);
-    const uint64_t gu_bytes = ((uint64_t) cap * (uint64_t) (2 * FF) * 4 + 15) & ~15ull;
-    const uint64_t q8_bytes = ((uint64_t) cap * (uint64_t) (FF / 32) * 34 + 15) & ~15ull;
-    float* gate_up = (float*) scratch;
-    uint8_t* h_q8_0 = (uint8_t*) scratch + gu_bytes;
-    float* h_scales = (float*) ((uint8_t*) scratch + gu_bytes + q8_bytes);
-    {
-        launch_hit_gu(fast, blob_base, slot_index, blob_bytes, x_q8_0, x_scales, gate_up, cap, d_count, dst_index,
-                      k_per_token, cs);
-        check("moe_hit_grouped_s2_multi/gu", stream);
-    }
-    {
-        const long long pairs = cap * (long long) FF;
-        {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
-
-            cs->parallel_for<dpct_kernel_name<class swiglu_kernel_a0c31a>>(
-                sycl::nd_range<3>(
-                    sycl::range(1, 1,
-                                (unsigned)((pairs + THREADS - 1) / THREADS)) *
-                        sycl::range(1, 1, THREADS),
-                    sycl::range(1, 1, THREADS)),
-                exp_props, [=](sycl::nd_item<3> item_ct1) {
-                    swiglu_kernel(gate_up, pairs);
-                });
-        }
-        check("moe_hit_grouped_s2_multi/swiglu", stream);
-    }
-    if (x_scales != nullptr) quantize_q8_0_scaled(gate_up, h_q8_0, h_scales, cap * (int64_t) FF, stream);
-    else quantize_q8_0(gate_up, h_q8_0, cap * (int64_t) FF, stream);
-    {
-        launch_hit_down(fast, blob_base, slot_index, dst_index, blob_bytes, h_q8_0,
-                        x_scales != nullptr ? h_scales : nullptr, out, cap, d_count, cs);
-        check("moe_hit_grouped_s2_multi/down", stream);
-    }
-}
-
 namespace {
 // Plan v0.3 P6: experts GROUPED - one blob pointer per group (a VRAM slot or a mapped host blob read over PCIe),
 // every entry of the group (a token routed to that expert) computed from ONE read of each row.  Per entry the
@@ -1186,12 +691,6 @@ __dpct_inline__ float chunk_dot(sycl::uint2 cb, const int *xw, float dw,
 // Gate/up: a block = GU_ROWS rows of ONE group.  The group's activations (each entry's token row of x_q8_0 and
 // its fp32 scales) are staged once into shared memory as aligned words; each warp then walks its rows, loading
 // each lane's code chunks once and dotting them with every entry.
-/*
-DPCT1110: The total declared local variable size in device function
-gu_grouped_kernel exceeds 128 bytes and may cause high register pressure.
-Consult with your hardware vendor to find the total register size available and
-adjust the code, or use smaller sub-group size to avoid high register pressure.
-*/
 __dpct_inline__ void gu_grouped_kernel(
     const unsigned long long *__restrict__ grp_ptr,
     const int32_t *__restrict__ grp_start, const int32_t *__restrict__ n_groups,
@@ -1336,12 +835,6 @@ __dpct_inline__ void stage_chunk(const uint8_t *__restrict__ xb, float dx,
     xs_dh[i] = sycl::int2(sycl::bit_cast<int>(dx), hx);
 }
 
-/*
-DPCT1110: The total declared local variable size in device function
-gu_grouped_t_kernel exceeds 128 bytes and may cause high register pressure.
-Consult with your hardware vendor to find the total register size available and
-adjust the code, or use smaller sub-group size to avoid high register pressure.
-*/
 __dpct_inline__ void gu_grouped_t_kernel(
     const unsigned long long *__restrict__ grp_ptr,
     const int32_t *__restrict__ grp_start, const int32_t *__restrict__ n_groups,
@@ -1418,12 +911,6 @@ __dpct_inline__ void gu_grouped_t_kernel(
     }
 }
 
-/*
-DPCT1110: The total declared local variable size in device function
-down_grouped_t_kernel exceeds 128 bytes and may cause high register pressure.
-Consult with your hardware vendor to find the total register size available and
-adjust the code, or use smaller sub-group size to avoid high register pressure.
-*/
 __dpct_inline__ void down_grouped_t_kernel(
     const unsigned long long *__restrict__ grp_ptr,
     const int32_t *__restrict__ grp_start, const int32_t *__restrict__ n_groups,
@@ -1552,326 +1039,6 @@ auto &e_s = *sycl::ext::oneapi::group_local_memory_for_overwrite<int[128]>(
 }
 }  // namespace
 
-void moe_group_resident(const int32_t* ids, int n, int k_per_tok, const uint8_t* base, int64_t blob,
-                        unsigned long long* grp_ptr, int32_t* grp_start, int32_t* counts, int32_t* ent_dst,
-                        int32_t* ent_tok, void* stream) {
-    if (n < 1 || n > 128) { std::fprintf(stderr, "moe_group_resident: n must be 1..128\n"); std::exit(1); }
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        strata::q_of(stream)
-            ->parallel_for<
-                dpct_kernel_name<class group_resident_kernel_5c38b8>>(
-                sycl::nd_range<3>(sycl::range(1, 1, 128),
-                                  sycl::range(1, 1, 128)),
-                exp_props, [=](sycl::nd_item<3> item_ct1) {
-                    group_resident_kernel(ids, n, k_per_tok, base,
-                                          (long long)blob, grp_ptr, grp_start,
-                                          counts, ent_dst, ent_tok);
-                });
-    }
-    check("moe_group_resident", stream);
-}
-
-void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
-                    const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries,
-                    const uint8_t* x_q8_0, const float* x_scales, void* scratch, float* out, void* stream) {
-    if (cap_groups <= 0 || cap_entries <= 0) return;
-    dpct::queue_ptr cs = strata::q_of(stream);
-    const uint64_t gu_bytes = ((uint64_t) cap_entries * (uint64_t) (2 * FF) * 4 + 15) & ~15ull;
-    const uint64_t q8_bytes = ((uint64_t) cap_entries * (uint64_t) (FF / 32) * 34 + 15) & ~15ull;
-    float* gate_up = (float*) scratch;
-    uint8_t* h_q8_0 = (uint8_t*) scratch + gu_bytes;
-    float* h_scales = (float*) ((uint8_t*) scratch + gu_bytes + q8_bytes);
-    const bool fast = new_grouped(x_q8_0, scratch);
-    {
-        const dpct::dim3 grid((unsigned)(2 * FF / GU_ROWS),
-                              (unsigned)cap_groups);
-        if (fast)
-        {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
-
-            cs->parallel_for<
-                dpct_kernel_name<class gu_grouped_t_kernel_998f94>>(
-                sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
-                                  sycl::range(1, 1, 256)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        gu_grouped_t_kernel(grp_ptr, grp_start, n_groups,
-                                            ent_tok, x_q8_0, x_scales, gate_up,
-                                            (int)cap_entries);
-                    });
-        } else {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
-
-            cs->parallel_for<dpct_kernel_name<class gu_grouped_kernel_c9eb4d>>(
-                sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
-                                  sycl::range(1, 1, 256)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        gu_grouped_kernel(grp_ptr, grp_start, n_groups, ent_tok,
-                                          x_q8_0, x_scales, gate_up,
-                                          (int)cap_entries);
-                    });
-        }
-        check("moe_grouped_s2/gu", stream);
-    }
-    // #783 PR-k (stuchapin909): SwiGLU and the scaled Q8_0 quantize of its result in one kernel (gate_up still gets the
-    // activation written back, so the parity checks read the same buffer); STRATA_S2_SWIGLU_Q8=0 keeps the two launches
-    static const bool swiglu_q8 = [] {
-        const char* e = std::getenv("STRATA_S2_SWIGLU_Q8");
-        return e == nullptr || e[0] != '0';
-    }();
-    static_assert(FF % 32 == 0, "the fused SwiGLU + Q8_0 kernel works in whole 32-value blocks");
-    if (fast && x_scales != nullptr && swiglu_q8) {
-        const long long pairs = cap_entries * (long long) FF;
-        const long long n_blocks = pairs >> 5;
-        const int warps = THREADS / 32;
-        {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
-
-            cs->parallel_for<dpct_kernel_name<
-                class swiglu_quantize_q8_0_scaled_kernel_1271ea>>(
-                sycl::nd_range<3>(
-                    sycl::range(1, 1,
-                                (unsigned)((n_blocks + warps - 1) / warps)) *
-                        sycl::range(1, 1, THREADS),
-                    sycl::range(1, 1, THREADS)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        swiglu_quantize_q8_0_scaled_kernel(gate_up, pairs,
-                                                           h_q8_0, h_scales);
-                    });
-        }
-        check("moe_grouped_s2/swiglu_q8", stream);
-    } else {
-        const long long pairs = cap_entries * (long long) FF;
-        {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
-
-            cs->parallel_for<dpct_kernel_name<class swiglu_kernel_90849f>>(
-                sycl::nd_range<3>(
-                    sycl::range(1, 1,
-                                (unsigned)((pairs + THREADS - 1) / THREADS)) *
-                        sycl::range(1, 1, THREADS),
-                    sycl::range(1, 1, THREADS)),
-                exp_props, [=](sycl::nd_item<3> item_ct1) {
-                    swiglu_kernel(gate_up, pairs);
-                });
-        }
-        check("moe_grouped_s2/swiglu", stream);
-        if (x_scales != nullptr) quantize_q8_0_scaled(gate_up, h_q8_0, h_scales, cap_entries * (int64_t) FF, stream);
-        else quantize_q8_0(gate_up, h_q8_0, cap_entries * (int64_t) FF, stream);
-    }
-    {
-        const dpct::dim3 grid((unsigned)(H / D_ROWS), (unsigned)cap_groups);
-        const float* hs = x_scales != nullptr ? h_scales : nullptr;
-        if (fast)
-        {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
-
-            cs->parallel_for<
-                dpct_kernel_name<class down_grouped_t_kernel_12b16d>>(
-                sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
-                                  sycl::range(1, 1, 256)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        down_grouped_t_kernel(grp_ptr, grp_start, n_groups,
-                                              ent_dst, h_q8_0, hs, out);
-                    });
-        } else {
-            auto exp_props = sycl::ext::oneapi::experimental::properties{
-                sycl::ext::oneapi::experimental::use_root_sync};
-
-            cs->parallel_for<
-                dpct_kernel_name<class down_grouped_kernel_ea4417>>(
-                sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
-                                  sycl::range(1, 1, 256)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        down_grouped_kernel(grp_ptr, grp_start, n_groups,
-                                            ent_dst, h_q8_0, hs, out);
-                    });
-        }
-        check("moe_grouped_s2/down", stream);
-    }
-}
-
-void moe_hit_add(float* parts, const float* hit_out, const int32_t* dst, const int32_t* count, int64_t cap,
-                 int64_t n_embd, void* stream) {
-    if (cap <= 0) return;
-    const dpct::dim3 grid(
-        (unsigned)((n_embd + 255) / 256 < 8 ? (n_embd + 255) / 256 : 8),
-        (unsigned)cap);
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        strata::q_of(stream)
-            ->parallel_for<dpct_kernel_name<class add_hits_kernel_50cbcb>>(
-                sycl::nd_range<3>(grid * sycl::range(1, 1, 256),
-                                  sycl::range(1, 1, 256)),
-                exp_props, [=](sycl::nd_item<3> item_ct1) {
-                    add_hits_kernel(parts, hit_out, dst, count, (int)n_embd);
-                });
-    }
-    check("moe_hit_add", stream);
-}
-
-void moe_hit_grouped_s2_cpu_order(const uint8_t *blob_base,
-                                  const int32_t *slot_index,
-                                  const int32_t *dst_index, int64_t n_hits,
-                                  int64_t blob_bytes, const uint8_t *x_q8_0,
-                                  void *scratch, float *out, void *stream,
-                                  const float *x_scales,
-                                  float *gate_up_trace) try {
-    if (n_hits <= 0) return;
-    if (x_scales == nullptr) {
-        std::fprintf(stderr, "moe_hit_grouped_s2_cpu_order requires fp32 activation scales\n");
-        std::exit(1);
-    }
-    dpct::queue_ptr cs = strata::q_of(stream);
-    const uint64_t gu_bytes = ((uint64_t) n_hits * 2 * FF * 4 + 15) & ~15ull;
-    const uint64_t q8_bytes = ((uint64_t) n_hits * (FF / 32) * 34 + 15) & ~15ull;
-    const uint64_t scale_bytes = ((uint64_t) n_hits * (FF / 32) * 4 + 15) & ~15ull;
-    float* gu = (float*) scratch;
-    uint8_t* hq = (uint8_t*) scratch + gu_bytes;
-    float* hs = (float*) (hq + q8_bytes);
-    float* hh = (float*) ((uint8_t*) hs + scale_bytes);
-    float* xh = (float*) ((uint8_t*) hh + scale_bytes);
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        cs->submit([&](sycl::handler &cgh) {
-            auto H_ct3 = H / 32;
-
-            cgh.parallel_for<
-                dpct_kernel_name<class activation_correction_kernel_ca15a9>>(
-                sycl::nd_range<3>(
-                    sycl::range(1, 1, (H / 32 + THREADS - 1) / THREADS) *
-                        sycl::range(1, 1, THREADS),
-                    sycl::range(1, 1, THREADS)),
-                exp_props, [=](sycl::nd_item<3> item_ct1) {
-                    activation_correction_kernel(x_q8_0, x_scales, xh, H_ct3);
-                });
-        });
-    }
-    check("cpu_order/input_correction", stream);
-    const int rows_per_block = THREADS / 8;
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        cs->parallel_for<
-            dpct_kernel_name<class cpu_order_projection_kernel_2fbdd9,
-                             dpct_kernel_scalar<false>>>(
-            sycl::nd_range<3>(
-                sycl::range(1, 1,
-                            (unsigned)((n_hits * 2 * FF + rows_per_block - 1) /
-                                       rows_per_block)) *
-                    sycl::range(1, 1, THREADS),
-                sycl::range(1, 1, THREADS)),
-            exp_props,
-            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
-                cpu_order_projection_kernel<false>(
-                    blob_base, slot_index, dst_index, blob_bytes, x_q8_0,
-                    x_scales, xh, gu, (int)n_hits);
-            });
-    }
-    check("cpu_order/gate_up", stream);
-    if (gate_up_trace != nullptr &&
-        /*
-        DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy API.
-        While the origin API might be synchronous, it depends on the type of
-        operand memory, so you may need to call wait() on event return by memcpy
-        API to ensure synchronization behavior.
-        */
-        DPCT_CHECK_ERROR(cs->memcpy(
-            gate_up_trace, gu, (size_t)n_hits * 2 * FF * sizeof(float))) != 0) {
-        std::fprintf(stderr, "cpu_order/gate_up_trace copy failed\n");
-        std::exit(1);
-    }
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        cs->submit([&](sycl::handler &cgh) {
-            auto int_n_hits_FF_ct1 = (int)n_hits * FF;
-
-            cgh.parallel_for<
-                dpct_kernel_name<class cpu_order_swiglu_kernel_4d84ce>>(
-                sycl::nd_range<3>(
-                    sycl::range(
-                        1, 1,
-                        (unsigned)((n_hits * FF + THREADS - 1) / THREADS)) *
-                        sycl::range(1, 1, THREADS),
-                    sycl::range(1, 1, THREADS)),
-                exp_props, [=](sycl::nd_item<3> item_ct1) {
-                    cpu_order_swiglu_kernel(gu, int_n_hits_FF_ct1);
-                });
-        });
-    }
-    check("cpu_order/swiglu", stream);
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        cs->submit([&](sycl::handler &cgh) {
-            auto int_n_hits_FF_ct4 = (int)n_hits * (FF / 32);
-
-            cgh.parallel_for<
-                dpct_kernel_name<class cpu_order_quantize_kernel_7d1393>>(
-                sycl::nd_range<3>(
-                    sycl::range(1, 1,
-                                (unsigned)((n_hits * (FF / 32) + THREADS - 1) /
-                                           THREADS)) *
-                        sycl::range(1, 1, THREADS),
-                    sycl::range(1, 1, THREADS)),
-                exp_props, [=](sycl::nd_item<3> item_ct1) {
-                    cpu_order_quantize_kernel(gu, hq, hs, hh,
-                                              int_n_hits_FF_ct4);
-                });
-        });
-    }
-    check("cpu_order/intermediate_quantize", stream);
-    {
-        auto exp_props = sycl::ext::oneapi::experimental::properties{
-            sycl::ext::oneapi::experimental::use_root_sync};
-
-        cs->parallel_for<
-            dpct_kernel_name<class cpu_order_projection_kernel_2e007a,
-                             dpct_kernel_scalar<true>>>(
-            sycl::nd_range<3>(
-                sycl::range(1, 1,
-                            (unsigned)((n_hits * H + rows_per_block - 1) /
-                                       rows_per_block)) *
-                    sycl::range(1, 1, THREADS),
-                sycl::range(1, 1, THREADS)),
-            exp_props,
-            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
-                cpu_order_projection_kernel<true>(blob_base, slot_index,
-                                                  dst_index, blob_bytes, hq, hs,
-                                                  hh, out, (int)n_hits);
-            });
-    }
-    check("cpu_order/down", stream);
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
+#include "s2_expert_grouped.kern.inc"
 
 }  // namespace strata::kernels

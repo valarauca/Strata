@@ -22,9 +22,7 @@
 // bits, so it only has to be exact.
 #pragma once
 
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
+#include "strata/port.hpp"
 #include <cstdint>
 #include <cstring>
 

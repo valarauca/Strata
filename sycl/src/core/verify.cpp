@@ -1,8 +1,6 @@
 // src/core/verify.cpp - see include/strata/core/verify.hpp.
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
-#include "strata/sycl_queue.hpp"
+#include "strata/ze/ze.hpp"
+#include "strata/intel_gpu.hpp"
 #include "strata/core/verify.hpp"
 #include "strata/core/remote_expert_opt.hpp"
 #include "strata/core/dma_batch.hpp"
@@ -218,7 +216,7 @@ std::chrono::seconds strata_ring_timeout() {
 // STRATA_VERIFY_STEPPED: no kernel of the window reads a host store while it runs, and no host reads a kernel's store
 // while it runs - every flag is raised before the segment that waits on it is submitted, and the host reads a
 // segment's rings and payload after the segment drained. So the window's mapped buffers need no uncached host memory
-// (sycl_queue.hpp) and its doorbell publishes need no uncached payload stores (sycl_doorbell.hpp). Both cost the
+// (intel_gpu.hpp) and its doorbell publishes need no uncached payload stores (sycl_doorbell.hpp). Both cost the
 // window time on an A770 (xe, Coder IQ1_M, 8K prompt): the GPU waited ~70 ms a window for the CPU with them, ~42
 // without; decode 22.8-25.0 -> 26.9-28.9 tok/s. STRATA_VERIFY_HOST_UNCACHED=1 keeps both.
 bool window_host_uncached() {
@@ -226,24 +224,14 @@ bool window_host_uncached() {
     return v;
 }
 
-bool mapped(size_t bytes, void **h, void **d) try {
-    /*
-    DPCT1048: The original value cudaHostAllocMapped is not meaningful in the
-    migrated code and was removed or replaced with 0. You may need to check the
-    migrated code.
-    */
-    // polled by the window's kernels: uncached host memory (sycl_queue.hpp); a buffer only read or written between
-    // kernels (the stepped window's payload) is ordinary host USM
-    if (DPCT_CHECK_ERROR(*h = window_host_uncached() ? strata::host_malloc_polled(bytes, dpct::get_in_order_queue())
-                                     : sycl::malloc_host(bytes, dpct::get_in_order_queue())) !=
-        0 || *h == nullptr) return false;
+bool mapped(size_t bytes, void **h, void **d) {
+    // polled by the window's kernels: uncached host memory (intel_gpu.hpp); a buffer only read or written between
+    // kernels (the stepped window's payload) is ordinary pinned host memory
+    *h = window_host_uncached() ? strata::host_malloc_polled(bytes) : strata::ze::malloc_host(bytes);
+    if (*h == nullptr) return false;
     std::memset(*h, 0, bytes);
-    return DPCT_CHECK_ERROR(*d = (void *)*h) == 0;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+    *d = *h;
+    return true;
 }
 
 strata::kernels::QsaShapes shapes_of(const ModelGeometry& g) {
@@ -331,10 +319,9 @@ bool Verifier::release_gpu_waits(int timeout_ms) try {
     _mm_sfence();
     const OnDevice on_device(device_);
     const Clock::time_point t0 = Clock::now();
-    // SYCL port: no cudaStreamQuery; a queue with nothing left to run reports ext_oneapi_empty()
-    for (dpct::queue_ptr q : {cs_, copy_}) {
+    for (strata::ze::Stream* q : {cs_, copy_}) {
         if (q == nullptr) continue;
-        while (!q->ext_oneapi_empty()) {
+        while (!q->idle()) {
             if (ms_since(t0) > timeout_ms) {
                 trace_ev("RELEASE-NOT-DRAINED", -1, -1, (int64_t) ms_since(t0));
                 return false;
@@ -419,16 +406,14 @@ void Verifier::diag(std::FILE* f) const {
 }
 
 Verifier::~Verifier() try {
-    // SYCL port: at process exit the Level Zero context can already be gone (serve mode's end), and a destructor
-    // that throws aborts the process (exit 139); the waits and frees below are best-effort then.
     const Verifier* self = this;
     g_diag_verifier.compare_exchange_strong(self, nullptr);
     for (auto& slot : g_live) {
         Verifier* me = this;
         slot.compare_exchange_strong(me, nullptr);
     }
-    if (cs_) cs_->wait();
-    if (sh_cs_) sh_cs_->wait();
+    if (cs_) cs_->sync();
+    if (sh_cs_) sh_cs_->sync();
     for (auto& e : exec_)
         if (e) delete (e);
     for (auto& e : exec_nr_)
@@ -441,31 +426,32 @@ Verifier::~Verifier() try {
         if (kv.second) delete (kv.second);
     for (auto& kv : commit_bm_)
         if (kv.second) delete (kv.second);
-    if (arena_b_) sycl::free(arena_b_, dpct::get_in_order_queue());
-    if (h_commitb_) sycl::free(h_commitb_, dpct::get_in_order_queue());
-    if (qcnt_) sycl::free(qcnt_, dpct::get_in_order_queue());
-    if (cs_ && cs_ != ext_stream_) dpct::get_current_device().destroy_queue(
-        cs_); // set_stream: the stage's stream, shared, not ours
-    if (sh_cs_) dpct::get_current_device().destroy_queue(sh_cs_);
-    if (copy_) { copy_->wait(); dpct::get_current_device().destroy_queue(copy_); }
-    if (commit_done_) dpct::destroy_event(commit_done_);
-    if (ev_done_) dpct::destroy_event(ev_done_);
-    if (ev_commit_) dpct::destroy_event(ev_commit_);
-    if (prof_pin_) sycl::free(prof_pin_, dpct::get_in_order_queue());
-    if (ev_fork_) dpct::destroy_event(ev_fork_);
-    if (ev_join_) dpct::destroy_event(ev_join_);
-    if (arena_) sycl::free(arena_, dpct::get_in_order_queue());
+    if (arena_b_) strata::ze::free(arena_b_);
+    if (h_commitb_) strata::ze::free(h_commitb_);
+    if (qcnt_) strata::ze::free(qcnt_);
+    if (owns_streams_) {
+        if (cs_ && cs_ != ext_stream_) delete cs_;
+        if (sh_cs_) delete sh_cs_;
+        if (copy_) { copy_->sync(); delete copy_; }
+    }
+    if (commit_done_) delete (commit_done_);
+    if (ev_done_) delete (ev_done_);
+    if (ev_commit_) delete (ev_commit_);
+    if (prof_pin_) strata::ze::free(prof_pin_);
+    if (ev_fork_) delete (ev_fork_);
+    if (ev_join_) delete (ev_join_);
+    if (arena_) strata::ze::free(arena_);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
                      h_flagA_, h_plan_, h_flagB_, h_plan_err_};
     for (void* h : hosts)
-        if (h) strata::host_free_polled(h, dpct::get_in_order_queue());
+        if (h) strata::host_free_polled(h);
 } catch (...) {
 }
 
 
 bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
                     SessionState &ss, const VerifyHits &hits,
-                    const NativeHead *head, int max_t, std::string &err) try {
+                    const NativeHead *head, int max_t, std::string &err) {
     g_diag_verifier.store(this);
     diag_verify_fn().store(&diag_active_verifier);
     for (auto& slot : g_live) {
@@ -473,7 +459,7 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
         if (slot.load() == this || slot.compare_exchange_strong(none, this)) break;
     }
     release_gpu_fn().store(&release_live_verifiers);
-    device_ = dpct::get_current_device_id(); // a layer split's stage on another
+    device_ = strata::ze::current_device(); // a layer split's stage on another
                                              // GPU: its streams, graphs and
                                              // buffers live there
     strata::kernels::fused_gr_check();   // once per card: which bitwise-equal hyper-connection read runs there
@@ -611,12 +597,12 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
     };
     Bump count;
     carve(count);
-    if (DPCT_CHECK_ERROR(arena_ = (void *)strata::malloc_device_guarded(
-                             count.used, dpct::get_in_order_queue())) != 0) {
+    arena_ = strata::ze::malloc_device_guarded(count.used, -1, "verify arena");
+    if (arena_ == nullptr) {
         err = "verify: the device arena (" + std::to_string(count.used >> 20) + " MiB) does not fit";
         return false;
     }
-    strata::big_fill_zero(dpct::get_in_order_queue(), arena_, count.used);
+    strata::ze::fill_zero(strata::ze::default_stream(), arena_, count.used);
     if (g_trace && trace_h_ == nullptr) {   // #649: the breadcrumbs, mapped so they read while the GPU hangs
         trace_n_ = (size_t) (g.n_layers + 1) * kProfPer * 2;
         if (!mapped(trace_n_ * 8, (void**) &trace_h_, (void**) &trace_m_)) {
@@ -636,15 +622,12 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
     prof_on_ = std::getenv("STRATA_VERIFY_PROFILE") != nullptr;
     if (prof_on_) {
         const size_t np = (size_t) g.n_layers * kProfPer + 4;
-        /*
-        DPCT1026: The call to cudaGetLastError was removed because this
-        functionality is redundant in SYCL.
-        */
-        if (DPCT_CHECK_ERROR(prof_ = (unsigned long long *)sycl::malloc_device(
-                                 np * 8, dpct::get_in_order_queue())) != 0) {
-            prof_on_ = false; prof_ = nullptr;
+        prof_ = (unsigned long long*) strata::ze::malloc_device(np * 8);
+        if (prof_ == nullptr) {
+            prof_on_ = false;
         } else {
-            dpct::get_in_order_queue().memset(prof_, 0, np * 8).wait();
+            strata::ze::default_stream().memset(prof_, 0, np * 8);
+            strata::ze::default_stream().sync();
             prof_h_.assign(np, 0);
         }
     }
@@ -653,51 +636,19 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
     carve(real);
     {
         const int32_t one = 1;
-        if (DPCT_CHECK_ERROR(dpct::get_in_order_queue()
-                                 .memcpy(one_, &one, sizeof one)
-                                 .wait()) != 0) {
-            err = "verify: the arena could not be set";
-            return false;
-        }
+        strata::ze::copy_sync(one_, &one, sizeof one);
     }
     sink_.staging = (unsigned long long) staging_;
     sink_.staging_cap = kStagingBlobs;
     (void) TS;
-    /*
-    DPCT1025: The SYCL queue is created ignoring the flag and priority
-    options.
-    */
-    if (DPCT_CHECK_ERROR(
-            copy_ = dpct::get_current_device().create_queue(true)) != 0) {
-        err = "verify: copy stream create failed";
-        return false;
-    }
-    if (ext_stream_ != nullptr) cs_ =
-        ext_stream_; // set_stream (pipelined windows): the stage's shared
-                     // stream
-    /*
-    DPCT1025: The SYCL queue is created ignoring the flag and priority
-    options.
-    */
-    else if (DPCT_CHECK_ERROR(
-                 cs_ = dpct::get_current_device().create_queue(true)) != 0)
-        cs_ = &dpct::get_in_order_queue();
-    /*
-    DPCT1025: The SYCL queue is created ignoring the flag and priority
-    options.
-    */
-    if (cs_ == &dpct::get_in_order_queue() ||
-        DPCT_CHECK_ERROR(
-            sh_cs_ = dpct::get_current_device().create_queue(true)) != 0) {
-        err = "verify: stream create failed";
-        return false;
-    }
-    if (DPCT_CHECK_ERROR(commit_done_ = new sycl::event()) != 0 ||
-        DPCT_CHECK_ERROR(ev_fork_ = new sycl::event()) != 0 ||
-        DPCT_CHECK_ERROR(ev_join_ = new sycl::event()) != 0) {
-        err = "verify: event create failed";
-        return false;
-    }
+    const bool dma_engine = strata::ze::has_copy_engine() && strata::ze::device_info(strata::ze::current_device()).battlemage;
+    copy_ = new strata::ze::Stream(-1, dma_engine ? strata::ze::Stream::Engine::Copy : strata::ze::Stream::Engine::Compute);
+    cs_ = ext_stream_ != nullptr ? ext_stream_ : new strata::ze::Stream();
+    sh_cs_ = new strata::ze::Stream();
+    owns_streams_ = true;
+    commit_done_ = new strata::ze::Event();
+    ev_fork_ = new strata::ze::Event();
+    ev_join_ = new strata::ze::Event();
     // Check whether 100% of experts across [lb_, le_) are resident in this stage's VRAM cache.
     // When true, every layer plans on device and writes directly into parts_ without any CPU doorbells,
     // wait_flag_ge spins, PCIe empty launches, or moe_hit_add copies.
@@ -729,60 +680,44 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
     }
     // (halo's STRATA_VERIFY_RESIDENT=1 is this window's all_resident_ graph above, which 0.1.39 has on by default)
     if (g_qfuse()) {   // S26: the HC read's q8_1 group counters, zeroed once (each launch leaves them zero)
-        if (DPCT_CHECK_ERROR(qcnt_ = sycl::malloc_device<unsigned int>(
-                                 (size_t)(g.n_embd / 32),
-                                 dpct::get_in_order_queue())) != 0 ||
-            DPCT_CHECK_ERROR(
-                dpct::get_in_order_queue()
-                    .memset(qcnt_, 0,
-                            sizeof(unsigned) * (size_t)(g.n_embd / 32))
-                    .wait()) != 0) {
-            /*
-            DPCT1026: The call to cudaGetLastError was removed because this
-            functionality is redundant in SYCL.
-            */
-            if (qcnt_) sycl::free(qcnt_, dpct::get_in_order_queue());
-            qcnt_ = nullptr;
+        qcnt_ = (unsigned int*) strata::ze::malloc_device((size_t) (g.n_embd / 32) * sizeof(unsigned int));
+        if (qcnt_ != nullptr) {
+            strata::ze::default_stream().memset(qcnt_, 0, sizeof(unsigned) * (size_t) (g.n_embd / 32));
+            strata::ze::default_stream().sync();
         }
     }
     if (all_resident_ || device_plan_) {
         bool ok2 = true;
-        if (device_plan_)
-            ok2 = DPCT_CHECK_ERROR(skip_ = (uint32_t *)sycl::malloc_device(
-                                       64, dpct::get_in_order_queue())) == 0 &&
-                  DPCT_CHECK_ERROR(
-                      dpct::get_in_order_queue().memset(skip_, 0, 64).wait()) ==
-                      0;
-        if (ok2 && hits.slot_off != nullptr && hits.n_slots > 0) {
-            ok2 = DPCT_CHECK_ERROR(
-                      slot_off_d_ = sycl::malloc_device<unsigned long long>(
-                          (size_t)hits.n_slots, dpct::get_in_order_queue())) ==
-                      0 &&
-                  DPCT_CHECK_ERROR(dpct::get_in_order_queue()
-                                       .memcpy(slot_off_d_, hits.slot_off,
-                                               (size_t)hits.n_slots *
-                                                   sizeof(unsigned long long))
-                                       .wait()) == 0;
+        if (device_plan_) {
+            skip_ = (uint32_t*) strata::ze::malloc_device(64);
+            ok2 = skip_ != nullptr;
+            if (ok2) strata::ze::default_stream().memset(skip_, 0, 64);
         }
-        /*
-        DPCT1026: The call to cudaGetLastError was removed because this
-        functionality is redundant in SYCL.
-        */
-        if (!ok2) {; all_resident_ = false; device_plan_ = false; }
+        if (ok2 && hits.slot_off != nullptr && hits.n_slots > 0) {
+            slot_off_d_ = (unsigned long long*) strata::ze::malloc_device((size_t) hits.n_slots * sizeof(unsigned long long));
+            ok2 = slot_off_d_ != nullptr;
+            if (ok2) strata::ze::default_stream().memcpy(slot_off_d_, hits.slot_off, (size_t) hits.n_slots * sizeof(unsigned long long));
+        }
+        strata::ze::default_stream().sync();
+        if (!ok2) { all_resident_ = false; device_plan_ = false; }
     }
-    if (std::getenv("STRATA_VERIFY_DEBUG") != nullptr) {   // SYCL port: the per-layer residual ladder (token 0)
-        dbgR_ = (float*) sycl::malloc_device((size_t) g.n_layers * g.n_embd * 4, dpct::get_in_order_queue());
-        dbgM_ = (float*) sycl::malloc_device((size_t) g.n_layers * g.n_embd * 4, dpct::get_in_order_queue());
+    if (std::getenv("STRATA_VERIFY_DEBUG") != nullptr) {   // Intel engine: the per-layer residual ladder (token 0)
+        dbgR_ = (float*) strata::ze::malloc_device((size_t) g.n_layers * g.n_embd * 4);
+        dbgM_ = (float*) strata::ze::malloc_device((size_t) g.n_layers * g.n_embd * 4);
     }
+    if (const char* d = std::getenv("STRATA_DUMP_WINDOWS"); d != nullptr && *d)
+        dumpL_ = (float*) strata::ze::malloc_device((size_t) (g.n_layers + 1) *
+                                                    (size_t) (g.hc * g.n_embd + 2 * g.n_embd + 2 * ss.k + ss.k * g.n_embd +
+                                                              g.n_expert) * 4);
+    if (std::getenv("STRATA_DUMP_SPEC_LAYERS") != nullptr && lb_ == 0 && le_ == g.n_layers)
+        dbgL_ = (float*) strata::ze::malloc_device((size_t) g.n_layers * (size_t) max_t * (size_t) (g.hc * g.n_embd + 2 * g.n_embd) * 4);
+    if ((std::getenv("STRATA_DUMP_SPEC_ROUTE") != nullptr || std::getenv("STRATA_ROUTE_TRACE") != nullptr) && lb_ == 0 &&
+        le_ == g.n_layers)
+        dbgRt_ = (float*) strata::ze::malloc_device((size_t) g.n_layers * (size_t) max_t * (size_t) (g.n_expert + 2 * ss.k) * 4);
     std::fprintf(stderr, "strata verify: window up to %d tokens, %.1f MiB of device buffers%s\n", max_t,
                  (double) count.used / 1048576.0,
                  all_resident_ ? " (100% VRAM resident: zero-doorbell graph)" : "");
     return true;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
 }
 
 const float* Verifier::final_R(int t) const { return R_ + (size_t) t * (size_t) (g_->hc * g_->n_embd); }
@@ -797,7 +732,7 @@ const float* Verifier::final_R(int t) const { return R_ + (size_t) t * (size_t) 
 // so the CPU computes A's experts of layer l while the GPU runs B's mixer and router of layer l, and B's experts
 // while the GPU combines A and runs A's layer l+1.  B's mixer only needs A's mixer of the same layer (K/V, GDN
 // state), never A's experts, so nothing waits that did not wait before.  Every token's arithmetic is unchanged.
-bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
+bool Verifier::record_window(int T, strata::ze::Stream* cs, std::string &err) {
     using namespace strata::kernels;
     const ModelGeometry& g = *g_;
     // 0.1.43 (STRATA_VERIFY_LEAN=0 turns it off): with the device plan under STRATA_VERIFY_NO_HOST no host ever answers a doorbell, so
@@ -823,13 +758,13 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
     const int G = (split_ && T >= 2 && !batch_rec_) ? 2 : 1;   // a batch window is one group
     const bool self_commit = T == 1 && !batch_rec_ && !g_qfuse() && one_token_self_commit();   // see Verifier::commit
     static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
-    // SYCL port, STRATA_VERIFY_EAGER=1: the window runs on the queue instead of as a graph, and each stage stamp is
+    // STRATA_VERIFY_EAGER=1: the window runs on the queue instead of as a graph, and each stage stamp is
     // a host-side wait + clock (there is no %globaltimer here), so the existing stage profiler reports ms per stage.
     static const bool eager = std::getenv("STRATA_VERIFY_EAGER") != nullptr;
     auto stamp = [&](int64_t l, int i, int grp) {
         if (trace_m_ != nullptr) gpu_stamp(trace_m_, (int) ((l * kProfPer + i) * 2 + grp), cs);   // #649
         if (!prof_on_ || grp != 0) return;
-        if (eager) { cs->wait(); prof_h_[(size_t) (l * kProfPer + i)] = (unsigned long long) std::chrono::steady_clock::now().time_since_epoch().count(); }
+        if (eager) { cs->sync(); prof_h_[(size_t) (l * kProfPer + i)] = (unsigned long long) std::chrono::steady_clock::now().time_since_epoch().count(); }
         else gpu_stamp(prof_, (int) (l * kProfPer + i), cs);
     };
     const int tb_[2] = {0, (T + 1) / 2}, te_[2] = {G == 2 ? (T + 1) / 2 : T, T};
@@ -878,6 +813,11 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
         embedding_gather_dev(codes, scales, offsets, tok_, T, w->ne0, w->code_bits, w->code_bias, w->group_elems,
                              row_codes, row_groups, emb_, cs);
         broadcast_streams(emb_, R_, N, (int) HC, T, cs);
+    }
+    const size_t DW = (size_t) (HC * N + 2 * N + 2 * K + K * N + NE);
+    if (dumpL_) {
+        cs->memcpy(dumpL_ + (size_t) g.n_layers * DW, Rt(0), (size_t) HC * N * 4);
+        cs->memcpy(dumpL_ + (size_t) g.n_layers * DW + (size_t) HC * N, bo_, (size_t) N * 4);
     }
 
     // per-layer state indices (GDN and QSA layers are numbered separately)
@@ -1183,21 +1123,8 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
                                                  qcur_ + tb * NH * HD, (int) (n * NH), (int) HD, (int) s.n_rot, EPS,
                                                  rope_scaling(), pos_ + tb * NH, cs);
                     } else {
-                    /*
-                    DPCT1124: cudaMemcpy2DAsync is migrated to asynchronous
-                    memcpy API. While the origin API might be synchronous, it
-                    depends on the type of operand memory, so you may need to
-                    call wait() on event return by memcpy API to ensure
-                    synchronization behavior.
-                    */
-                    if (DPCT_CHECK_ERROR(dpct::async_dpct_memcpy(
-                            qcur_ + tb * NH * HD, (size_t)HD * 4,
-                            qfull_ + tb * NH * 2 * HD, (size_t)HD * 2 * 4,
-                            (size_t)HD * 4, (size_t)(n * NH),
-                            dpct::device_to_device, *cs)) != 0) {
-                        err = "verify: the q/gate split failed";
-                        return false;
-                    }
+                    cs->memcpy_2d(qcur_ + tb * NH * HD, (size_t) HD * 4, qfull_ + tb * NH * 2 * HD, (size_t) HD * 2 * 4,
+                                  (size_t) HD * 4, (size_t) (n * NH));
                     norm_rope(qcur_ + tb * NH * HD, wqn, (int) (n * NH), (int) HD, pos_ + tb * NH);
                     }
                     if (st.kv_rot) fwht256_inplace_cuda(qcur_ + tb * NH * HD, (int64_t) n * NH, cs);   // <Hq, Hk> = <q, k>
@@ -1211,20 +1138,8 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
                         native_qsa_rms_norm_rope(qfull_ + t * NH * 2 * HD, (int) (2 * HD), (const float*) wqn->data, qc,
                                                  (int) NH, (int) HD, (int) s.n_rot, EPS, rope_scaling(), pos_ + t * NH, cs);
                     } else {
-                    /*
-                    DPCT1124: cudaMemcpy2DAsync is migrated to asynchronous
-                    memcpy API. While the origin API might be synchronous, it
-                    depends on the type of operand memory, so you may need to
-                    call wait() on event return by memcpy API to ensure
-                    synchronization behavior.
-                    */
-                    if (DPCT_CHECK_ERROR(dpct::async_dpct_memcpy(
-                            qc, (size_t)HD * 4, qfull_ + t * NH * 2 * HD,
-                            (size_t)HD * 2 * 4, (size_t)HD * 4, (size_t)NH,
-                            dpct::device_to_device, *cs)) != 0) {
-                        err = "verify: the q/gate split failed";
-                        return false;
-                    }
+                    cs->memcpy_2d(qc, (size_t) HD * 4, qfull_ + t * NH * 2 * HD, (size_t) HD * 2 * 4, (size_t) HD * 4,
+                                  (size_t) NH);
                     norm_rope(qc, wqn, (int) NH, (int) HD, pos_ + t * NH);
                     }
                     if (st.kv_rot) fwht256_inplace_cuda(qc, NH, cs);   // <Hq, Hk> = <q, k>
@@ -1283,6 +1198,9 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
             return false;
         }
         stamp(l, 16, grp);
+        if (dbgL_)
+            cs->memcpy(dbgL_ + (size_t) l * (size_t) MT * (size_t) (HC * N + 2 * N) + (size_t) MT * HC * N + (size_t) tb * N,
+                       bo_ + tb * N, (size_t) n * N * 4);
         const bool q8_ffn = gr_read_group(1, true, inj_, inj2_);   // true: nat_xq_ holds the MoE input's q8_1 (STRATA_QFUSE)
         // with CPU experts in the window the shared expert forks off once the doorbell is published (it no longer
         // competes with it for the GPU's first microseconds); STRATA_SH_FORK_LATE=0 forks at the top as before
@@ -1291,13 +1209,13 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
             return !e || e[0] != '0';
         }();
         const bool sh_fork = sh_stream_on() && !prof_on_ && !g_stepped &&
-                             sh_cs_ != &dpct::get_in_order_queue() &&
+                             sh_cs_ != &strata::ze::default_stream() &&
                              ev_fork_ != nullptr && ev_join_ != nullptr;
         const bool sh_fork_late = sh_fork && sh_fork_late_env && !ar_on();
-        dpct::queue_ptr sh_stream = sh_fork ? sh_cs_ : cs;
+        strata::ze::Stream* sh_stream = sh_fork ? sh_cs_ : cs;
         if (sh_fork && !sh_fork_late) {
-            dpct::sync_barrier(ev_fork_, cs);
-            (sh_cs_)->ext_oneapi_submit_barrier({*ev_fork_});
+            (cs)->record(*(ev_fork_));
+            (sh_cs_)->wait(*ev_fork_);
         }
         // the window's rows routed in 2 launches (one router GEMV reading the weight once, one
         // top-10) instead of 2 per token; every row's arithmetic is the single-token call's (STRATA_DEC_BATCH=0: old)
@@ -1307,7 +1225,7 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
         const WeightRef* w_sgi = lfuse_on(n) && g_lfuse_gate() ? v.get("ffn_gate_inp_shexp.weight") : nullptr;
         bool sg_ready = false;
         if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && (NE == 512 || NE == 256) && K == 10) {
-            try {   // SYCL port: the fused multi-token router for 256 experts as well (it was 512-only)
+            try {   // the fused multi-token router for 256 experts as well (it was 512-only)
                 if (w_sgi != nullptr)
                     sg_ready = bf16_gemv_fp32_mmvf_multi_aux(mixed_ + tb * N, N, (const uint16_t*) w_router->data,
                                                              logits_ + tb * NE, NE, N, NE, n,
@@ -1359,8 +1277,8 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
                                      m_x_ + tb * N, m_ids_ + tb * K, m_seq_, cs);
             }
             if (sh_fork_late) {
-                dpct::sync_barrier(ev_fork_, cs);
-                (sh_cs_)->ext_oneapi_submit_barrier({*ev_fork_});
+                (cs)->record(*(ev_fork_));
+                (sh_cs_)->wait(*ev_fork_);
             }
             if (step_hook_ && !step_hook_(l, grp)) { if (err.empty()) err = "verify: stepped serve failed"; return false; }
         }
@@ -1397,7 +1315,7 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
                 err = std::string("verify shared expert: ") + e.what();
                 return false;
             }
-            if (sh_fork) dpct::sync_barrier(ev_join_, sh_cs_);
+            if (sh_fork) (sh_cs_)->record(*(ev_join_));
         }
         if (strata::kernels::cpu::expert_layout().native) {
             if (!qdedup)
@@ -1495,9 +1413,9 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
         // Same condition as `sh_fork` above, which is per group and out of scope here: wait only when the fork
         // actually ran (a wait on an event never recorded is a no-op, but saying it outright reads better).
         if (sh_stream_on() && !prof_on_ &&
-            sh_cs_ != &dpct::get_in_order_queue() && ev_fork_ != nullptr &&
+            sh_cs_ != &strata::ze::default_stream() && ev_fork_ != nullptr &&
             ev_join_ != nullptr) {
-            cs->ext_oneapi_submit_barrier({*ev_join_});
+            cs->wait(*ev_join_);
         }
         if (sg_gated_[grp]) {   // STRATA_LFUSE: the shared expert's gate was not applied: the combine applies it (all rows are hits)
             try {
@@ -1534,6 +1452,30 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
     for (int64_t l = lb_; l < le_; ++l)
         for (int grp = 0; grp < G; ++grp) {
             if (!post(l, grp)) return false;
+            if (dbgL_) {
+                float* lay = dbgL_ + (size_t) l * (size_t) MT * (size_t) (HC * N + 2 * N);
+                const int tb = tb_[grp], n = te_[grp] - tb_[grp];
+                cs->memcpy(lay + (size_t) tb * HC * N, Rt(tb), (size_t) n * HC * N * 4);
+                cs->memcpy(lay + (size_t) MT * (HC * N + N) + (size_t) tb * N, bo_ + tb * N, (size_t) n * N * 4);
+            }
+            if (dbgRt_) {
+                const int64_t RW = NE + 2 * K;
+                float* lay = dbgRt_ + (size_t) l * (size_t) MT * (size_t) RW;
+                const int tb = tb_[grp], n = te_[grp] - tb_[grp];
+                cs->memcpy(lay + (size_t) tb * NE, logits_ + (size_t) tb * NE, (size_t) n * NE * 4);
+                cs->memcpy(lay + (size_t) MT * NE + (size_t) tb * K, ids_ + (size_t) tb * K, (size_t) n * K * 4);
+                cs->memcpy(lay + (size_t) MT * (NE + K) + (size_t) tb * K, w_ + (size_t) tb * K, (size_t) n * K * 4);
+            }
+            if (dumpL_ && grp == 0) {
+                float* row = dumpL_ + (size_t) l * DW;
+                cs->memcpy(row, Rt(0), (size_t) HC * N * 4);
+                cs->memcpy(row + (size_t) HC * N, bo_, (size_t) N * 4);
+                cs->memcpy(row + (size_t) (HC + 1) * N, ids_, (size_t) K * 4);
+                cs->memcpy(row + (size_t) (HC + 1) * N + K, w_, (size_t) K * 4);
+                cs->memcpy(row + (size_t) (HC + 1) * N + 2 * K, shared_, (size_t) N * 4);
+                cs->memcpy(row + (size_t) (HC + 2) * N + 2 * K, parts_, (size_t) K * N * 4);
+                if (hits_.d_res) cs->memcpy(row + (size_t) (HC + 2 + K) * N + 2 * K, hits_.d_res + l * NE, (size_t) NE * 4);
+            }
             if (dbgR_ && grp == 0) {   // recorded into the window graph as memcpy nodes
                 cs->memcpy(dbgR_ + (size_t) l * N, Rt(0), (size_t) N * 4);
                 cs->memcpy(dbgM_ + (size_t) l * N, mixed_, (size_t) N * 4);
@@ -1684,30 +1626,25 @@ void Verifier::refresh_ar() {
     }
 }
 
-bool Verifier::capture_segments(int T, std::string& err) try {
+bool Verifier::capture_segments(int T, std::string& err) {
     if (!seg_[T].empty()) return true;
     // every segment's payload is read after the segment drained: its publishes store plainly (elementwise.dp.cpp)
     struct PlainPayload {
         PlainPayload() { strata::kernels::doorbell_plain_payload(!window_host_uncached()); }
         ~PlainPayload() { strata::kernels::doorbell_plain_payload(false); }
     } plain_payload;
-    namespace sx = sycl::ext::oneapi::experimental;
     auto close_segment = [&]() -> bool {
-        dpct::experimental::command_graph_ptr gph = nullptr;
-        dpct::experimental::end_recording(cs_, &gph);
-        if (gph == nullptr) { err = "verify: segment capture produced no graph"; return false; }
-        seg_[T].push_back(new sx::command_graph<sx::graph_state::executable>(gph->finalize()));
-        delete gph;
+        seg_[T].push_back(cs_->end_capture());
         return true;
     };
     auto boundary = [&](int64_t l, int grp, char kind) -> bool {
         if (!close_segment()) return false;
         seg_at_[T].push_back({l, grp});
         seg_kind_[T].push_back(kind);
-        dpct::experimental::begin_recording(cs_);
+        cs_->begin_capture();
         return true;
     };
-    dpct::experimental::begin_recording(cs_);
+    cs_->begin_capture();
     step_hook_ = [&](int64_t l, int grp) { return boundary(l, grp, 1); };
     static const bool split_on = [] { const char* e = std::getenv("STRATA_VERIFY_SPLIT"); return !(e && e[0] == '0'); }();
     if (split_on) step_hook2_ = [&](int64_t l, int grp) { return boundary(l, grp, 0); };
@@ -1726,118 +1663,33 @@ bool Verifier::capture_segments(int T, std::string& err) try {
         std::fprintf(stderr, "strata verify: the %d-token window as %zu graph segments\n", T, seg_[T].size());
     return true;
 }
-catch (sycl::exception const& exc) {
-    err = std::string("verify: segment capture: ") + exc.what();
-    return false;
-}
 
-bool Verifier::capture(int T, std::string &err) try {
+bool Verifier::capture(int T, std::string &err) {
     // stepped mode: the doorbell window as segments; the all-resident (zero-doorbell) graph has no serves and is
     // captured whole below, its one host flag raised before launch (run)
     if (g_stepped && !ar_on() && std::getenv("STRATA_VERIFY_EAGER") == nullptr) return capture_segments(T, err);
-    dpct::experimental::command_graph_exec_ptr &exec_t =
+    strata::ze::Graph* &exec_t =
         ar_off_ ? exec_nr_[T] : exec_[T];
     if (exec_t != nullptr) return true;
-    if (std::getenv("STRATA_VERIFY_EAGER") != nullptr) return true;   // SYCL port: no graph, run() replays the body
-    if (DPCT_CHECK_ERROR(dpct::experimental::begin_recording(cs_)) != 0) {
-        err = "verify: begin capture failed";
-        return false;
-    }
+    if (std::getenv("STRATA_VERIFY_EAGER") != nullptr) return true;   // no graph: run() replays the body
+    cs_->begin_capture();
     std::string rerr;
     const bool ok = record_window(T, cs_, rerr);
-    dpct::experimental::command_graph_ptr graph = nullptr;
-    const dpct::err0 ce =
-        DPCT_CHECK_ERROR(dpct::experimental::end_recording(cs_, &graph));
+    strata::ze::Graph* graph = cs_->end_capture();
     if (!ok) {
-        if (graph) delete (graph);
+        delete graph;
         err = rerr;
         return false;
     }
-    /*
-    DPCT1000: Error handling if-stmt was detected but could not be rewritten.
-    */
-    if (ce != 0) {
-        /*
-        DPCT1009: SYCL reports errors using exceptions and does not use error
-        codes. Please replace the "get_error_string_dummy(...)" with a real
-        error-handling function.
-        */
-        /*
-        DPCT1001: The statement could not be removed.
-        */
-        err = std::string("verify: end capture: ") +
-              dpct::get_error_string_dummy(ce);
-        return false;
-    }
-    if (std::getenv("STRATA_VERIFY_NODES") != nullptr) {   // what the window graph holds
-        size_t nn = 0;
-        dpct::experimental::get_nodes(graph, nullptr, &nn);
-        std::vector<dpct::experimental::node_ptr> nodes(nn);
-        dpct::experimental::get_nodes(graph, nodes.data(), &nn);
-        std::map<std::string, int> kinds;
-        for (dpct::experimental::node_ptr nd : nodes) {
-            sycl::ext::oneapi::experimental::node_type ty;
-            ty = nd->get_type();
-            std::string name = "type" + std::to_string((int) ty);
-            if (ty == sycl::ext::oneapi::experimental::node_type::kernel) {
-                name = "kernel";   // SYCL: no kernel-name introspection on graph nodes
-            } else if (ty == sycl::ext::oneapi::experimental::node_type::memcpy)
-                name = "memcpy";
-            else if (ty == sycl::ext::oneapi::experimental::node_type::memset)
-                name = "memset";
-            ++kinds[name];
-        }
-        std::vector<std::pair<int, std::string>> v;
-        for (auto& [k2, c] : kinds) v.push_back({c, k2});
-        std::sort(v.rbegin(), v.rend());
-        std::fprintf(stderr, "strata verify: the %d-token window graph has %zu nodes:", T, nn);
-        for (size_t i = 0; i < v.size() && i < 40; ++i) std::fprintf(stderr, " %d x %.60s;", v[i].first, v[i].second.c_str());
-        std::fprintf(stderr, "\n");
-    }
-    const dpct::err0 ie = DPCT_CHECK_ERROR(
-        exec_t = new sycl::ext::oneapi::experimental::command_graph<
-            sycl::ext::oneapi::experimental::graph_state::executable>(
-            graph->finalize()));
-    delete (graph);
-    /*
-    DPCT1000: Error handling if-stmt was detected but could not be rewritten.
-    */
-    if (ie != 0) {
-        /*
-        DPCT1009: SYCL reports errors using exceptions and does not use error
-        codes. Please replace the "get_error_string_dummy(...)" with a real
-        error-handling function.
-        */
-        /*
-        DPCT1001: The statement could not be removed.
-        */
-        err = std::string("verify: instantiate: ") +
-              dpct::get_error_string_dummy(ie);
-        return false;
-    }
-    /*
-    DPCT1007: Migration of cudaGraphUpload is not supported.
-    */
-    const dpct::err0 ue = 0;   // no cudaGraphUpload on SYCL: a finalized command_graph is already resident
-    const dpct::err0 us = DPCT_CHECK_ERROR(cs_->wait());
-    std::fprintf(
-        stderr,
-        "strata verify: captured the %d-token window (upload %s, sync %s)\n", T,
-        /*
-        DPCT1009: SYCL reports errors using exceptions and does not use error
-        codes. Please replace the "get_error_string_dummy(...)" with a real
-        error-handling function.
-        */
-        dpct::get_error_string_dummy(ue), dpct::get_error_string_dummy(us));
+    if (std::getenv("STRATA_VERIFY_NODES") != nullptr)
+        std::fprintf(stderr, "strata verify: the %d-token window graph has %zu commands\n", T, graph->nodes());
+    exec_t = graph;
+    cs_->sync();
+    std::fprintf(stderr, "strata verify: captured the %d-token window (%zu commands)\n", T, graph->nodes());
     return true;
 }
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
 
-bool Verifier::capture_commit(std::string &err) try {
+bool Verifier::capture_commit(std::string &err) {
     if (commit_exec_ != nullptr) return true;
     using namespace strata::kernels;
     const ModelGeometry& g = *g_;
@@ -1848,10 +1700,7 @@ bool Verifier::capture_commit(std::string &err) try {
                                 (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
     const int64_t TS = (s.idx_block - 1) * ID;
     const int64_t HS = (int64_t) NG_HIST * NG_HC_DIM;
-    if (DPCT_CHECK_ERROR(dpct::experimental::begin_recording(cs_)) != 0) {
-        err = "verify: begin commit capture failed";
-        return false;
-    }
+    cs_->begin_capture();
     bool ok = true;
     try {
         copy_i32_from_mapped(commit_, m_commit_, 2 + MT, cs_);
@@ -1894,35 +1743,13 @@ bool Verifier::capture_commit(std::string &err) try {
         err = std::string("verify commit: ") + e.what();
         ok = false;
     }
-    dpct::experimental::command_graph_ptr graph = nullptr;
-    const dpct::err0 ce =
-        DPCT_CHECK_ERROR(dpct::experimental::end_recording(cs_, &graph));
+    strata::ze::Graph* graph = cs_->end_capture();
     if (!ok) {
-        if (graph) delete (graph);
+        delete graph;
         return false;
     }
-    if (ce != 0 ||
-        DPCT_CHECK_ERROR(
-            commit_exec_ = new sycl::ext::oneapi::experimental::command_graph<
-                sycl::ext::oneapi::experimental::graph_state::executable>(
-                graph->finalize())) != 0) {
-        if (graph) delete (graph);
-        /*
-        DPCT1009: SYCL reports errors using exceptions and does not use error
-        codes. Please replace the "get_error_string_dummy(...)" with a real
-        error-handling function.
-        */
-        err = std::string("verify: commit capture: ") +
-              dpct::get_error_string_dummy(ce);
-        return false;
-    }
-    delete (graph);
+    commit_exec_ = graph;
     return true;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
 }
 
 void Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0) {
@@ -1952,10 +1779,9 @@ void Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0) {
 }
 
 void Verifier::collect_profile() {
-    if (std::getenv("STRATA_VERIFY_EAGER") == nullptr)   // eager (SYCL port): prof_h_ already holds the host clocks
-        dpct::get_in_order_queue()
-            .memcpy(prof_h_.data(), prof_, prof_h_.size() * 8)
-            .wait();
+    if (std::getenv("STRATA_VERIFY_EAGER") == nullptr) {   // eager: prof_h_ already holds the host clocks
+        strata::ze::copy_sync(prof_h_.data(), prof_, prof_h_.size() * 8);
+    }
     accumulate_profile(prof_h_.data());
 }
 
@@ -1994,7 +1820,7 @@ void Verifier::accumulate_profile(const unsigned long long* stamps) {
 }
 
 bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
-                   void *user, int32_t *out, std::string &err) try {
+                   void *user, int32_t *out, std::string &err) {
     using namespace strata::kernels;
     const OnDevice on_device(device_);
     last_batch_ = false;
@@ -2025,10 +1851,10 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
     trace_ev("WINDOW", -1, -1, pos0 * 16 + T);
     ms_host += ms_since(t0);
     VDBG("staged; launching\n");
-    static Clock::time_point t_prev_end;   // SYCL port timing: where does a round's wall clock go?
+    static Clock::time_point t_prev_end;   // where does a round's wall clock go?
     const Clock::time_point t_launch = Clock::now();
     if (ar_on() && h_plan_err_ != nullptr) *(volatile uint32_t*) h_plan_err_ = 0;
-    {   // SYCL port: on an Arc A750 the first window after other GPU work (a prefill, the previous request) never
+    {   // On an Arc A750 the first window after other GPU work (a prefill, the previous request) never
         // started when it was launched behind that work still in flight on another queue (no GPU breadcrumb, 20 s
         // timeout, the engine dies). Letting the other queues drain before every window removes it (9 of 9 three-request runs pass; before, almost all
         // failed; the gap rule alone (=2) did not help, so it is the windows after each other, not only the first). The cost is
@@ -2036,7 +1862,7 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
         static const char* wv = std::getenv("STRATA_WINDOW_SYNC");
         static const int wmode = wv ? std::atoi(wv) : (intel_i915_gpu() ? 1 : 0);
         const bool first_or_gap = t_prev_end.time_since_epoch().count() == 0 || (t_launch - t_prev_end) > std::chrono::milliseconds(20);
-        if (wmode == 1 || (wmode == 2 && first_or_gap)) dpct::get_current_device().queues_wait_and_throw();
+        if (wmode == 1 || (wmode == 2 && first_or_gap)) strata::ze::device_sync();
     }
     // STRATA_VERIFY_STEPPED (Arc A-series): the doorbell window runs as segments with the CPU experts served at the
     // queue boundaries between them (no mid-kernel host signalling); the all-resident graph gets its one flag (the PLE
@@ -2054,7 +1880,15 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
         *(volatile uint32_t*) h_flag_ = 1;
         std::atomic_thread_fence(std::memory_order_seq_cst);
     }
-    dpct::err0 le = 0;
+    static const bool no_host = [] { const char* v = std::getenv("STRATA_VERIFY_NO_HOST"); return v && *v && std::strcmp(v, "0") != 0; }();
+    if (no_host && !ar_on() && !stepped_run && do_ple) {
+        const Clock::time_point tp = Clock::now();
+        if (!ss.ple.table->gather_batch(ple_rows, (size_t) T, h_ple_, err)) return false;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        _mm_sfence();
+        ms_host += ms_since(tp);
+    }
+    int le = 0;
     if (stepped_run) {
         if (remote_opt_) { err = "verify: STRATA_VERIFY_STEPPED does not serve --remote-expert-opt"; return false; }
         const int Gs = groups_[T] > 0 ? groups_[T] : 1;
@@ -2065,7 +1899,7 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
         // raise flags B and M before the following segment is submitted
         auto serve = [&](int64_t l, int grp, size_t nxt) -> bool {
             const Clock::time_point a = Clock::now();
-            cs_->wait();
+            cs_->sync();
             const Clock::time_point b = Clock::now();
             const uint32_t want = (uint32_t) ((l - lb_) * Gs + grp + 1);
             if (*(volatile uint32_t*) h_seq_ < want) {
@@ -2110,7 +1944,7 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
                     while (!done.load(std::memory_order_acquire) && *(volatile uint32_t*) h_flagA_ != want)
                         std::this_thread::yield();
                     if (done.load(std::memory_order_acquire) && *(volatile uint32_t*) h_flagA_ != want) empty_plan();
-                    cs_->ext_oneapi_graph(*seg_[T][nxt]);   // flag A is up: its waits pass
+                    cs_->launch(*seg_[T][nxt]);   // flag A is up: its waits pass
                     submitted[nxt] = 1;
                     th.join();
                 } catch (const std::exception& e) { err = std::string("verify: pipelined serve: ") + e.what(); return false; }
@@ -2120,9 +1954,9 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
                 std::atomic_thread_fence(std::memory_order_seq_cst);
                 if (*(volatile uint32_t*) h_flagA_ != want) empty_plan();
             }
-            copy_->wait();   // fetch_dma's copies and its flag-B host task
+            copy_->sync();   // fetch_dma's copies and its flag-B host task
             std::atomic_thread_fence(std::memory_order_seq_cst);
-            raise_flag(h_flagB_, want);
+            raise_b(want);
             if (want == 1 && do_ple) {   // layer 1's pre copies h_ple_ after layer 0's wait on the M flag
                 const Clock::time_point tp = Clock::now();
                 if (!ss.ple.table->gather_batch(ple_rows, (size_t) T, h_ple_, err)) return false;
@@ -2139,7 +1973,7 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
         try {
             for (size_t i = 0; i < seg_[T].size() && le == 0; ++i) {
                 const bool has_entry = i < seg_at_[T].size();
-                if (!submitted[i]) cs_->ext_oneapi_graph(*seg_[T][i]);   // (a split segment: its serve submitted it)
+                if (!submitted[i]) cs_->launch(*seg_[T][i]);   // (a split segment: its serve submitted it)
                 if (has_entry && seg_kind_[T][i] == 1 && !serve(seg_at_[T][i].first, seg_at_[T][i].second, i + 1)) {
                     if (err.empty()) err = "verify: stepped serve failed";
                     le = 1;
@@ -2150,39 +1984,24 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
         ms_pool += st_pool;
         if (le != 0) return false;
     } else {
-        le = (std::getenv("STRATA_VERIFY_EAGER") != nullptr)
-                 ? (record_window(T, cs_, err) ? 0 : 1)   // SYCL port: eager replay of the window body
-                 : DPCT_CHECK_ERROR((cs_)->ext_oneapi_graph(*(ar_off_ ? exec_nr_[T] : exec_[T])));
+        if (std::getenv("STRATA_VERIFY_EAGER") != nullptr) le = record_window(T, cs_, err) ? 0 : 1;   // eager replay of the window body
+        else cs_->launch(*(ar_off_ ? exec_nr_[T] : exec_[T]));
     }
-    /*
-    DPCT1009: SYCL reports errors using exceptions and does not use error
-    codes. Please replace the "get_error_string_dummy(...)" with a real
-    error-handling function.
-    */
-    /*
-    DPCT1001: The statement could not be removed.
-    */
-    /*
-    DPCT1000: Error handling if-stmt was detected but could not be rewritten.
-    */
     trace_ev("LAUNCHED", -1, -1, (int64_t) le);
     if (le != 0) {
-        err =
-            std::string("verify: launch: ") + dpct::get_error_string_dummy(le);
+        if (err.empty()) err = "verify: launch failed";
         return false;
     }
-    (void)DPCT_CHECK_ERROR(((cs_)->ext_oneapi_empty()));
     VDBG("launched\n");
     volatile uint32_t* const seq = h_seq_;
     volatile uint32_t* const flag = h_flag_;
     const int G = groups_[T] > 0 ? groups_[T] : 1;
     const int gtb[2] = {0, (T + 1) / 2}, gte[2] = {G == 2 ? (T + 1) / 2 : T, T};
-    // SYCL port: with every routed expert resident the GPU takes its own plan (`device_plan_`) and skips every
+    // With every routed expert resident the GPU takes its own plan (`device_plan_`) and skips every
     // host flag, so the host has nothing to do per layer - and on this platform a kernel's writes to host-mapped
     // memory are not reliably visible while the graph runs (measured: the ring is seen late or not at all),
     // so waiting on them per layer fails. STRATA_VERIFY_NO_HOST=1 waits for the whole window instead. Only for
     // an all-resident cache: a missed expert would leave the GPU waiting for a plan that never comes.
-    static const bool no_host = [] { const char* v = std::getenv("STRATA_VERIFY_NO_HOST"); return v && *v && std::strcmp(v, "0") != 0; }();
     const int64_t steps = (le_ - lb_) * G;
     const bool test_stall = g_test_stall > 0 && windows + 1 == g_test_stall;   // #267 test hook (off: false)
     if (stepped_run || stepped_ar) {
@@ -2213,31 +2032,20 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
             const auto now = Clock::now();
             if (now - last_flush > std::chrono::microseconds(2000)) {
                 last_flush = now;
-                // SYCL port fix: cudaStreamQuery's answer (0 finished, 1 still running) was lost in the migration
-                // (DPCT_CHECK_ERROR of ext_oneapi_empty() is always 0), so ANY wait over 2 ms was reported as
-                // "graph finished". Layers whose GPU time exceeds 2 ms (host-mirrored experts read over PCIe) failed that way.
-                const dpct::err0 q = cs_->ext_oneapi_empty() ? 0 : 1;
+                const int q = cs_->idle() ? 0 : 1;
                 if (q != 1 && *seq < want) {
                     trace_ev("NEVER-RANG", k, l, (int64_t) q);
                     trace_dump(stderr);
                     err = "verify: layer " + std::to_string(l) +
                           " never rang (" +
-                          /*
-                          DPCT1009: SYCL reports errors using exceptions and
-                          does not use error codes. Please replace the
-                          "get_error_string_dummy(...)" with a real
-                          error-handling function.
-                          */
-                          (q == 0
-                               ? std::string("graph finished")
-                               : std::string(dpct::get_error_string_dummy(q))) +
+                          std::string("graph finished") +
                           ")";
                     return false;
                 }
             }
             if (now - a > strata_ring_timeout()) {
                 // #267: the caller ends the engine; no spin kernel may outlive it
-                trace_ev("TIMEOUT", k, l, (int64_t) !cs_->ext_oneapi_empty());   // SYCL port: 1 = still running
+                trace_ev("TIMEOUT", k, l, (int64_t) !cs_->idle());   // 1 = still running
                 if (g_trace) {
                     diag(stderr);   // the words and the breadcrumbs before the release ...
                     const bool drained = release_gpu_waits(5000);
@@ -2282,7 +2090,7 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
             sink_.start2[0] = 0;
             std::atomic_thread_fence(std::memory_order_seq_cst);
             *(volatile uint32_t*) h_flagA_ = want;
-            raise_flag(h_flagB_, want);
+            raise_b(want);
         }
         // Layer 1's pre(1, 0) copies h_ple_ -> ple_ after Layer 0's wait_flag_ge(m_flag_, 1).
         // By collecting PLE here at k == 0 (after publishing flagA/flagB for Layer 0 so the GPU can run
@@ -2305,8 +2113,8 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
     // watchdog then releases every verifier's GPU waits (release_live_verifiers) before it ends the engine, so no
     // spin kernel outlives the process.  The wait itself stays a blocking sync (a polling wait cost decode upstream).
     trace_ev("SYNC", -1, -1, 0);
-    const dpct::err0 se = DPCT_CHECK_ERROR(cs_->wait());
-    trace_ev("SYNCED", -1, -1, (int64_t) se);
+    cs_->sync();
+    trace_ev("SYNCED", -1, -1, 0);
     const Clock::time_point t_done = Clock::now();
     if (std::getenv("STRATA_VERIFY_DEBUG") != nullptr) {
         std::fprintf(stderr, "verify dbg: T=%d window: since previous window %.1f ms, staging %.1f ms, gpu %.1f ms\n", T,
@@ -2315,34 +2123,20 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
                      std::chrono::duration<double, std::milli>(t_done - t_launch).count());
     }
     t_prev_end = t_done;
-    /*
-    DPCT1009: SYCL reports errors using exceptions and does not use error
-    codes. Please replace the "get_error_string_dummy(...)" with a real
-    error-handling function.
-    */
-    /*
-    DPCT1001: The statement could not be removed.
-    */
-    /*
-    DPCT1000: Error handling if-stmt was detected but could not be rewritten.
-    */
-    if (se != 0) {
-        err = std::string("verify: ") + dpct::get_error_string_dummy(se);
-        return false;
-    }
-    if (no_host && std::getenv("STRATA_VERIFY_DEBUG") != nullptr) {   // SYCL port: what the window left behind
+    if (dumpL_) dump_window(T, tokens, pos0);
+    if (no_host && std::getenv("STRATA_VERIFY_DEBUG") != nullptr) {   // what the window left behind
         const int Gd = groups_[T] > 0 ? groups_[T] : 1;
         std::vector<uint32_t> sk((size_t) Gd, 0);
         std::vector<int32_t> id0((size_t) ss.k, 0);
         std::vector<int32_t> res0((size_t) 16, 0);
-        cs_->memcpy(sk.data(), skip_, sk.size() * 4).wait();
-        cs_->memcpy(id0.data(), ids_, id0.size() * 4).wait();
-        cs_->memcpy(res0.data(), hits_.d_res, res0.size() * 4).wait();
+        cs_->memcpy(sk.data(), skip_, sk.size() * 4); cs_->sync();
+        cs_->memcpy(id0.data(), ids_, id0.size() * 4); cs_->sync();
+        cs_->memcpy(res0.data(), hits_.d_res, res0.size() * 4); cs_->sync();
         std::fprintf(stderr, "verify dbg: window T=%d: host seq=%u (expected %lld), skip[]=", T, *(volatile uint32_t*) h_seq_,
                      (long long) ((le_ - lb_) * Gd));
         for (int i = 0; i < Gd; ++i) std::fprintf(stderr, " %u", sk[(size_t) i]);
         std::vector<float> w0((size_t) ss.k, 0.f);
-        cs_->memcpy(w0.data(), w_, w0.size() * 4).wait();
+        cs_->memcpy(w0.data(), w_, w0.size() * 4); cs_->sync();
         std::fprintf(stderr, "; layer-0 weights:");
         for (size_t i = 0; i < w0.size(); ++i) std::fprintf(stderr, " %.3g", w0[i]);
         std::fprintf(stderr, "; layer-0 ids:");
@@ -2353,7 +2147,7 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
                      ((volatile int32_t*) h_out_)[2], ((volatile int32_t*) h_out_)[3]);
         auto stat = [&](const char* what, const float* dev, size_t n) {   // token 0's vector: where do the zeros begin?
             std::vector<float> v(n, 0.f);
-            cs_->memcpy(v.data(), dev, n * 4).wait();
+            cs_->memcpy(v.data(), dev, n * 4); cs_->sync();
             double sum = 0, mx = 0; size_t nonfinite = 0;
             for (float x : v) { if (!std::isfinite(x)) { ++nonfinite; continue; } sum += std::fabs(x); mx = std::max(mx, (double) std::fabs(x)); }
             std::fprintf(stderr, "verify dbg:   %-8s n=%zu mean|.|=%.4g max|.|=%.4g nonfinite=%zu first4=%g %g %g %g\n", what, n,
@@ -2362,8 +2156,8 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
         if (dbgR_) {
             const size_t N = (size_t) g.n_embd;
             std::vector<float> r((size_t) g.n_layers * N), m((size_t) g.n_layers * N);
-            cs_->memcpy(r.data(), dbgR_, r.size() * 4).wait();
-            cs_->memcpy(m.data(), dbgM_, m.size() * 4).wait();
+            cs_->memcpy(r.data(), dbgR_, r.size() * 4); cs_->sync();
+            cs_->memcpy(m.data(), dbgM_, m.size() * 4); cs_->sync();
             for (int64_t l = 0; l < g.n_layers; ++l) {
                 double sr = 0, sm = 0; size_t nr = 0, nm = 0;
                 for (size_t i = 0; i < N; ++i) {
@@ -2377,7 +2171,7 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
         }
         {   // the device plan of the last layer group and the MoE parts it produced (token 0)
             std::vector<int32_t> pc(4, 0);
-            cs_->memcpy(pc.data(), plan_, 16).wait();
+            cs_->memcpy(pc.data(), plan_, 16); cs_->sync();
             std::fprintf(stderr, "verify dbg:   plan (last layer, grp 0): groups=%d entries=%d pcie=%d\n", pc[0], pc[1], pc[2]);
         }
         stat("parts_", parts_, (size_t) ss.k * g.n_embd);
@@ -2396,13 +2190,13 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
     commit_pending_ = false;
     progress_at("verify window: waiting for the expert copies", (int64_t) T);
     if (copy_used_) {
-        copy_->wait(); // no host function of this window may raise flag B in
+        copy_->sync(); // no host function of this window may raise flag B in
                        // the next one
         copy_used_ = false;
     }
     if (prof_on_ && G == 1) {   // the window's GPU stage stamps
         collect_profile();
-        if (std::getenv("STRATA_VERIFY_EAGER") != nullptr)   // SYCL port: the stage table per window, host-clocked
+        if (std::getenv("STRATA_VERIFY_EAGER") != nullptr)   // the stage table per window, host-clocked
             std::fprintf(stderr, "verify stages T=%d (ms/window):%s\n", T, profile_report().c_str());
     }
     // ---- a sampled or penalized request: the head's sampling again, host-side so its parameters are this call's
@@ -2418,20 +2212,14 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
         SamplerParams sp = sampling_;
         sp.counter = (uint64_t) pos0;
         sample_tokens(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);
-        if (DPCT_CHECK_ERROR(cs_->wait()) !=
-            0) { // m_out_ is the mapped h_out_: synced, it is readable
-            err = "verify: the head sampling failed";
-            return false;
-        }
+        cs_->sync();   // m_out_ is the mapped h_out_: synced, it is readable
     }
     for (int t = 0; t < T; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
     if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg) {   // debug: the first non-finite head
         static bool reported = false;
         if (!reported) {
             std::vector<float> h((size_t) T * (size_t) n_vocab_);
-            dpct::get_in_order_queue()
-                .memcpy(h.data(), head_logits_, h.size() * 4)
-                .wait();
+            strata::ze::copy_sync(h.data(), head_logits_, h.size() * 4);
             for (int t = 0; t < T && !reported; ++t) {
                 int64_t bad = 0;
                 for (int64_t v = 0; v < n_vocab_; ++v) bad += !std::isfinite(h[(size_t) t * n_vocab_ + v]);
@@ -2448,11 +2236,6 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
     progress_at("decode");
     progress_beat();
     return true;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
 }
 
 void Verifier::set_plan_slot(int grp) {
@@ -2493,10 +2276,10 @@ void Verifier::raise_flag(uint32_t* flag, uint32_t value) {
 // GPU its VRAM experts; a host function raises flag B when they have landed (the graph waits for it before the PCIe
 // groups).  Staging is split between the two token groups of a split window.
 void Verifier::fetch_dma(void *ctx, const uint8_t *const *src, int n,
-                         size_t bytes) try {
+                         size_t bytes) {
     Verifier* v = (Verifier*) ctx;
     const uint32_t want = v->cur_layer_ + 1;
-    if (n <= 0) { raise_flag(v->h_flagB_, want); return; }
+    if (n <= 0) { v->raise_b(want); return; }
     v->copy_used_ = true;
     uint8_t* stage = (uint8_t*) v->sink_.staging;                  // this group's half in a split window
     // STRATA_DMA_BATCH (midhatn's #807, F12): the group's independent uploads as one cudaMemcpyBatchAsync.  Mode 0 is
@@ -2505,48 +2288,53 @@ void Verifier::fetch_dma(void *ctx, const uint8_t *const *src, int n,
     // copied.
     const int batch_mode = strata::core::dma_batch_mode();
     if (batch_mode == 0) {
-        /*
-        DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy API.
-        While the origin API might be synchronous, it depends on the type of
-        operand memory, so you may need to call wait() on event return by memcpy
-        API to ensure synchronization behavior.
-        */
         for (int i = 0; i < n; ++i)
             v->copy_->memcpy(stage + (size_t)i * bytes, src[i], bytes);
     } else {
-        const auto copied = strata::core::copy_expert_blobs(stage, src, n, bytes, v->copy_, batch_mode);
-        /*
-        DPCT1000: Error handling if-stmt was detected but could not be
-        rewritten.
-        */
-        if (copied != 0) {
-            /*
-            DPCT1009: SYCL reports errors using exceptions and does not use
-            error codes. Please replace the "get_error_string_dummy(...)" with a
-            real error-handling function.
-            */
-            std::fprintf(stderr, "strata DMA: expert upload failed: %s\n",
-                         dpct::get_error_string_dummy(copied));
-            /*
-            DPCT1001: The statement could not be removed.
-            */
-            std::fflush(stderr);
-            v->release_gpu_waits(5000);
-            std::abort();
-        }
+        strata::core::copy_expert_blobs(stage, src, n, bytes, v->copy_, batch_mode);
     }
     FlagSet& fs = v->flag_sets_[v->cur_layer_ % (sizeof v->flag_sets_ / sizeof v->flag_sets_[0])];
     fs.flag = v->h_flagB_;
     fs.value = want;
-  FlagSet* fsp = &fs;
-  v->copy_->submit([&](sycl::handler &cgh) {
-    cgh.host_task([=]() { raise_flag(fsp->flag, fsp->value); });
-  });
+    strata::ze::host_func(*v->copy_, [](void* p) { raise_flag(((FlagSet*) p)->flag, ((FlagSet*) p)->value); }, &fs);
 }
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+
+void Verifier::dump_window(int T, const int32_t* tokens, int64_t pos0) {
+    static const char* dir = std::getenv("STRATA_DUMP_WINDOWS");
+    static const int64_t max_w = [] { const char* v = std::getenv("STRATA_DUMP_WINDOWS_MAX"); return v ? std::atoll(v) : 64; }();
+    const int64_t seq = dump_seq_++;
+    if (seq >= max_w) return;
+    const ModelGeometry& g = *g_;
+    const int64_t K = ss_->k;
+    const size_t DW = (size_t) (g.hc * g.n_embd + 2 * g.n_embd + 2 * K + K * g.n_embd + g.n_expert);
+    std::vector<float> h((size_t) (g.n_layers + 1) * DW);
+    cs_->memcpy(h.data(), dumpL_, h.size() * 4);
+    cs_->sync();
+    char path[1024];
+    std::snprintf(path, sizeof path, "%s/w%04lld_l%02lld-%02lld.bin", dir, (long long) seq, (long long) lb_, (long long) le_);
+    std::FILE* f = std::fopen(path, "wb");
+    if (f == nullptr) {
+        std::fprintf(stderr, "strata verify: STRATA_DUMP_WINDOWS: cannot write %s\n", path);
+        return;
+    }
+    const int32_t hdr[10] = {0x32574453, (int32_t) lb_, (int32_t) le_, (int32_t) g.n_layers, (int32_t) g.hc,
+                             (int32_t) g.n_embd, T, (int32_t) pos0, (int32_t) K, (int32_t) g.n_expert};
+    std::fwrite(hdr, sizeof hdr, 1, f);
+    std::fwrite(tokens, 4, (size_t) T, f);
+    for (int64_t l = lb_; l < le_; ++l) std::fwrite(h.data() + (size_t) l * DW, 4, DW, f);
+    std::fwrite(h.data() + (size_t) g.n_layers * DW, 4, DW, f);
+    std::fclose(f);
+}
+
+void Verifier::raise_b(uint32_t want) {
+    if (!copy_used_ || copy_ == nullptr || copy_->idle()) {
+        raise_flag(h_flagB_, want);
+        return;
+    }
+    FlagSet& fs = flag_sets_[(want - 1) % (sizeof flag_sets_ / sizeof flag_sets_[0])];
+    fs.flag = h_flagB_;
+    fs.value = want;
+    strata::ze::host_func(*copy_, [](void* p) { raise_flag(((FlagSet*) p)->flag, ((FlagSet*) p)->value); }, &fs);
 }
 
 void Verifier::publish_plan(void* ctx) {
@@ -2556,7 +2344,7 @@ void Verifier::publish_plan(void* ctx) {
 }
 
 bool Verifier::window_logprobs(const int32_t* targets, int T, int64_t pos0, int32_t extra_id, std::FILE* out,
-                               std::string& err) try {
+                               std::string& err) {
     if (next_ != nullptr) return next_->window_logprobs(targets, T, pos0, extra_id, out, err);
     const OnDevice on_device(device_);
     if (head_logits_ == nullptr || n_vocab_ <= 0 || T <= 0 || targets == nullptr || out == nullptr) {
@@ -2565,7 +2353,8 @@ bool Verifier::window_logprobs(const int32_t* targets, int T, int64_t pos0, int3
     }
     // run() synchronized cs_ before returning, so the head of this window is complete
     std::vector<float> h((size_t) T * (size_t) n_vocab_);
-    cs_->memcpy(h.data(), head_logits_, h.size() * sizeof(float)).wait();
+    cs_->memcpy(h.data(), head_logits_, h.size() * sizeof(float));
+    cs_->sync();
     for (int t = 0; t < T; ++t) {
         const float* row = h.data() + (size_t) t * (size_t) n_vocab_;
         const int32_t tgt = targets[t];
@@ -2606,15 +2395,12 @@ bool Verifier::window_logprobs(const int32_t* targets, int T, int64_t pos0, int3
     }
     std::fflush(out);
     return true;
-} catch (sycl::exception const& e) {
-    err = std::string("window_logprobs: ") + e.what();
-    return false;
 }
 
 namespace { bool g_commit_async = false; }
 void Verifier::set_commit_async(bool on) { g_commit_async = on && std::getenv("STRATA_COMMIT_SYNC") == nullptr; }
 
-bool Verifier::commit(int n_keep, std::string &err) try {
+bool Verifier::commit(int n_keep, std::string &err) {
     const OnDevice on_device(device_);
     if (n_keep < 1 || n_keep > last_t_) { err = "verify: commit count out of range"; return false; }
     const Clock::time_point t0 = Clock::now();
@@ -2625,74 +2411,14 @@ bool Verifier::commit(int n_keep, std::string &err) try {
         // a one-token window has advanced the state itself (record_window): no commit graph
     } else {
         std::atomic_thread_fence(std::memory_order_seq_cst);
-        const dpct::err0 le =
-            DPCT_CHECK_ERROR((cs_)->ext_oneapi_graph(*commit_exec_));
-        /*
-        DPCT1009: SYCL reports errors using exceptions and does not use error
-        codes. Please replace the "get_error_string_dummy(...)" with a real
-        error-handling function.
-        */
-        /*
-        DPCT1001: The statement could not be removed.
-        */
-        /*
-        DPCT1000: Error handling if-stmt was detected but could not be
-        rewritten.
-        */
-        if (le != 0) {
-          err = std::string("verify: commit launch: ") +
-                dpct::get_error_string_dummy(le);
-          return false;
-        }
+        cs_->launch(*commit_exec_);
         // set_commit_async: no wait here - the next window runs on the same stream after it, and the drafter (its own
         // stream) reads only this window's final rows and its own K/V. h_commit_ is next written after the next window's
         // results are read, i.e. after this graph has run.  Everything else waits on commit_done_ (wait_commit).
         if (!g_commit_async || next_ != nullptr) {
-            const dpct::err0 se = DPCT_CHECK_ERROR(cs_->wait());
-            /*
-            DPCT1009: SYCL reports errors using exceptions and does not use
-            error codes. Please replace the "get_error_string_dummy(...)" with a
-            real error-handling function.
-            */
-            /*
-            DPCT1001: The statement could not be removed.
-            */
-            /*
-            DPCT1000: Error handling if-stmt was detected but could not be
-            rewritten.
-            */
-            if (se != 0) {
-              err = std::string("verify: commit: ") +
-                    dpct::get_error_string_dummy(se);
-              return false;
-            }
+            cs_->sync();
         } else {
-            /*
-            DPCT1024: The original code returned the error code that was
-            further consumed by the program logic. This original code was
-            replaced with 0. You may need to rewrite the program logic consuming
-            the error code.
-            */
-            const dpct::err0 re =
-                DPCT_CHECK_ERROR(dpct::sync_barrier(commit_done_, cs_));
-            /*
-            DPCT1009: SYCL reports errors using exceptions and does not use
-            error codes. Please replace the "get_error_string_dummy(...)" with a
-            real error-handling function.
-            */
-            /*
-            DPCT1001: The statement could not be removed.
-            */
-            /*
-            DPCT1000: Error handling if-stmt was detected but could not be
-            rewritten.
-            */
-            if (re != 0) {
-              err = std::string("verify: commit event: ") +
-                    dpct::get_error_string_dummy(re);
-              return false;
-            }
-            (void)DPCT_CHECK_ERROR(((cs_)->ext_oneapi_empty()));
+            cs_->record(*commit_done_);
             commit_pending_ = true;
         }
     }
@@ -2704,45 +2430,18 @@ bool Verifier::commit(int n_keep, std::string &err) try {
     ms_commit += ms_since(t0);
     return next_ == nullptr || next_->commit(n_keep, err);
 }
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
 
-bool Verifier::wait_commit(std::string &err) try {
+bool Verifier::wait_commit(std::string &err) {
     if (commit_pending_) {
         const OnDevice on_device(device_);
         commit_pending_ = false;
-        const dpct::err0 se = DPCT_CHECK_ERROR(commit_done_->wait_and_throw());
-        /*
-        DPCT1009: SYCL reports errors using exceptions and does not use error
-        codes. Please replace the "get_error_string_dummy(...)" with a real
-        error-handling function.
-        */
-        /*
-        DPCT1001: The statement could not be removed.
-        */
-        /*
-        DPCT1000: Error handling if-stmt was detected but could not be
-        rewritten.
-        */
-        if (se != 0) {
-          err = std::string("verify: commit: ") +
-                dpct::get_error_string_dummy(se);
-          return false;
-        }
+        commit_done_->sync();
     }
     return next_ == nullptr || next_->wait_commit(err);
 }
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
 
-// SYCL port: capture every window graph now (one per window size) instead of on first use, so the first request
-// does not pay for them (a 2,400-node graph takes tens of ms to finalize on this backend).
+// Record every window graph now (one per window size) instead of on first use, so the first request does not pay for
+// them (a 2,400-command window takes tens of ms to record).
 bool Verifier::warm(std::string &err) {
     for (int T = 1; T <= max_t_; ++T)
         if (!capture(T, err)) return false;
@@ -2752,7 +2451,7 @@ bool Verifier::warm(std::string &err) {
 // ================================ BATCH WINDOWS (see init_slots) ================================
 
 bool Verifier::init_slots(const std::vector<SessionState *> &slots,
-                          std::string &err) try {
+                          std::string &err) {
     const OnDevice on_device(device_);
     if (g_ == nullptr || ss_ == nullptr) { err = "verify: init_slots before init"; return false; }
     if (slots.empty()) {
@@ -2775,10 +2474,8 @@ bool Verifier::init_slots(const std::vector<SessionState *> &slots,
         return false;
     }
     const uint64_t a = ((uint64_t) S * CB * 4 + 255) & ~255ull;
-    if (DPCT_CHECK_ERROR(
-            d = (void *)sycl::malloc_device(
-                a + (uint64_t)S * std::max<int64_t>(nQ, 1) * TS * 4,
-                dpct::get_in_order_queue())) != 0) {
+    d = strata::ze::malloc_device(a + (uint64_t) S * std::max<int64_t>(nQ, 1) * TS * 4);
+    if (d == nullptr) {
         err = "verify: the batch buffers do not fit";
         return false;
     }
@@ -2791,21 +2488,13 @@ bool Verifier::init_slots(const std::vector<SessionState *> &slots,
                  (long long) lb_, (long long) le_);
     return true;
 }
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
 
 bool Verifier::capture_batch(const int *rows, int S, int hbase,
-                             std::string &err) try {
-    dpct::experimental::command_graph_exec_ptr &ex =
+                             std::string &err) {
+    strata::ze::Graph* &ex =
         exec_bm_[bkey(rows, S, hbase)];
     if (ex != nullptr) return true;
-    if (DPCT_CHECK_ERROR(dpct::experimental::begin_recording(cs_)) != 0) {
-        err = "verify: begin batch capture failed";
-        return false;
-    }
+    cs_->begin_capture();
     batch_rec_ = true;
     row_base_ = hbase;
     for (int t = 0; t < S; ++t) brow_[t] = rows[t];
@@ -2813,61 +2502,23 @@ bool Verifier::capture_batch(const int *rows, int S, int hbase,
     const bool ok = record_window(S, cs_, rerr);
     batch_rec_ = false;
     row_base_ = 0;
-    dpct::experimental::command_graph_ptr graph = nullptr;
-    const dpct::err0 ce =
-        DPCT_CHECK_ERROR(dpct::experimental::end_recording(cs_, &graph));
-    if (!ok || ce != 0) {
-        if (graph) delete (graph);
-        /*
-        DPCT1009: SYCL reports errors using exceptions and does not use error
-        codes. Please replace the "get_error_string_dummy(...)" with a real
-        error-handling function.
-        */
-        err = !ok ? rerr
-                  : std::string("verify: end batch capture: ") +
-                        dpct::get_error_string_dummy(ce);
+    strata::ze::Graph* graph = cs_->end_capture();
+    if (!ok) {
+        delete graph;
+        err = rerr;
         return false;
     }
-    const dpct::err0 ie = DPCT_CHECK_ERROR(
-        ex = new sycl::ext::oneapi::experimental::command_graph<
-            sycl::ext::oneapi::experimental::graph_state::executable>(
-            graph->finalize()));
-    delete (graph);
-    /*
-    DPCT1009: SYCL reports errors using exceptions and does not use error
-    codes. Please replace the "get_error_string_dummy(...)" with a real
-    error-handling function.
-    */
-    /*
-    DPCT1001: The statement could not be removed.
-    */
-    /*
-    DPCT1000: Error handling if-stmt was detected but could not be rewritten.
-    */
-    if (ie != 0) {
-      err = std::string("verify: batch instantiate: ") +
-            dpct::get_error_string_dummy(ie);
-      return false;
-    }
-    /*
-    DPCT1007: Migration of cudaGraphUpload is not supported.
-    */
-    // no cudaGraphUpload on SYCL: a finalized command_graph is already resident
-    cs_->wait();
+    ex = graph;
+    cs_->sync();
     std::string list;
     for (int t = 0; t < S; ++t) list += (t ? "," : "") + std::to_string(rows[t]);
     std::fprintf(stderr, "strata verify: captured the batch window over slots %s\n", list.c_str());
     return true;
 }
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
 
 bool Verifier::capture_commit_batch(const int *rows, int S, int hbase,
-                                    std::string &err) try {
-    dpct::experimental::command_graph_exec_ptr &cex =
+                                    std::string &err) {
+    strata::ze::Graph* &cex =
         commit_bm_[bkey(rows, S, hbase)];
     if (cex != nullptr) return true;
     using namespace strata::kernels;
@@ -2879,10 +2530,7 @@ bool Verifier::capture_commit_batch(const int *rows, int S, int hbase,
                                 (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
     const int64_t TS = (s.idx_block - 1) * ID;
     const int64_t HS = (int64_t) NG_HIST * NG_HC_DIM;
-    if (DPCT_CHECK_ERROR(dpct::experimental::begin_recording(cs_)) != 0) {
-        err = "verify: begin batch commit capture failed";
-        return false;
-    }
+    cs_->begin_capture();
     bool ok = true;
     try {
         for (int t = 0; t < S; ++t)
@@ -2943,40 +2591,18 @@ bool Verifier::capture_commit_batch(const int *rows, int S, int hbase,
         err = std::string("verify batch commit: ") + e.what();
         ok = false;
     }
-    dpct::experimental::command_graph_ptr graph = nullptr;
-    const dpct::err0 ce =
-        DPCT_CHECK_ERROR(dpct::experimental::end_recording(cs_, &graph));
+    strata::ze::Graph* graph = cs_->end_capture();
     if (!ok) {
-        if (graph) delete (graph);
+        delete graph;
         return false;
     }
-    if (ce != 0 ||
-        DPCT_CHECK_ERROR(
-            cex = new sycl::ext::oneapi::experimental::command_graph<
-                sycl::ext::oneapi::experimental::graph_state::executable>(
-                graph->finalize())) != 0) {
-        if (graph) delete (graph);
-        /*
-        DPCT1009: SYCL reports errors using exceptions and does not use error
-        codes. Please replace the "get_error_string_dummy(...)" with a real
-        error-handling function.
-        */
-        err = std::string("verify: batch commit capture: ") +
-              dpct::get_error_string_dummy(ce);
-        return false;
-    }
-    delete (graph);
+    cex = graph;
     return true;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
 }
 
 bool Verifier::stage_batch(const int *rows, int S, int hbase,
                            const int32_t *tokens, const int64_t *pos,
-                           std::string &err) try {
+                           std::string &err) {
     using namespace strata::kernels;
     if (S < 1 || S > max_t_ || hbase < 0 ||
         (next_ != nullptr && hbase + S > (int) slots_.size())) {
@@ -3015,10 +2641,7 @@ bool Verifier::stage_batch(const int *rows, int S, int hbase,
     if (batch_graph_limit_ > 0) {
         const auto key = bkey(rows, S, hbase);
         if (exec_bm_.find(key) == exec_bm_.end() && exec_bm_.size() >= batch_graph_limit_) {
-            if (DPCT_CHECK_ERROR(cs_->wait()) != 0) {
-                err = "verify: synchronizing before batch graph eviction failed";
-                return false;
-            }
+            cs_->sync();
             auto old = exec_bm_.begin();
             uint64_t oldest = UINT64_MAX;
             for (auto it = exec_bm_.begin(); it != exec_bm_.end(); ++it) {
@@ -3089,11 +2712,6 @@ bool Verifier::stage_batch(const int *rows, int S, int hbase,
     ms_host += ms_since(t0);
     return true;
 }
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
 
 bool Verifier::run_slots(int S, const int32_t* tokens, const int64_t* pos, PoolMultiFn pool, void* user, int32_t* out,
                          std::string& err) {
@@ -3104,30 +2722,12 @@ bool Verifier::run_slots(int S, const int32_t* tokens, const int64_t* pos, PoolM
 
 bool Verifier::run_slot_rows(const int *rows, int S, const int32_t *tokens,
                              const int64_t *pos, PoolMultiFn pool, void *user,
-                             int32_t *out, std::string &err) try {
+                             int32_t *out, std::string &err) {
     using namespace strata::kernels;
     const OnDevice on_device(device_);
     const ModelGeometry& g = *g_;
     if (!stage_batch(rows, S, 0, tokens, pos, err)) return false;
-    const dpct::err0 le =
-        DPCT_CHECK_ERROR((cs_)->ext_oneapi_graph(*exec_bm_[bkey(rows, S, 0)]));
-    /*
-    DPCT1009: SYCL reports errors using exceptions and does not use error
-    codes. Please replace the "get_error_string_dummy(...)" with a real
-    error-handling function.
-    */
-    /*
-    DPCT1001: The statement could not be removed.
-    */
-    /*
-    DPCT1000: Error handling if-stmt was detected but could not be rewritten.
-    */
-    if (le != 0) {
-      err = std::string("verify: batch launch: ") +
-            dpct::get_error_string_dummy(le);
-      return false;
-    }
-    (void)DPCT_CHECK_ERROR(((cs_)->ext_oneapi_empty()));
+    cs_->launch(*exec_bm_[bkey(rows, S, 0)]);
     volatile uint32_t* const seq = h_seq_;
     volatile uint32_t* const flag = h_flag_;
     const int64_t steps = le_ - lb_;
@@ -3142,25 +2742,8 @@ bool Verifier::run_slot_rows(const int *rows, int S, const int32_t *tokens,
             _mm_sfence();
             *flag = 1;
         }
-        const dpct::err0 se = DPCT_CHECK_ERROR(cs_->wait());
-        /*
-        DPCT1009: SYCL reports errors using exceptions and does not use error
-        codes. Please replace the "get_error_string_dummy(...)" with a real
-        error-handling function.
-        */
-        /*
-        DPCT1001: The statement could not be removed.
-        */
-        /*
-        DPCT1000: Error handling if-stmt was detected but could not be
-        rewritten.
-        */
-        if (se != 0) {
-          err =
-              std::string("verify batch: ") + dpct::get_error_string_dummy(se);
-          return false;
-        }
-        copy_->wait();
+        cs_->sync();
+        copy_->sync();
         if (prof_on_) collect_profile();
         ++windows;
         if (le_ < g.n_layers) return next_ == nullptr || next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err);
@@ -3183,19 +2766,11 @@ bool Verifier::run_slot_rows(const int *rows, int S, const int32_t *tokens,
             const auto now = Clock::now();
             if (now - last_flush > std::chrono::microseconds(2000)) {
                 last_flush = now;
-                const dpct::err0 q = cs_->ext_oneapi_empty() ? 0 : 1;
+                const int q = cs_->idle() ? 0 : 1;
                 if (q != 1 && *seq < want) {
                     err = "verify batch: layer " + std::to_string(l) +
                           " never rang (" +
-                          /*
-                          DPCT1009: SYCL reports errors using exceptions and
-                          does not use error codes. Please replace the
-                          "get_error_string_dummy(...)" with a real
-                          error-handling function.
-                          */
-                          (q == 0
-                               ? std::string("graph finished")
-                               : std::string(dpct::get_error_string_dummy(q))) +
+                          std::string("graph finished") +
                           ")";
                     return false;
                 }
@@ -3221,29 +2796,14 @@ bool Verifier::run_slot_rows(const int *rows, int S, const int32_t *tokens,
             sink_.start2[0] = 0;
             std::atomic_thread_fence(std::memory_order_seq_cst);
             *(volatile uint32_t*) h_flagA_ = want;
-            raise_flag(h_flagB_, want);
+            raise_b(want);
         }
         *flag = want;
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
         ms_pool += ms_since(b);
     }
-    const dpct::err0 se = DPCT_CHECK_ERROR(cs_->wait());
-    /*
-    DPCT1009: SYCL reports errors using exceptions and does not use error
-    codes. Please replace the "get_error_string_dummy(...)" with a real
-    error-handling function.
-    */
-    /*
-    DPCT1001: The statement could not be removed.
-    */
-    /*
-    DPCT1000: Error handling if-stmt was detected but could not be rewritten.
-    */
-    if (se != 0) {
-      err = std::string("verify batch: ") + dpct::get_error_string_dummy(se);
-      return false;
-    }
-    copy_->wait();
+    cs_->sync();
+    copy_->sync();
     if (prof_on_) collect_profile();
     ++windows;
     if (le_ < g.n_layers) return next_ == nullptr || next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err);
@@ -3253,11 +2813,6 @@ bool Verifier::run_slot_rows(const int *rows, int S, const int32_t *tokens,
     progress_beat();
     return true;
 }
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
 
 bool Verifier::commit_slots(std::string& err) {
     std::vector<int> keep(slots_.size(), 0);
@@ -3265,7 +2820,7 @@ bool Verifier::commit_slots(std::string& err) {
     return commit_slot_prefixes(keep.data(), err);
 }
 
-bool Verifier::commit_slot_prefixes(const int *keep, std::string &err) try {
+bool Verifier::commit_slot_prefixes(const int *keep, std::string &err) {
     const OnDevice on_device(device_);
     if (!last_batch_ || last_t_ < 1) { err = "verify: commit_slots without a batch window"; return false; }
     const int S = last_t_;
@@ -3287,41 +2842,8 @@ bool Verifier::commit_slot_prefixes(const int *keep, std::string &err) try {
             c[2 + j] = j < n ? (int32_t) last_pos_b_[first + j] : -1;
     }
     std::atomic_thread_fence(std::memory_order_seq_cst);
-    const dpct::err0 le = DPCT_CHECK_ERROR(
-        (cs_)->ext_oneapi_graph(*commit_bm_[bkey(last_rows_, S, row_base_)]));
-    /*
-    DPCT1009: SYCL reports errors using exceptions and does not use error
-    codes. Please replace the "get_error_string_dummy(...)" with a real
-    error-handling function.
-    */
-    /*
-    DPCT1001: The statement could not be removed.
-    */
-    /*
-    DPCT1000: Error handling if-stmt was detected but could not be rewritten.
-    */
-    if (le != 0) {
-      err = std::string("verify: batch commit launch: ") +
-            dpct::get_error_string_dummy(le);
-      return false;
-    }
-    const dpct::err0 se = DPCT_CHECK_ERROR(cs_->wait());
-    /*
-    DPCT1009: SYCL reports errors using exceptions and does not use error
-    codes. Please replace the "get_error_string_dummy(...)" with a real
-    error-handling function.
-    */
-    /*
-    DPCT1001: The statement could not be removed.
-    */
-    /*
-    DPCT1000: Error handling if-stmt was detected but could not be rewritten.
-    */
-    if (se != 0) {
-      err = std::string("verify: batch commit: ") +
-            dpct::get_error_string_dummy(se);
-      return false;
-    }
+    cs_->launch(*commit_bm_[bkey(last_rows_, S, row_base_)]);
+    cs_->sync();
     if (ple_stage())
         for (int t = 0; t < S;) {
             const int first = t;
@@ -3335,13 +2857,8 @@ bool Verifier::commit_slot_prefixes(const int *keep, std::string &err) try {
     ms_commit += ms_since(t0);
     return next_ == nullptr || next_->commit_slot_prefixes(keep, err);
 }
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
 
-bool Verifier::sample_rows(int S, std::string &err) try {
+bool Verifier::sample_rows(int S, std::string &err) {
     bool any = false;
     for (int t = 0; t < S; ++t) {
         strata::kernels::SamplerParams sp = slot_sp_[(size_t) last_rows_[t]];
@@ -3352,45 +2869,19 @@ bool Verifier::sample_rows(int S, std::string &err) try {
                                        m_out_ + t, cs_);
         any = true;
     }
-    if (any && DPCT_CHECK_ERROR(cs_->wait()) != 0) {
-      err = "verify batch: the row sampling failed"; return false;
-    }
+    if (any) cs_->sync();
     return true;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
 }
 
 bool Verifier::batch_launch(int base, int S, const int32_t *tokens,
-                            const int64_t *pos, std::string &err) try {
+                            const int64_t *pos, std::string &err) {
     const OnDevice on_device(device_);
     if (b_running_) { err = "verify: batch_launch while this stage is busy"; return false; }
     int rows[8] = {};
     for (int t = 0; t < S && t < 8; ++t) rows[t] = base + t;
     if (!stage_batch(rows, S, base, tokens, pos, err)) return false;
-    dpct::err0 le = DPCT_CHECK_ERROR(
-        (cs_)->ext_oneapi_graph(*exec_bm_[bkey(rows, S, base)]));
-    if (le == 0) le = DPCT_CHECK_ERROR((cs_)->ext_oneapi_graph(*commit_bm_[bkey(
-        rows, S, base)])); // right behind it: every row is kept
-    /*
-    DPCT1009: SYCL reports errors using exceptions and does not use error
-    codes. Please replace the "get_error_string_dummy(...)" with a real
-    error-handling function.
-    */
-    /*
-    DPCT1001: The statement could not be removed.
-    */
-    /*
-    DPCT1000: Error handling if-stmt was detected but could not be rewritten.
-    */
-    if (le != 0) {
-      err = std::string("verify: batch launch: ") +
-            dpct::get_error_string_dummy(le);
-      return false;
-    }
-    (void)DPCT_CHECK_ERROR(((cs_)->ext_oneapi_empty()));
+    cs_->launch(*exec_bm_[bkey(rows, S, base)]);
+    cs_->launch(*commit_bm_[bkey(rows, S, base)]);   // right behind it: every row is kept
     if (ple_stage())   // the host's side of the commit (the hash's last two tokens)
         for (int t = 0; t < S; ++t) {
             SessionState& sx = *slots_[(size_t) rows[t]];
@@ -3403,13 +2894,8 @@ bool Verifier::batch_launch(int base, int S, const int32_t *tokens,
     b_last_ = Clock::now();
     return true;
 }
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
 
-int Verifier::batch_poll(PoolMultiFn pool, void *user, std::string &err) try {
+int Verifier::batch_poll(PoolMultiFn pool, void *user, std::string &err) {
     if (!b_running_) return 1;
     const OnDevice on_device(device_);
     volatile uint32_t* const seq = h_seq_;
@@ -3427,19 +2913,11 @@ int Verifier::batch_poll(PoolMultiFn pool, void *user, std::string &err) try {
         if (*seq < want) {
             const auto now = Clock::now();
             if (now - b_last_ > std::chrono::milliseconds(2)) {
-                const dpct::err0 q = cs_->ext_oneapi_empty() ? 0 : 1;
+                const int q = cs_->idle() ? 0 : 1;
                 if (q != 1 && *seq < want) {
                     err = "verify batch: layer " + std::to_string(lb_ + b_k_) +
                           " never rang (" +
-                          /*
-                          DPCT1009: SYCL reports errors using exceptions and
-                          does not use error codes. Please replace the
-                          "get_error_string_dummy(...)" with a real
-                          error-handling function.
-                          */
-                          (q == 0
-                               ? std::string("graph finished")
-                               : std::string(dpct::get_error_string_dummy(q))) +
+                          std::string("graph finished") +
                           ")";
                     b_running_ = false;
                     return -1;
@@ -3467,49 +2945,15 @@ int Verifier::batch_poll(PoolMultiFn pool, void *user, std::string &err) try {
             sink_.start2[0] = 0;
             std::atomic_thread_fence(std::memory_order_seq_cst);
             *(volatile uint32_t*) h_flagA_ = want;
-            raise_flag(h_flagB_, want);
+            raise_b(want);
         }
         *(volatile uint32_t*) h_flag_ = want;
         ms_pool += ms_since(b);
         b_last_ = Clock::now();
         ++b_k_;
     }
-    const dpct::err0 q = cs_->ext_oneapi_empty() ? 0 : 1;
-    /*
-    DPCT1001: The statement could not be removed.
-    */
-    /*
-    DPCT1002: Special case error handling if-stmt was detected. You may need
-    to rewrite this code.
-    */
-    if (q == 1) return 0;
-    /*
-    DPCT1009: SYCL reports errors using exceptions and does not use error
-    codes. Please replace the "get_error_string_dummy(...)" with a real
-    error-handling function.
-    */
-    /*
-    DPCT1001: The statement could not be removed.
-    */
-    /*
-    DPCT1000: Error handling if-stmt was detected but could not be rewritten.
-    */
-    if (q != 0) {
-      err = std::string("verify batch: ") + dpct::get_error_string_dummy(q);
-      b_running_ = false;
-      return -1;
-    }
-    const dpct::err0 qc = DPCT_CHECK_ERROR(
-        ((copy_)->ext_oneapi_empty())); // no host function of this window may
-                                        // raise flag B in the next
-    /*
-    DPCT1001: The statement could not be removed.
-    */
-    /*
-    DPCT1002: Special case error handling if-stmt was detected. You may need
-    to rewrite this code.
-    */
-    if (qc == 1) return 0;
+    if (!cs_->idle()) return 0;
+    if (!copy_->idle()) return 0;   // no host function of this window may raise flag B in the next
     if (prof_on_) collect_profile();
     if (last_stage()) {
         if (!sample_rows(S, err)) { b_running_ = false; return -1; }
@@ -3520,20 +2964,68 @@ int Verifier::batch_poll(PoolMultiFn pool, void *user, std::string &err) try {
     progress_beat();
     return 1;
 }
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
+
+int64_t Verifier::layer_row_floats() const { return g_->n_layers * (g_->hc * g_->n_embd + 2 * g_->n_embd); }
+
+bool Verifier::copy_layers(int t, float* host) const {
+    if (dbgL_ == nullptr || host == nullptr || t < 0 || t >= max_t_) return false;
+    const ModelGeometry& g = *g_;
+    const size_t HN = (size_t) (g.hc * g.n_embd), N = (size_t) g.n_embd, MT = (size_t) max_t_;
+    try {
+        for (int64_t l = 0; l < g.n_layers; ++l) {
+            const float* lay = dbgL_ + (size_t) l * MT * (HN + 2 * N);
+            float* out = host + (size_t) l * (HN + 2 * N);
+            cs_->memcpy(out, lay + (size_t) t * HN, HN * 4);
+            cs_->memcpy(out + HN, lay + MT * HN + (size_t) t * N, N * 4);
+            cs_->memcpy(out + HN + N, lay + MT * (HN + N) + (size_t) t * N, N * 4);
+        }
+        cs_->sync();
+    } catch (const std::exception&) {
+        return false;
+    }
+    return true;
+}
+
+int64_t Verifier::route_row_words() const { return g_->n_layers * (g_->n_expert + 2 * (int64_t) ss_->k); }
+
+bool Verifier::copy_route(int t, void* host) const {
+    if (dbgRt_ == nullptr || host == nullptr || t < 0 || t >= max_t_) return false;
+    const ModelGeometry& g = *g_;
+    const size_t NE = (size_t) g.n_expert, K = (size_t) ss_->k, MT = (size_t) max_t_, RW = NE + 2 * K;
+    try {
+        for (int64_t l = 0; l < g.n_layers; ++l) {
+            const float* lay = dbgRt_ + (size_t) l * MT * RW;
+            float* out = (float*) host + (size_t) l * RW;
+            cs_->memcpy(out, lay + (size_t) t * NE, NE * 4);
+            cs_->memcpy(out + NE, lay + MT * NE + (size_t) t * K, K * 4);
+            cs_->memcpy(out + NE + K, lay + MT * (NE + K) + (size_t) t * K, K * 4);
+        }
+        cs_->sync();
+    } catch (const std::exception&) {
+        return false;
+    }
+    return true;
+}
+
+bool Verifier::copy_route_ids(int T, int32_t* host) const {
+    if (dbgRt_ == nullptr || host == nullptr || T <= 0 || T > max_t_) return false;
+    const ModelGeometry& g = *g_;
+    const size_t NE = (size_t) g.n_expert, K = (size_t) ss_->k, MT = (size_t) max_t_, RW = NE + 2 * K;
+    try {
+        for (int64_t l = 0; l < g.n_layers; ++l)
+            cs_->memcpy(host + (size_t) l * (size_t) T * K, dbgRt_ + (size_t) l * MT * RW + MT * NE, (size_t) T * K * 4);
+        cs_->sync();
+    } catch (const std::exception&) {
+        return false;
+    }
+    return true;
 }
 
 bool Verifier::copy_logits(int t, float* host) const {
     if (next_ != nullptr) return next_->copy_logits(t, host);   // a layer split: the head is on the last stage
     if (head_logits_ == nullptr || host == nullptr || t < 0 || n_vocab_ <= 0) return false;
-    try {
-        cs_->memcpy(host, head_logits_ + (size_t) t * (size_t) n_vocab_, (size_t) n_vocab_ * sizeof(float)).wait();
-    } catch (sycl::exception const&) {
-        return false;
-    }
+    cs_->memcpy(host, head_logits_ + (size_t) t * (size_t) n_vocab_, (size_t) n_vocab_ * sizeof(float));
+    cs_->sync();
     return true;
 }
 
@@ -3549,17 +3041,9 @@ double now_ms() { return std::chrono::duration<double, std::milli>(Clock::now().
 
 void Verifier::diag_pipelined(std::FILE* f, const char* name) const {
     auto rd = [](const uint32_t* p) { return p ? *(const volatile uint32_t*) p : 0u; };
-    auto ev = [](dpct::event_ptr e) {
-        try {
-    if (e == nullptr) return "none";
-        const dpct::err0 q = dpct::sycl_event_query(e);
-        return q == 0 ? "done" : q == 1 ? "PENDING" : "error";
-    }
-    catch (sycl::exception const &exc) {
-      std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-                << ", line:" << __LINE__ << std::endl;
-      std::exit(1);
-    }
+    auto ev = [](strata::ze::Event* e) {
+        if (e == nullptr) return "none";
+        return e->query() ? "done" : "PENDING";
     };
     std::fprintf(f, "  %s: %s T=%d pos %lld served %lld/%lld; GPU rang %u, flags served %u A %u B %u; window event %s, "
                     "commit event %s (commit launched %d)\n", name, fl_active_ ? "IN FLIGHT" : "idle", last_t_,
@@ -3567,7 +3051,7 @@ void Verifier::diag_pipelined(std::FILE* f, const char* name) const {
                  rd(h_flagB_), ev(ev_done_), ev(ev_commit_), (int) commit_live_);
 }
 
-bool Verifier::capture_all(std::string &err) try {
+bool Verifier::capture_all(std::string &err) {
     const OnDevice on_device(device_);
     if (g_ == nullptr) { err = "verify: capture_all before init"; return false; }
     if (remote_opt_ != nullptr) { err = "verify: pipelined windows do not serve --remote-expert-opt"; return false; }
@@ -3575,35 +3059,12 @@ bool Verifier::capture_all(std::string &err) try {
     for (int T = 1; T <= max_t_; ++T)
         if (!capture(T, err)) return false;
     if (!capture_commit(err)) return false;
-    if ((ev_done_ == nullptr &&
-         DPCT_CHECK_ERROR(ev_done_ = new sycl::event()) != 0) ||
-        (ev_commit_ == nullptr &&
-         DPCT_CHECK_ERROR(ev_commit_ = new sycl::event()) != 0)) {
-        err = "verify: event create failed";
-        return false;
-    }
-    if (prof_on_ && prof_pin_ == nullptr &&
-        /*
-        DPCT1048: The original value cudaHostAllocDefault is not meaningful in
-        the migrated code and was removed or replaced with 0. You may need to
-        check the migrated code.
-        */
-        DPCT_CHECK_ERROR(prof_pin_ = (unsigned long long *)sycl::malloc_host(
-                             prof_h_.size() * 8, dpct::get_in_order_queue())) !=
-            0) {
-        prof_pin_ = nullptr;   // the pipelined windows go unprofiled
-                               /*
-                               DPCT1026: The call to cudaGetLastError was removed because this
-                               functionality is redundant in SYCL.
-                               */
-    }
+    if (ev_done_ == nullptr) ev_done_ = new strata::ze::Event();
+    if (ev_commit_ == nullptr) ev_commit_ = new strata::ze::Event();
+    if (prof_on_ && prof_pin_ == nullptr)
+        prof_pin_ = (unsigned long long*) strata::ze::malloc_host(prof_h_.size() * 8);   // nullptr: unprofiled
     pl_ple_rows_.assign((size_t) strata::kernels::kVerifyMaxT * strata::kernels::PLE_N_HEADS, 0u);
     return true;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
 }
 
 // The host staging of a pipelined window: run()'s (stage_inputs), and its PLE rows from `ple_prev` with their pages
@@ -3639,7 +3100,7 @@ bool Verifier::prestage(int T, const int32_t* tokens, int64_t pos0, const int32_
 }
 
 bool Verifier::pl_launch(int T, const int32_t *tokens, int64_t pos0,
-                         std::string &err) try {
+                         std::string &err) {
     const OnDevice on_device(device_);
     if (fl_active_) { err = "verify: a window is already in flight on this verifier"; return false; }
     if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
@@ -3667,50 +3128,16 @@ bool Verifier::pl_launch(int T, const int32_t *tokens, int64_t pos0,
     std::atomic_thread_fence(std::memory_order_seq_cst);
     trace_ev("WINDOW (pipelined)", -1, -1, pos0 * 16 + T);
     ms_host += ms_since(t0);
-    const dpct::err0 le = DPCT_CHECK_ERROR((cs_)->ext_oneapi_graph(*exec_[T]));
-    trace_ev("LAUNCHED", -1, -1, (int64_t) le);
-    /*
-    DPCT1009: SYCL reports errors using exceptions and does not use error
-    codes. Please replace the "get_error_string_dummy(...)" with a real
-    error-handling function.
-    */
-    /*
-    DPCT1001: The statement could not be removed.
-    */
-    /*
-    DPCT1000: Error handling if-stmt was detected but could not be rewritten.
-    */
-    if (le != 0) {
-      err = std::string("verify: launch: ") + dpct::get_error_string_dummy(le);
-      return false;
-    }
-    /*
-    DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy API. While
-    the origin API might be synchronous, it depends on the type of operand
-    memory, so you may need to call wait() on event return by memcpy API to
-    ensure synchronization behavior.
-    */
+    cs_->launch(*exec_[T]);
+    trace_ev("LAUNCHED", -1, -1, 0);
     if (fl_prof_) cs_->memcpy(prof_pin_, prof_, prof_h_.size() * 8);
-    /*
-    DPCT1024: The original code returned the error code that was further
-    consumed by the program logic. This original code was replaced with 0. You
-    may need to rewrite the program logic consuming the error code.
-    */
-    if (DPCT_CHECK_ERROR(dpct::sync_barrier(ev_done_, cs_)) != 0) {
-      err = "verify: event record failed"; return false;
-    }
-    (void)DPCT_CHECK_ERROR(((cs_)->ext_oneapi_empty())); // WDDM: submit now
+    cs_->record(*ev_done_);
     fl_active_ = true;
     fl_since_ms_ = fl_flush_ms_ = fl_launch_ms_ = now_ms();
     return true;
 }
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
 
-int Verifier::service(PoolMultiFn pool, void *user, std::string &err) try {
+int Verifier::service(PoolMultiFn pool, void *user, std::string &err) {
     if (!fl_active_) return 1;
     if (fl_k_ >= fl_total_) return 1;
     const OnDevice on_device(device_);
@@ -3743,24 +3170,15 @@ int Verifier::service(PoolMultiFn pool, void *user, std::string &err) try {
             const double now = now_ms();
             if (now - fl_flush_ms_ > 2.0) {   // flush WDDM and notice a dead graph, as run() does
                 fl_flush_ms_ = now;
-                const dpct::err0 q = dpct::sycl_event_query(ev_done_);
+                const int q = ((ev_done_)->query() ? 0 : 1);
                 if (q != 1 && *(volatile uint32_t *)h_seq_ < want) {
                     trace_ev("NEVER-RANG", fl_k_, l, (int64_t) q);
                     err = "verify: layer " + std::to_string(l) +
                           " never rang (" +
-                          /*
-                          DPCT1009: SYCL reports errors using exceptions and
-                          does not use error codes. Please replace the
-                          "get_error_string_dummy(...)" with a real
-                          error-handling function.
-                          */
-                          (q == 0
-                               ? std::string("graph finished")
-                               : std::string(dpct::get_error_string_dummy(q))) +
+                          std::string("graph finished") +
                           ")";
                     return -1;
                 }
-                (void)DPCT_CHECK_ERROR(((cs_)->ext_oneapi_empty()));
             }
             if (now - fl_since_ms_ > 20000.0) {   // #267: no spin kernel may outlive the engine
                 trace_ev("TIMEOUT", fl_k_, l, 0);
@@ -3799,7 +3217,7 @@ int Verifier::service(PoolMultiFn pool, void *user, std::string &err) try {
             sink_.start2[0] = 0;
             std::atomic_thread_fence(std::memory_order_seq_cst);
             *(volatile uint32_t*) h_flagA_ = want;
-            raise_flag(h_flagB_, want);
+            raise_b(want);
         }
         if (fl_k_ == 0 && !gather_ple()) return -1;
         *(volatile uint32_t*) h_flag_ = want;
@@ -3809,46 +3227,23 @@ int Verifier::service(PoolMultiFn pool, void *user, std::string &err) try {
     }
     return 1;
 }
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
 
-bool Verifier::done(std::string &err) try {
+bool Verifier::done(std::string &err) {
     if (!fl_active_ || fl_k_ < fl_total_) return false;
     const OnDevice on_device(device_);
-    const dpct::err0 q = dpct::sycl_event_query(ev_done_);
-
-    /*
-    DPCT1009: SYCL reports errors using exceptions and does not use error
-    codes. Please replace the "get_error_string_dummy(...)" with a real
-    error-handling function.
-    */
-    /*
-    DPCT1001: The statement could not be removed.
-    */
-    /*
-    DPCT1000: Error handling if-stmt was detected but could not be
-    rewritten.
-    */
-    if (q != 0) {
-      err = std::string("verify: ") + dpct::get_error_string_dummy(q);
-      return false;
+    if (!ev_done_->query()) {
+        if (now_ms() - fl_since_ms_ > 20000.0)   // every layer served, and the graph still runs: #267 as above
+            err = "verify: the window never finished" + released_note(release_gpu_waits(5000));
+        return false;
     }
     if (copy_used_) {   // no host function of this window may raise flag B in the next one
-        if (((copy_)->ext_oneapi_empty() ? 0 : 1) == 1) return false;
+        if (!copy_->idle()) return false;
         copy_used_ = false;
     }
     return true;
 }
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
 
-bool Verifier::pl_finish(int32_t *out, std::string &err) try {
+bool Verifier::pl_finish(int32_t *out, std::string &err) {
     using namespace strata::kernels;
     const OnDevice on_device(device_);
     const ModelGeometry& g = *g_;
@@ -3863,80 +3258,27 @@ bool Verifier::pl_finish(int32_t *out, std::string &err) try {
         SamplerParams sp = sampling_;
         sp.counter = (uint64_t) last_pos0_;
         sample_tokens(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);
-        if (DPCT_CHECK_ERROR(cs_->wait()) != 0) {
-            err = "verify: the head sampling failed";
-            return false;
-        }
+        cs_->sync();
     }
     if (out != nullptr)
         for (int t = 0; t < T; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
     progress_beat();
     return true;
 }
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
-}
 
-bool Verifier::pl_commit_async(int n_keep, std::string &err) try {
+bool Verifier::pl_commit_async(int n_keep, std::string &err) {
     const OnDevice on_device(device_);
     if (n_keep < 1 || n_keep > last_t_) { err = "verify: commit count out of range"; return false; }
     if (commit_exec_ == nullptr || ev_commit_ == nullptr) { err = "verify: pipelined commit not prepared"; return false; }
     const Clock::time_point t0 = Clock::now();
-    if (commit_live_) {   // its graph reads the words below when it starts: the previous one has (a window ago)
-        dpct::err0 q;
-        while ((q = dpct::sycl_event_query(ev_commit_)) == 1) _mm_pause();
-        /*
-        DPCT1009: SYCL reports errors using exceptions and does not use
-        error codes. Please replace the "get_error_string_dummy(...)" with a
-        real error-handling function.
-        */
-        /*
-        DPCT1001: The statement could not be removed.
-        */
-        /*
-        DPCT1000: Error handling if-stmt was detected but could not be
-        rewritten.
-        */
-        if (q != 0) {
-          err =
-              std::string("verify: commit: ") + dpct::get_error_string_dummy(q);
-          return false;
-        }
-    }
+    if (commit_live_)   // its graph reads the words below when it starts: the previous one has (a window ago)
+        while (!ev_commit_->query()) _mm_pause();
     h_commit_[0] = n_keep;
     h_commit_[1] = n_keep - 1;
     for (int t = 0; t < max_t_; ++t) h_commit_[2 + t] = t < n_keep ? (int32_t) (last_pos0_ + t) : -1;
     std::atomic_thread_fence(std::memory_order_seq_cst);
-    const dpct::err0 le =
-        DPCT_CHECK_ERROR((cs_)->ext_oneapi_graph(*commit_exec_));
-    /*
-    DPCT1009: SYCL reports errors using exceptions and does not use error
-    codes. Please replace the "get_error_string_dummy(...)" with a real
-    error-handling function.
-    */
-    /*
-    DPCT1001: The statement could not be removed.
-    */
-    /*
-    DPCT1000: Error handling if-stmt was detected but could not be
-    rewritten.
-    */
-    if (le != 0) {
-      err = std::string("verify: commit launch: ") +
-            dpct::get_error_string_dummy(le);
-      return false;
-    }
-    /*
-    DPCT1024: The original code returned the error code that was further
-    consumed by the program logic. This original code was replaced with 0. You
-    may need to rewrite the program logic consuming the error code.
-    */
-    if (DPCT_CHECK_ERROR(dpct::sync_barrier(ev_commit_, cs_)) != 0) {
-      err = "verify: event record failed"; return false;
-    }
-    (void)DPCT_CHECK_ERROR(((cs_)->ext_oneapi_empty()));
+    cs_->launch(*commit_exec_);
+    cs_->record(*ev_commit_);
     commit_live_ = true;
     if (ple_stage())
         for (int t = 0; t < n_keep; ++t) {
@@ -3945,11 +3287,6 @@ bool Verifier::pl_commit_async(int n_keep, std::string &err) try {
         }
     ms_commit += ms_since(t0);
     return true;
-}
-catch (sycl::exception const &exc) {
-  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-            << ", line:" << __LINE__ << std::endl;
-  std::exit(1);
 }
 
 void Verifier::absorb_stats(Verifier& o) {

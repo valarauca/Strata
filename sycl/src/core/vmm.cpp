@@ -1,9 +1,9 @@
-// src/core/vmm.cpp - SYCL port: no virtual memory management.
+// src/core/vmm.cpp - Intel engine: no virtual memory management.
 //
-// Upstream's vmm.cpp reaches the CUDA driver's cuMem* functions through cudaGetDriverEntryPointByVersion; Level Zero
-// has no equivalent through dpct.  Every entry point therefore reports "not available", the same answer a GPU
-// without virtual memory management gives, so --vram-elastic and the elastic K/V (--kv-grow) refuse with their
-// usual message and nothing else changes.
+// Upstream's vmm.cpp reaches the CUDA driver's cuMem* functions through cudaGetDriverEntryPointByVersion; the Intel
+// engine's runtime (strata/ze) has no virtual memory calls.  Every entry point therefore reports "not available", the
+// same answer a GPU without virtual memory management gives, so --vram-elastic and the elastic K/V (--kv-grow) refuse
+// with their usual message and nothing else changes.
 #include "strata/core/vmm.hpp"
 
 namespace strata::core {

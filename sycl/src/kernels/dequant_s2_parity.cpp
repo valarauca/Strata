@@ -6,9 +6,7 @@
 // decodes to the same values on every block of the artifact.  So this compares "GPU canonical decode" against
 // "CPU decode already proven equal to ggml", and a fault in either the canonicaliser or the kernel shows up
 // here.  A parity test whose two sides were written together would show neither.
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
+#include "strata/ze/ze.hpp"
 #include "strata/artifact/dequant.hpp"
 #include "strata/kernels/dequant_s2.hpp"
 
@@ -22,7 +20,10 @@ namespace {
 
 constexpr int QK = 64;
 
-void check(dpct::err0 e, const char *what) {
+/// cudaMemcpy: after the device's queued work, complete on return.
+void memcpy_sync(void* dst, const void* src, size_t bytes) {
+    strata::ze::device_sync();
+    strata::ze::copy_sync(dst, src, bytes);
 }
 
 // fp16 patterns that are finite, normal and exactly representable.  Random 16-bit patterns would include NaN
@@ -77,42 +78,16 @@ int main(int argc, char** argv) {
 
     uint8_t* d_codes = nullptr;
     float *d_scales = nullptr, *d_out = nullptr;
-    check(DPCT_CHECK_ERROR(d_codes = (uint8_t *)sycl::malloc_device(
-                               codes.size(), dpct::get_in_order_queue())),
-          "cudaMalloc codes");
-    check(DPCT_CHECK_ERROR(d_scales = sycl::malloc_device<float>(
-                               scales.size(), dpct::get_in_order_queue())),
-          "cudaMalloc scales");
-    check(DPCT_CHECK_ERROR(d_out = sycl::malloc_device<float>(
-                               cpu.size(), dpct::get_in_order_queue())),
-          "cudaMalloc out");
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming in
-    the original code the source host memory is pageable memory. If the memory
-    is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-              d_codes, codes.data(), codes.size()).wait()),
-          "copy codes");
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming in
-    the original code the source host memory is pageable memory. If the memory
-    is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-              d_scales, scales.data(), scales.size() * sizeof(float)).wait()),
-          "copy scales");
+    d_codes = (uint8_t*) strata::ze::malloc_device(codes.size());
+    d_scales = (float*) strata::ze::malloc_device(scales.size() * sizeof(float));
+    d_out = (float*) strata::ze::malloc_device(cpu.size() * sizeof(float));
+    memcpy_sync(d_codes, codes.data(), codes.size());
+    memcpy_sync(d_scales, scales.data(), scales.size() * sizeof(float));
 
     strata::kernels::dequant_s2(d_codes, d_scales, d_out, n_blocks);
 
     std::vector<float> gpu(cpu.size());
-    check(DPCT_CHECK_ERROR(
-              (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                  .memcpy(gpu.data(), d_out, gpu.size() * sizeof(float))
-                  .wait()),
-          "copy back");
+    memcpy_sync(gpu.data(), d_out, gpu.size() * sizeof(float));
 
     long long bad = 0, first_bad = -1;
     for (size_t i = 0; i < cpu.size(); ++i) {
@@ -158,8 +133,8 @@ int main(int argc, char** argv) {
     std::printf("  bit-exact against the scalar dequantizer that dequant_xcheck proved equal to ggml\n");
     if (selftest) std::printf("dequant_s2_parity OK\n");
 
-    sycl::free(d_codes, dpct::get_in_order_queue());
-    sycl::free(d_scales, dpct::get_in_order_queue());
-    sycl::free(d_out, dpct::get_in_order_queue());
+    strata::ze::free(d_codes);
+    strata::ze::free(d_scales);
+    strata::ze::free(d_out);
     return 0;
 }

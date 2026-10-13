@@ -10,9 +10,7 @@
 //      `ple_layer_xcheck.cpp`.  That file records EVERY intermediate (key, value, gate, gated, normalized,
 //      conv_out, result), so a mismatch can be attributed to a stage instead of guessed at - and the weights
 //      in it were checked to be the artifact's real ones before this test was written.
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
+#include "strata/ze/ze.hpp"
 #include "strata/kernels/ple.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/f16_bits.hpp"
@@ -33,7 +31,17 @@ namespace o = strata::kernels::ple_oracle;
 
 namespace {
 
-void ck(dpct::err0 e, const char *what) {
+/// cudaMemcpy: after the device's queued work, complete on return.
+void memcpy_sync(void* dst, const void* src, size_t bytes) {
+    strata::ze::device_sync();
+    strata::ze::copy_sync(dst, src, bytes);
+}
+
+/// cudaMemset: after the device's queued work, complete on return.
+void memset_sync(void* dst, int value, size_t bytes) {
+    strata::ze::device_sync();
+    strata::ze::default_stream().memset(dst, value, bytes);
+    strata::ze::default_stream().sync();
 }
 
 /// TOLERANCE CHECKS MUST BE NaN-SAFE, and `x <= t` is not.
@@ -189,53 +197,17 @@ int history_advance_regression() {
     for (size_t c = 0; c < channels; ++c)
         for (size_t r = 0; r < rows; ++r) expected[c * rows + r] = -float(c * 16 + r + 1);
     float *history_storage = nullptr, *norm_storage = nullptr;
-    ck(DPCT_CHECK_ERROR(history_storage = sycl::malloc_device<float>(
-                            (count + 2 * guard), dpct::get_in_order_queue())),
-       "history regression allocation");
-    ck(DPCT_CHECK_ERROR(
-           norm_storage = sycl::malloc_device<float>(
-               (channels + 2 * guard), dpct::get_in_order_queue())),
-       "history norm allocation");
-    ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                            .memset(history_storage, 0xa5,
-                                    (count + 2 * guard) * sizeof(float))
-                            .wait()),
-       "history guard init");
-    ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                            .memset(norm_storage, 0xa5,
-                                    (channels + 2 * guard) * sizeof(float))
-                            .wait()),
-       "history norm guard init");
+    history_storage = (float*) strata::ze::malloc_device((count + 2 * guard) * sizeof(float));
+    norm_storage = (float*) strata::ze::malloc_device((channels + 2 * guard) * sizeof(float));
+    memset_sync(history_storage, 0xa5, (count + 2 * guard) * sizeof(float));
+    memset_sync(norm_storage, 0xa5, (channels + 2 * guard) * sizeof(float));
     float* history = history_storage + guard;
     float* norm = norm_storage + guard;
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming in
-    the original code the source host memory is pageable memory. If the memory
-    is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-           history, expected.data(), count * sizeof(float)).wait()),
-       "history initial values");
-    dpct::queue_ptr stream;
-    dpct::experimental::command_graph_ptr graph;
-    dpct::experimental::command_graph_exec_ptr executable;
-    /*
-    DPCT1025: The SYCL queue is created ignoring the flag and priority
-    options.
-    */
-    ck(DPCT_CHECK_ERROR(stream = dpct::get_current_device().create_queue(true)),
-       "history regression stream");
-    ck(DPCT_CHECK_ERROR(dpct::experimental::begin_recording(stream)),
-       "history regression capture");
+    memcpy_sync(history, expected.data(), count * sizeof(float));
+    strata::ze::Stream* stream = new strata::ze::Stream();
+    stream->begin_capture();
     k::ple_history_advance(history, norm, stream);
-    ck(DPCT_CHECK_ERROR(dpct::experimental::end_recording(stream, &graph)),
-       "history regression capture end");
-    ck(DPCT_CHECK_ERROR(
-           executable = new sycl::ext::oneapi::experimental::command_graph<
-               sycl::ext::oneapi::experimental::graph_state::executable>(
-               graph->finalize())),
-       "history regression instantiate");
+    strata::ze::Graph* graph = stream->end_capture();
     int bad = 0;
     for (int token = 0; token < 12; ++token) {
         for (size_t c = 0; c < channels; ++c) {
@@ -243,23 +215,10 @@ int history_advance_regression() {
             for (size_t r = 0; r + 1 < rows; ++r) expected[c * rows + r] = expected[c * rows + r + 1];
             expected[c * rows + rows - 1] = normalized[c];
         }
-        /*
-        DPCT1124: cudaMemcpyAsync is migrated to asynchronous memcpy API.
-        While the origin API might be synchronous, it depends on the type of
-        operand memory, so you may need to call wait() on event return by memcpy
-        API to ensure synchronization behavior.
-        */
-        ck(DPCT_CHECK_ERROR(stream->memcpy(norm, normalized.data(),
-                                           channels * sizeof(float))),
-           "history new normalized row");
-        ck(DPCT_CHECK_ERROR(stream->ext_oneapi_graph(*executable)),
-           "history captured advance");
-        ck(DPCT_CHECK_ERROR(stream->wait()), "history captured advance sync");
-        ck(DPCT_CHECK_ERROR(
-               (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                   .memcpy(actual.data(), history, count * sizeof(float))
-                   .wait()),
-           "history readback");
+        stream->memcpy(norm, normalized.data(), channels * sizeof(float));
+        stream->launch(*graph);
+        stream->sync();
+        memcpy_sync(actual.data(), history, count * sizeof(float));
         if (std::memcmp(actual.data(), expected.data(), count * sizeof(float)) != 0) {
             std::printf("  history advance mismatch after token %d\n", token);
             ++bad;
@@ -273,26 +232,17 @@ int history_advance_regression() {
     if (!overlap_refused || !null_refused) ++bad;
     auto guard_ok = [&](float* storage, size_t payload) {
         uint8_t before[64], after[64];
-        ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                .memcpy(before, storage, sizeof(before))
-                                .wait()),
-           "history prefix guard");
-        ck(DPCT_CHECK_ERROR(
-               (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                   .memcpy(after, storage + guard + payload, sizeof(after))
-                   .wait()),
-           "history suffix guard");
+        memcpy_sync(before, storage, sizeof(before));
+        memcpy_sync(after, storage + guard + payload, sizeof(after));
         return std::all_of(before, before + 64, [](uint8_t b) { return b == 0xa5; }) &&
                std::all_of(after, after + 64, [](uint8_t b) { return b == 0xa5; });
     };
     if (!guard_ok(history_storage, count) || !guard_ok(norm_storage, channels)) ++bad;
     std::printf("  PLE history 12 captured steps, row-fastest state and guards: %s\n", bad == 0 ? "pass" : "FAIL");
-    ck(DPCT_CHECK_ERROR(delete (executable)), "history graph exec destroy");
-    ck(DPCT_CHECK_ERROR(delete (graph)), "history graph destroy");
-    ck(DPCT_CHECK_ERROR(dpct::get_current_device().destroy_queue(stream)),
-       "history stream destroy");
-    sycl::free(history_storage, dpct::get_in_order_queue());
-        sycl::free(norm_storage, dpct::get_in_order_queue());
+    delete graph;
+    delete stream;
+    strata::ze::free(history_storage);
+    strata::ze::free(norm_storage);
     return bad;
 }
 
@@ -708,115 +658,30 @@ int main(int argc, char** argv) {
     uint8_t* d_kc = nullptr;
     uint16_t *d_vb = nullptr, *d_c1 = nullptr;
     float *d_g = nullptr, *d_v = nullptr, *d_gd = nullptr, *d_nm = nullptr, *d_co = nullptr;
-    ck(DPCT_CHECK_ERROR(d_emb = (float *)sycl::malloc_device(
-                            nd * 4, dpct::get_in_order_queue())),
-       "emb");
-    ck(DPCT_CHECK_ERROR(d_hid = (float *)sycl::malloc_device(
-                            hcd * 4, dpct::get_in_order_queue())),
-       "hid");
-    ck(DPCT_CHECK_ERROR(
-           d_hist = (float *)sycl::malloc_device((size_t)k::NG_HIST * hcd * 4,
-                                                 dpct::get_in_order_queue())),
-       "hist");
-    ck(DPCT_CHECK_ERROR(d_nk = (float *)sycl::malloc_device(
-                            hcd * 4, dpct::get_in_order_queue())),
-       "nk");
-    ck(DPCT_CHECK_ERROR(d_nq = (float *)sycl::malloc_device(
-                            hcd * 4, dpct::get_in_order_queue())),
-       "nq");
-    ck(DPCT_CHECK_ERROR(d_nc = (float *)sycl::malloc_device(
-                            hcd * 4, dpct::get_in_order_queue())),
-       "nc");
-    ck(DPCT_CHECK_ERROR(d_kc = (uint8_t *)sycl::malloc_device(
-                            key_codes.size(), dpct::get_in_order_queue())),
-       "kc");
-    ck(DPCT_CHECK_ERROR(d_vb = (uint16_t *)sycl::malloc_device(
-                            value_bf16.size() * 2, dpct::get_in_order_queue())),
-       "vb");
-    ck(DPCT_CHECK_ERROR(d_c1 = (uint16_t *)sycl::malloc_device(
-                            conv1d_f16.size() * 2, dpct::get_in_order_queue())),
-       "c1");
-    ck(DPCT_CHECK_ERROR(d_g = (float *)sycl::malloc_device(
-                            k::NG_HC * 4, dpct::get_in_order_queue())),
-       "g");
-    ck(DPCT_CHECK_ERROR(d_v = (float *)sycl::malloc_device(
-                            nd * 4, dpct::get_in_order_queue())),
-       "v");
-    ck(DPCT_CHECK_ERROR(d_gd = (float *)sycl::malloc_device(
-                            hcd * 4, dpct::get_in_order_queue())),
-       "gd");
-    ck(DPCT_CHECK_ERROR(d_nm = (float *)sycl::malloc_device(
-                            hcd * 4, dpct::get_in_order_queue())),
-       "nm");
-    ck(DPCT_CHECK_ERROR(d_co = (float *)sycl::malloc_device(
-                            hcd * 4, dpct::get_in_order_queue())),
-       "co");
-    ck(DPCT_CHECK_ERROR(d_ck = (float *)sycl::malloc_device(
-                            hcd * 4, dpct::get_in_order_queue())),
-       "ck");
-    ck(DPCT_CHECK_ERROR(d_cv = (float *)sycl::malloc_device(
-                            nd * 4, dpct::get_in_order_queue())),
-       "cv");
-    ck(DPCT_CHECK_ERROR(d_cn = (float *)sycl::malloc_device(
-                            hcd * 4, dpct::get_in_order_queue())),
-       "cn");
-    ck(DPCT_CHECK_ERROR(d_cr = (float *)sycl::malloc_device(
-                            hcd * 4, dpct::get_in_order_queue())),
-       "cr");
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming in
-    the original code the source host memory is pageable memory. If the memory
-    is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    ck(DPCT_CHECK_ERROR(
-           (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(d_nk, cap.w_nk.data(), hcd * 4).wait()),
-       "cnk");
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming in
-    the original code the source host memory is pageable memory. If the memory
-    is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    ck(DPCT_CHECK_ERROR(
-           (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(d_nq, cap.w_nq.data(), hcd * 4).wait()),
-       "cnq");
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming in
-    the original code the source host memory is pageable memory. If the memory
-    is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    ck(DPCT_CHECK_ERROR(
-           (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(d_nc, cap.w_nc.data(), hcd * 4).wait()),
-       "cnc");
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming in
-    the original code the source host memory is pageable memory. If the memory
-    is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-           d_kc, key_codes.data(), key_codes.size()).wait()),
-       "ckc");
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming in
-    the original code the source host memory is pageable memory. If the memory
-    is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-           d_vb, value_bf16.data(), value_bf16.size() * 2).wait()),
-       "cvb");
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming in
-    the original code the source host memory is pageable memory. If the memory
-    is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-           d_c1, conv1d_f16.data(), conv1d_f16.size() * 2).wait()),
-       "cc1");
+    d_emb = (float*) strata::ze::malloc_device(nd * 4);
+    d_hid = (float*) strata::ze::malloc_device(hcd * 4);
+    d_hist = (float*) strata::ze::malloc_device((size_t)k::NG_HIST * hcd * 4);
+    d_nk = (float*) strata::ze::malloc_device(hcd * 4);
+    d_nq = (float*) strata::ze::malloc_device(hcd * 4);
+    d_nc = (float*) strata::ze::malloc_device(hcd * 4);
+    d_kc = (uint8_t*) strata::ze::malloc_device(key_codes.size());
+    d_vb = (uint16_t*) strata::ze::malloc_device(value_bf16.size() * 2);
+    d_c1 = (uint16_t*) strata::ze::malloc_device(conv1d_f16.size() * 2);
+    d_g = (float*) strata::ze::malloc_device(k::NG_HC * 4);
+    d_v = (float*) strata::ze::malloc_device(nd * 4);
+    d_gd = (float*) strata::ze::malloc_device(hcd * 4);
+    d_nm = (float*) strata::ze::malloc_device(hcd * 4);
+    d_co = (float*) strata::ze::malloc_device(hcd * 4);
+    d_ck = (float*) strata::ze::malloc_device(hcd * 4);
+    d_cv = (float*) strata::ze::malloc_device(nd * 4);
+    d_cn = (float*) strata::ze::malloc_device(hcd * 4);
+    d_cr = (float*) strata::ze::malloc_device(hcd * 4);
+    memcpy_sync(d_nk, cap.w_nk.data(), hcd * 4);
+    memcpy_sync(d_nq, cap.w_nq.data(), hcd * 4);
+    memcpy_sync(d_nc, cap.w_nc.data(), hcd * 4);
+    memcpy_sync(d_kc, key_codes.data(), key_codes.size());
+    memcpy_sync(d_vb, value_bf16.data(), value_bf16.size() * 2);
+    memcpy_sync(d_c1, conv1d_f16.data(), conv1d_f16.size() * 2);
 
     k::PleWeights w{};
     w.key_codes = d_kc;
@@ -827,18 +692,8 @@ int main(int argc, char** argv) {
     w.norm_conv = d_nc;
     w.conv1d_f16 = d_c1;
     float* d_ks = nullptr;
-    ck(DPCT_CHECK_ERROR(d_ks = (float *)sycl::malloc_device(
-                            key_scales.size() * 4, dpct::get_in_order_queue())),
-       "ks");
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming in
-    the original code the source host memory is pageable memory. If the memory
-    is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-           d_ks, key_scales.data(), key_scales.size() * 4).wait()),
-       "cks");
+    d_ks = (float*) strata::ze::malloc_device(key_scales.size() * 4);
+    memcpy_sync(d_ks, key_scales.data(), key_scales.size() * 4);
     w.key_scales = d_ks;
 
     // Per-stage comparison.  Each stage the oracle records is a separate line, so a mismatch says WHICH part
@@ -860,47 +715,18 @@ int main(int argc, char** argv) {
     // ggml layout for the state is `ne=(hist, hc_dim)`: flat = row + NG_HIST*channel.
     std::vector<float> hist_state = cap.hist;
     for (int t = 0; t < cap.nt; ++t) {
-        /*
-        DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-        assuming in the original code the source host memory is pageable memory.
-        If the memory is not pageable, call wait() on event return by memcpy API
-        to ensure synchronization behavior.
-        */
-        ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-               d_emb, cap.emb.data() + (size_t)t * nd, nd * 4).wait()),
-           "cemb");
-        /*
-        DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-        assuming in the original code the source host memory is pageable memory.
-        If the memory is not pageable, call wait() on event return by memcpy API
-        to ensure synchronization behavior.
-        */
-        ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-               d_hid, cap.hidden.data() + (size_t)t * hcd, hcd * 4).wait()),
-           "chid");
-        /*
-        DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-        assuming in the original code the source host memory is pageable memory.
-        If the memory is not pageable, call wait() on event return by memcpy API
-        to ensure synchronization behavior.
-        */
-        ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-               d_hist, hist_state.data(), (size_t)k::NG_HIST * hcd * 4).wait()),
-           "chist");
+        memcpy_sync(d_emb, cap.emb.data() + (size_t)t * nd, nd * 4);
+        memcpy_sync(d_hid, cap.hidden.data() + (size_t)t * hcd, hcd * 4);
+        memcpy_sync(d_hist, hist_state.data(), (size_t)k::NG_HIST * hcd * 4);
         k::PleOut out{};
         out.key = d_ck; out.value = d_cv; out.gate = d_g; out.gated = d_gd;
         out.normalized = d_nm; out.conv = d_co; out.result = d_cr;
         // the workspace is the caller's, and the sync the block used to do is now the caller's too
     void* ple_ws = nullptr;
-    ck(DPCT_CHECK_ERROR(
-           ple_ws = (void *)sycl::malloc_device(k::ple_block_scratch_bytes(),
-                                                dpct::get_in_order_queue())),
-       "ple_block scratch");
+    ple_ws = strata::ze::malloc_device(k::ple_block_scratch_bytes());
     if (t == 0) {
         const size_t bytes = (size_t) k::ple_block_scratch_bytes();
-        ck(DPCT_CHECK_ERROR(
-               (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memset(ple_ws, 0xa5, bytes).wait()),
-           "PLE prelaunch guard sentinel");
+        memset_sync(ple_ws, 0xa5, bytes);
         const struct AliasCase { float* k::PleOut::* field; size_t offset; } cases[] = {
             {&k::PleOut::key, 0}, {&k::PleOut::value, hcd}, {&k::PleOut::gate, hcd + nd},
             {&k::PleOut::gated, hcd + nd + (size_t) k::NG_HC},
@@ -914,13 +740,9 @@ int main(int argc, char** argv) {
             try { k::ple_block(d_emb, d_hid, d_hist, w, invalid, ple_ws, nullptr); }
             catch (const std::invalid_argument&) { ++refused; }
         }
-        ck(DPCT_CHECK_ERROR(dpct::get_current_device().queues_wait_and_throw()),
-           "PLE guard no-launch sync");
+        strata::ze::device_sync();
         std::vector<uint8_t> sentinel(bytes);
-        ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                .memcpy(sentinel.data(), ple_ws, bytes)
-                                .wait()),
-           "PLE guard sentinel readback");
+        memcpy_sync(sentinel.data(), ple_ws, bytes);
         const bool unchanged = std::all_of(sentinel.begin(), sentinel.end(), [](uint8_t b) { return b == 0xa5; });
         const bool rejected = refused == 7 && unchanged;
         std::printf("  PLE old caller output offsets rejected before launch: %s (%d/7, scratch %s)\n",
@@ -928,36 +750,14 @@ int main(int argc, char** argv) {
         if (!rejected) ++bad;
     }
     k::ple_block(d_emb, d_hid, d_hist, w, out, ple_ws, nullptr);
-    ck(DPCT_CHECK_ERROR(dpct::get_current_device().queues_wait_and_throw()),
-       "ple_block sync");
-        ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                .memcpy(dev_key.data(), d_ck, hcd * 4)
-                                .wait()),
-           "rck");
-        ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                .memcpy(dev_value.data(), d_cv, nd * 4)
-                                .wait()),
-           "rcv");
-        ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                .memcpy(dev_gate.data(), d_g, k::NG_HC * 4)
-                                .wait()),
-           "rg");
-        ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                .memcpy(dev_gated.data(), d_gd, hcd * 4)
-                                .wait()),
-           "rgd");
-        ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                .memcpy(dev_norm.data(), d_nm, hcd * 4)
-                                .wait()),
-           "rnm");
-        ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                .memcpy(dev_conv.data(), d_co, hcd * 4)
-                                .wait()),
-           "rco");
-        ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                .memcpy(dev_res.data(), d_cr, hcd * 4)
-                                .wait()),
-           "rcr");
+    strata::ze::device_sync();
+        memcpy_sync(dev_key.data(), d_ck, hcd * 4);
+        memcpy_sync(dev_value.data(), d_cv, nd * 4);
+        memcpy_sync(dev_gate.data(), d_g, k::NG_HC * 4);
+        memcpy_sync(dev_gated.data(), d_gd, hcd * 4);
+        memcpy_sync(dev_norm.data(), d_nm, hcd * 4);
+        memcpy_sync(dev_conv.data(), d_co, hcd * 4);
+        memcpy_sync(dev_res.data(), d_cr, hcd * 4);
 
         const size_t ok_ = (size_t) t * hcd, ov = (size_t) t * nd, og = (size_t) t * (size_t) k::NG_HC;
         const Stage stages[] = {
@@ -1009,46 +809,17 @@ int main(int argc, char** argv) {
                 }
                 reference_value[row] = float(sum);
             }
-            /*
-            DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-            assuming in the original code the source host memory is pageable
-            memory. If the memory is not pageable, call wait() on event return
-            by memcpy API to ensure synchronization behavior.
-            */
-            ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-                   d_emb, witness.data(), nd * sizeof(float)).wait()),
-               "native PLE witness");
+            memcpy_sync(d_emb, witness.data(), nd * sizeof(float));
             k::ple_block(d_emb, d_hid, d_hist, w, out, ple_ws, nullptr);
-            ck(DPCT_CHECK_ERROR(
-                   dpct::get_current_device().queues_wait_and_throw()),
-               "legacy PLE witness sync");
+            strata::ze::device_sync();
             std::vector<float> legacy_value(nd);
-            ck(DPCT_CHECK_ERROR(
-                   (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                       .memcpy(legacy_value.data(), d_cv, nd * sizeof(float))
-                       .wait()),
-               "legacy PLE witness value");
-            dpct::queue_ptr stream;
-            /*
-            DPCT1025: The SYCL queue is created ignoring the flag and
-            priority options.
-            */
-            ck(DPCT_CHECK_ERROR(
-                   stream = dpct::get_current_device().create_queue(true)),
-               "native PLE stream");
+            memcpy_sync(legacy_value.data(), d_cv, nd * sizeof(float));
+            strata::ze::Stream* stream = new strata::ze::Stream();
             k::ple_set_native_bf16(true);
             k::ple_block(d_emb, d_hid, d_hist, w, out, ple_ws, stream);
-            ck(DPCT_CHECK_ERROR(stream->wait()), "native PLE sync");
-            ck(DPCT_CHECK_ERROR(
-                   (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                       .memcpy(native_value.data(), d_cv, nd * sizeof(float))
-                       .wait()),
-               "native PLE value");
-            ck(DPCT_CHECK_ERROR(
-                   (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                       .memcpy(native_result.data(), d_cr, hcd * sizeof(float))
-                       .wait()),
-               "native PLE result");
+            stream->sync();
+            memcpy_sync(native_value.data(), d_cv, nd * sizeof(float));
+            memcpy_sync(native_result.data(), d_cr, hcd * sizeof(float));
             long long nf = 0;
             const double rel = rel_l1(reference_value.data(), native_value.data(), nd, nullptr, &nf);
             const double separation = rel_l1(native_value.data(), legacy_value.data(), nd);
@@ -1056,56 +827,23 @@ int main(int argc, char** argv) {
             std::printf("  native PLE value: %s (ref rel %.3e, BF16 separation %.3e)\n",
                         correct ? "pass" : "FAIL", rel, separation);
             if (!correct) ++bad;
-            dpct::experimental::command_graph_ptr graph;
-            dpct::experimental::command_graph_exec_ptr executable;
-            ck(DPCT_CHECK_ERROR(dpct::experimental::begin_recording(stream)),
-               "native PLE capture");
+            strata::ze::Graph* graph;
+            stream->begin_capture();
             k::ple_block(d_emb, d_hid, d_hist, w, out, ple_ws, stream);
-            ck(DPCT_CHECK_ERROR(
-                   dpct::experimental::end_recording(stream, &graph)),
-               "native PLE capture end");
-            ck(DPCT_CHECK_ERROR(
-                   executable =
-                       new sycl::ext::oneapi::experimental::command_graph<
-                           sycl::ext::oneapi::experimental::graph_state::
-                               executable>(graph->finalize())),
-               "native PLE instantiate");
+            graph = stream->end_capture();
             k::ple_set_native_bf16(false);
-            ck(DPCT_CHECK_ERROR(stream->ext_oneapi_graph(*executable)),
-               "native PLE replay");
-            ck(DPCT_CHECK_ERROR(stream->wait()), "native PLE replay sync");
-            ck(DPCT_CHECK_ERROR(
-                   (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                       .memcpy(replay.data(), d_cr, hcd * sizeof(float))
-                       .wait()),
-               "native PLE replay result");
+            stream->launch(*graph);
+            stream->sync();
+            memcpy_sync(replay.data(), d_cr, hcd * sizeof(float));
             const bool captured = std::memcmp(native_result.data(), replay.data(), hcd * sizeof(float)) == 0;
             std::printf("  native PLE captured selection: %s\n", captured ? "byte-identical" : "FAIL");
             if (!captured) ++bad;
-            ck(DPCT_CHECK_ERROR(delete (executable)),
-               "native PLE graph exec destroy");
-            ck(DPCT_CHECK_ERROR(delete (graph)), "native PLE graph destroy");
-            ck(DPCT_CHECK_ERROR(
-                   dpct::get_current_device().destroy_queue(stream)),
-               "native PLE stream destroy");
-            /*
-            DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-            assuming in the original code the source host memory is pageable
-            memory. If the memory is not pageable, call wait() on event return
-            by memcpy API to ensure synchronization behavior.
-            */
-            ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-                   d_emb, cap.emb.data(), nd * sizeof(float)).wait()),
-               "restore PLE embedding");
+            delete graph;
+            delete stream;
+            memcpy_sync(d_emb, cap.emb.data(), nd * sizeof(float));
             k::ple_block(d_emb, d_hid, d_hist, w, out, ple_ws, nullptr);
-            ck(DPCT_CHECK_ERROR(
-                   dpct::get_current_device().queues_wait_and_throw()),
-               "restored PLE sync");
-            ck(DPCT_CHECK_ERROR(
-                   (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                       .memcpy(replay.data(), d_cr, hcd * sizeof(float))
-                       .wait()),
-               "restored PLE result");
+            strata::ze::device_sync();
+            memcpy_sync(replay.data(), d_cr, hcd * sizeof(float));
             const bool restored = std::memcmp(dev_res.data(), replay.data(), hcd * sizeof(float)) == 0;
             std::printf("  restored PLE default: %s\n", restored ? "byte-identical" : "FAIL");
             if (!restored) ++bad;
@@ -1124,52 +862,19 @@ int main(int argc, char** argv) {
             }
             void *native_storage = nullptr, *q_storage = nullptr;
             float* raw_projection = nullptr;
-            ck(DPCT_CHECK_ERROR(
-                   native_storage = (void *)sycl::malloc_device(
-                       native_bytes + 2 * guard, dpct::get_in_order_queue())),
-               "native PLE weights");
-            ck(DPCT_CHECK_ERROR(
-                   q_storage = (void *)sycl::malloc_device(
-                       qbytes + 2 * guard, dpct::get_in_order_queue())),
-               "native PLE q8 scratch");
-            ck(DPCT_CHECK_ERROR(raw_projection = (float *)sycl::malloc_device(
-                                    hcd * 4, dpct::get_in_order_queue())),
-               "native PLE raw projection");
-            ck(DPCT_CHECK_ERROR(
-                   (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                       .memset(native_storage, 0xa5, native_bytes + 2 * guard)
-                       .wait()),
-               "native PLE weight guards");
-            ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                    .memset(q_storage, 0xa5, qbytes + 2 * guard)
-                                    .wait()),
-               "native PLE q8 guards");
+            native_storage = strata::ze::malloc_device(native_bytes + 2 * guard);
+            q_storage = strata::ze::malloc_device(qbytes + 2 * guard);
+            raw_projection = (float*) strata::ze::malloc_device(hcd * 4);
+            memset_sync(native_storage, 0xa5, native_bytes + 2 * guard);
+            memset_sync(q_storage, 0xa5, qbytes + 2 * guard);
             void* native_data = static_cast<uint8_t*>(native_storage) + guard;
             void* native_q = static_cast<uint8_t*>(q_storage) + guard;
-            /*
-            DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-            assuming in the original code the source host memory is pageable
-            memory. If the memory is not pageable, call wait() on event return
-            by memcpy API to ensure synchronization behavior.
-            */
-            ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-                   native_data, native_key.data(), native_bytes).wait()),
-               "native PLE weights upload");
+            memcpy_sync(native_data, native_key.data(), native_bytes);
             k::PleWeights nw = w;
             nw.key_native_data = native_data; nw.key_native_type = 42; nw.key_native_q8_1 = native_q;
-            dpct::queue_ptr stream;
-            /*
-            DPCT1025: The SYCL queue is created ignoring the flag and
-            priority options.
-            */
-            ck(DPCT_CHECK_ERROR(
-                   stream = dpct::get_current_device().create_queue(true)),
-               "native PLE key stream");
+            strata::ze::Stream* stream = new strata::ze::Stream();
             const size_t workspace_bytes = (size_t) k::ple_block_scratch_bytes();
-            ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                    .memset(ple_ws, 0xa5, workspace_bytes)
-                                    .wait()),
-               "native PLE no-launch sentinel");
+            memset_sync(ple_ws, 0xa5, workspace_bytes);
             int refused = 0;
             for (int c = 0; c < 9; ++c) {
                 auto invalid = nw;
@@ -1183,41 +888,24 @@ int main(int argc, char** argv) {
                 if (c == 8) invalid.key_native_q8_1 = native_data;
                 try {
                     k::ple_block(d_emb, d_hid, d_hist, invalid, out, ple_ws,
-                                 c == 2 ? &dpct::get_in_order_queue() : stream);
+                                 c == 2 ? &strata::ze::default_stream() : stream);
                 }
                 catch (const std::invalid_argument&) { ++refused; }
             }
-            ck(DPCT_CHECK_ERROR(stream->wait()), "native PLE refusal sync");
+            stream->sync();
             std::vector<uint8_t> sentinel(workspace_bytes);
-            ck(DPCT_CHECK_ERROR(
-                   (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                       .memcpy(sentinel.data(), ple_ws, workspace_bytes)
-                       .wait()),
-               "native PLE refusal sentinel");
+            memcpy_sync(sentinel.data(), ple_ws, workspace_bytes);
             const bool untouched = std::all_of(sentinel.begin(), sentinel.end(), [](uint8_t x) { return x == 0xa5; });
             std::printf("  native PLE key prelaunch guards: %s (%d/9, workspace %s)\n",
                         refused == 9 && untouched ? "pass" : "FAIL", refused, untouched ? "unchanged" : "changed");
             if (refused != 9 || !untouched) ++bad;
-            dpct::experimental::command_graph_ptr graph = nullptr;
-                dpct::experimental::command_graph_exec_ptr executable = nullptr;
+            strata::ze::Graph* graph = nullptr;
             std::vector<float> projected(hcd), normalized(hcd), actual_key(hcd), actual_result(hcd), replay(hcd);
             for (int p = 0; p < std::min(cap.nt, 2); ++p) {
-                /*
-                DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-                assuming in the original code the source host memory is pageable
-                memory. If the memory is not pageable, call wait() on event
-                return by memcpy API to ensure synchronization behavior.
-                */
-                ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-                       d_emb, cap.emb.data() + (size_t)p * nd, nd * 4).wait()),
-                   "native PLE key input");
+                memcpy_sync(d_emb, cap.emb.data() + (size_t)p * nd, nd * 4);
                 k::native_q2_0_f32(native_data, d_emb, native_q, raw_projection, k::NG_N_EMBD, k::NG_HC_DIM, 1, stream);
-                ck(DPCT_CHECK_ERROR(stream->wait()), "native PLE raw key sync");
-                ck(DPCT_CHECK_ERROR(
-                       (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                           .memcpy(projected.data(), raw_projection, hcd * 4)
-                           .wait()),
-                   "native PLE raw key read");
+                stream->sync();
+                memcpy_sync(projected.data(), raw_projection, hcd * 4);
                 for (int c = 0; c < k::NG_HC; ++c) {
                     double sum = 0;
                     for (size_t j = 0; j < nd; ++j) { const float v = projected[(size_t) c * nd + j]; sum += double(v * v); }
@@ -1225,97 +913,44 @@ int main(int argc, char** argv) {
                     for (size_t j = 0; j < nd; ++j) { const size_t i = (size_t) c * nd + j; normalized[i] = projected[i] * scale * cap.w_nk[i]; }
                 }
                 k::ple_block(d_emb, d_hid, d_hist, nw, out, ple_ws, stream);
-                ck(DPCT_CHECK_ERROR(stream->wait()),
-                   "native PLE key direct sync");
-                ck(DPCT_CHECK_ERROR(
-                       (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                           .memcpy(actual_key.data(), d_ck, hcd * 4)
-                           .wait()),
-                   "native PLE key read");
-                ck(DPCT_CHECK_ERROR(
-                       (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                           .memcpy(actual_result.data(), d_cr, hcd * 4)
-                           .wait()),
-                   "native PLE result read");
+                stream->sync();
+                memcpy_sync(actual_key.data(), d_ck, hcd * 4);
+                memcpy_sync(actual_result.data(), d_cr, hcd * 4);
                 const double rel = rel_l1(normalized.data(), actual_key.data(), hcd);
                 const bool wired = le(rel, 2e-6) && nonfinite(actual_result.data(), hcd) == 0;
                 std::printf("  native PLE key projection->existing norm input %d: %s (rel %.3e)\n", p, wired ? "pass" : "FAIL", rel);
                 if (!wired) ++bad;
                 if (p == 0) {
-                    ck(DPCT_CHECK_ERROR(
-                           dpct::experimental::begin_recording(stream)),
-                       "native PLE key capture");
+                    stream->begin_capture();
                     k::ple_block(d_emb, d_hid, d_hist, nw, out, ple_ws, stream);
-                    ck(DPCT_CHECK_ERROR(
-                           dpct::experimental::end_recording(stream, &graph)),
-                       "native PLE key capture end");
-                    ck(DPCT_CHECK_ERROR(
-                           executable = new sycl::ext::oneapi::experimental::
-                               command_graph<sycl::ext::oneapi::experimental::
-                                                 graph_state::executable>(
-                                   graph->finalize())),
-                       "native PLE key instantiate");
+                    graph = stream->end_capture();
                 }
                 nw.key_native_data = nullptr; // graph selection must survive descriptor changes
                 for (int repeat = 0; repeat < 2; ++repeat) {
-                    ck(DPCT_CHECK_ERROR(stream->ext_oneapi_graph(*executable)),
-                       "native PLE key replay");
-                    ck(DPCT_CHECK_ERROR(stream->wait()),
-                       "native PLE key replay sync");
-                    ck(DPCT_CHECK_ERROR(
-                           (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                               .memcpy(replay.data(), d_cr, hcd * 4)
-                               .wait()),
-                       "native PLE key replay read");
+                    stream->launch(*graph);
+                    stream->sync();
+                    memcpy_sync(replay.data(), d_cr, hcd * 4);
                     if (std::memcmp(actual_result.data(), replay.data(), hcd * 4) != 0) ++bad;
                 }
                 nw.key_native_data = native_data;
             }
-            ck(DPCT_CHECK_ERROR(delete (executable)),
-               "native PLE key executable destroy");
-            ck(DPCT_CHECK_ERROR(delete (graph)),
-               "native PLE key graph destroy");
+            delete graph;
             for (int b = 0; b < 2; ++b) {
                 const void* storage = b == 0 ? native_storage : q_storage;
                 const size_t payload = b == 0 ? native_bytes : qbytes;
                 std::vector<uint8_t> ends(2 * guard);
-                ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                        .memcpy(ends.data(), storage, guard)
-                                        .wait()),
-                   "native PLE prefix guard");
-                ck(DPCT_CHECK_ERROR(
-                       (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                           .memcpy(ends.data() + guard,
-                                   static_cast<const uint8_t *>(storage) +
-                                       guard + payload,
-                                   guard)
-                           .wait()),
-                   "native PLE suffix guard");
+                memcpy_sync(ends.data(), storage, guard);
+                memcpy_sync(ends.data() + guard, static_cast<const uint8_t *>(storage) + guard + payload, guard);
                 if (!std::all_of(ends.begin(), ends.end(), [](uint8_t x) { return x == 0xa5; })) ++bad;
             }
-            ck(DPCT_CHECK_ERROR(
-                   dpct::get_current_device().destroy_queue(stream)),
-               "native PLE key stream destroy");
-            sycl::free(raw_projection, dpct::get_in_order_queue());
-                sycl::free(q_storage, dpct::get_in_order_queue());
-                sycl::free(native_storage, dpct::get_in_order_queue());
-            /*
-            DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-            assuming in the original code the source host memory is pageable
-            memory. If the memory is not pageable, call wait() on event return
-            by memcpy API to ensure synchronization behavior.
-            */
-            ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-                   d_emb, cap.emb.data(), nd * 4).wait()),
-               "native PLE restore input");
+            delete stream;
+            strata::ze::free(raw_projection);
+            strata::ze::free(q_storage);
+            strata::ze::free(native_storage);
+            memcpy_sync(d_emb, cap.emb.data(), nd * 4);
             k::ple_block(d_emb, d_hid, d_hist, w, out, ple_ws, nullptr);
-            ck(DPCT_CHECK_ERROR(
-                   dpct::get_current_device().queues_wait_and_throw()),
-               "native PLE default restore sync");
-            ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                    .memcpy(replay.data(), d_cr, hcd * 4)
-                                    .wait()),
-               "native PLE default restore read");
+            strata::ze::device_sync();
+            memcpy_sync(replay.data(), d_cr, hcd * 4);
             const bool restored = std::memcmp(dev_res.data(), replay.data(), hcd * 4) == 0;
             std::printf("  native PLE key graph/repeat/buffer guards checked; restored default: %s\n", restored ? "byte-identical" : "FAIL");
             if (!restored) ++bad;
@@ -1326,43 +961,21 @@ int main(int argc, char** argv) {
             // workspace; result may overwrite hidden once its original values are no longer needed.
             const size_t workspace_bytes = (size_t) k::ple_block_scratch_bytes();
             void* compact_workspace = nullptr;
-            ck(DPCT_CHECK_ERROR(compact_workspace = (void *)sycl::malloc_device(
-                                    workspace_bytes + hcd * sizeof(float),
-                                    dpct::get_in_order_queue())),
-               "compact PLE workspace");
+            compact_workspace = strata::ze::malloc_device(workspace_bytes + hcd * sizeof(float));
             k::PleOut compact{};
             compact.normalized = reinterpret_cast<float*>(static_cast<uint8_t*>(compact_workspace) + workspace_bytes);
             compact.result = d_hid;
             k::ple_block(d_emb, d_hid, d_hist, w, compact, compact_workspace, nullptr);
-            ck(DPCT_CHECK_ERROR(
-                   dpct::get_current_device().queues_wait_and_throw()),
-               "compact PLE sync");
+            strata::ze::device_sync();
             std::vector<float> compact_norm(hcd), compact_result(hcd);
-            ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                    .memcpy(compact_norm.data(),
-                                            compact.normalized,
-                                            hcd * sizeof(float))
-                                    .wait()),
-               "compact PLE normalized");
-            ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                    .memcpy(compact_result.data(), d_hid,
-                                            hcd * sizeof(float))
-                                    .wait()),
-               "compact PLE result");
+            memcpy_sync(compact_norm.data(), compact.normalized, hcd * sizeof(float));
+            memcpy_sync(compact_result.data(), d_hid, hcd * sizeof(float));
             const bool equal = std::memcmp(compact_norm.data(), dev_norm.data(), hcd * sizeof(float)) == 0 &&
                                std::memcmp(compact_result.data(), dev_res.data(), hcd * sizeof(float)) == 0;
             std::printf("  PLE separate exports and in-place hidden result: %s\n", equal ? "byte-identical" : "FAIL");
             if (!equal) ++bad;
-            /*
-            DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-            assuming in the original code the source host memory is pageable
-            memory. If the memory is not pageable, call wait() on event return
-            by memcpy API to ensure synchronization behavior.
-            */
-            ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-                   d_hid, cap.hidden.data(), hcd * sizeof(float)).wait()),
-               "restore PLE hidden input");
-            sycl::free(compact_workspace, dpct::get_in_order_queue());
+            memcpy_sync(d_hid, cap.hidden.data(), hcd * sizeof(float));
+            strata::ze::free(compact_workspace);
         }
 
         // slide the conv state by one NORMALIZED row, which is what the next token's window needs
@@ -1371,7 +984,7 @@ int main(int argc, char** argv) {
                 hist_state[r + (size_t) k::NG_HIST * c] = hist_state[(r + 1) + (size_t) k::NG_HIST * c];
         for (size_t c = 0; c < hcd; ++c)
             hist_state[((size_t) k::NG_HIST - 1) + (size_t) k::NG_HIST * c] = dev_norm[c];
-        sycl::free(ple_ws, dpct::get_in_order_queue());
+        strata::ze::free(ple_ws);
     }
 
     // ---- the trap that matters most: gated vs normalized as the conv input --------------------------

@@ -35,9 +35,7 @@
 // the cache is stored POST-RoPE, so a mid-run change would mix two scalings in one cache.
 #pragma once
 
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
+#include "strata/port.hpp"
 #include <cmath>
 
 #if defined(SYCL_LANGUAGE_VERSION) || defined(__HIPCC__)
@@ -158,10 +156,10 @@ STRATA_ROPE_SCALING_HD inline void rope_scaled_angle(float theta_extrap, float f
         const float ramp_mix = rope_yarn_ramp(corr_low, corr_high, pair) * ext_factor;
         theta = theta * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
         // "Get n-d magnitude scaling corrected for interpolation" - the log term only when correcting.
-        mscale *= 1.0f + 0.1f * sycl::log(1.0f / freq_scale);
+        mscale *= 1.0f + 0.1f * STRATA_MATH::log(1.0f / freq_scale);
     }
-    cos_out = sycl::cos(theta) * mscale;
-    sin_out = sycl::sin(theta) * mscale;
+    cos_out = STRATA_MATH::cos(theta) * mscale;
+    sin_out = STRATA_MATH::sin(theta) * mscale;
 }
 
 /// The ONE validity rule for a resolved configuration, shared by the engine's startup check and every rotation

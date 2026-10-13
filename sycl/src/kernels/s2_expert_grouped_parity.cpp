@@ -23,9 +23,7 @@
 // the projection.  Bitwise equality with the previous kernels is the contract; on top of it a double-precision
 // host reference of every up row and every down row checks that the fixture computes an expert at all - two
 // kernels agreeing on garbage would otherwise pass.
-#define DPCT_PROFILING_ENABLED
-#include <sycl/sycl.hpp>
-#include <dpct/dpct.hpp>
+#include "strata/ze/ze.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
 
@@ -56,40 +54,31 @@ constexpr size_t XROW = (size_t) NCH_GU * 34;   // one token's activation row of
 
 int g_fail = 0;
 
-void ck(dpct::err0 e, const char *w) {
-    /*
-    DPCT1009: SYCL reports errors using exceptions and does not use error
-    codes. Please replace the "get_error_string_dummy(...)" with a real
-    error-handling function.
-    */
+/// cudaMemcpy: after the device's queued work, complete on return.
+void memcpy_sync(void* dst, const void* src, size_t bytes) {
+    strata::ze::device_sync();
+    strata::ze::copy_sync(dst, src, bytes);
 }
+
+/// cudaMemset: after the device's queued work, complete on return.
+void memset_sync(void* dst, int value, size_t bytes) {
+    strata::ze::device_sync();
+    strata::ze::default_stream().memset(dst, value, bytes);
+    strata::ze::default_stream().sync();
+}
+
 template <typename T> T* dalloc(size_t n) {
     T* p = nullptr;
-    ck(DPCT_CHECK_ERROR(p = (T *)sycl::malloc_device(
-                            n * sizeof(T) + 256, dpct::get_in_order_queue())),
-       "malloc");
-    ck(DPCT_CHECK_ERROR(
-           (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memset(p, 0, n * sizeof(T) + 256).wait()),
-       "memset");
+    p = (T*) strata::ze::malloc_device(n * sizeof(T) + 256);
+    memset_sync(p, 0, n * sizeof(T) + 256);
     return p;
 }
 template <typename T> void up(T* d, const std::vector<T>& h) {
-    /*
-    DPCT1114: cudaMemcpy is migrated to asynchronization memcpy, assuming in
-    the original code the source host memory is pageable memory. If the memory
-    is not pageable, call wait() on event return by memcpy API to ensure
-    synchronization behavior.
-    */
-    ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-           d, h.data(), h.size() * sizeof(T)).wait()),
-       "h2d");
+    memcpy_sync(d, h.data(), h.size() * sizeof(T));
 }
 template <typename T> std::vector<T> down(const T* d, size_t n) {
     std::vector<T> h(n);
-    ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                            .memcpy(h.data(), d, n * sizeof(T))
-                            .wait()),
-       "d2h");
+    memcpy_sync(h.data(), d, n * sizeof(T));
     return h;
 }
 
@@ -170,13 +159,8 @@ bool twice(const char* name, float* d_out, size_t out_floats, const Scratch& s,
            const std::function<void()>& call, Run* keep, bool expect_new = true) {
     Run r[2];
     for (int old = 1; old >= 0; --old) {
-        ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
-                                .memset(d_out, 0xA5, out_floats * 4)
-                                .wait()),
-           "sentinel out");
-        ck(DPCT_CHECK_ERROR(
-               (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memset(s.p, 0x5A, s.bytes).wait()),
-           "sentinel scratch");
+        memset_sync(d_out, 0xA5, out_floats * 4);
+        memset_sync(s.p, 0x5A, s.bytes);
         k::moe_grouped_select_old(old);
         (void) k::moe_grouped_last_path();   // clear
         call();
@@ -187,14 +171,7 @@ bool twice(const char* name, float* d_out, size_t out_floats, const Scratch& s,
                         path == 1 ? "the new" : path == 0 ? "the previous" : "no", want ? "the new" : "the previous");
             ++g_fail;
         }
-        /*
-        DPCT1010: SYCL uses exceptions to report errors and does not use the
-        error codes. The cudaGetLastError function call was replaced with 0. You
-        need to rewrite this code.
-        */
-        ck(0, name);
-        ck(DPCT_CHECK_ERROR(dpct::get_current_device().queues_wait_and_throw()),
-           name);
+        strata::ze::device_sync();
         Run& x = r[old ? 0 : 1];
         x.out = down(d_out, out_floats);
         x.scratch = down((const uint8_t*) s.p, (size_t) s.bytes);
@@ -402,17 +379,9 @@ void check_all() {
         const int T = 8, n = T * K;
         uint8_t* h_host = nullptr;
         uint8_t* d_host = nullptr;
-        /*
-        DPCT1048: The original value cudaHostAllocMapped is not meaningful in
-        the migrated code and was removed or replaced with 0. You may need to
-        check the migrated code.
-        */
-        ck(DPCT_CHECK_ERROR(h_host = (uint8_t *)sycl::malloc_host(
-                                BLOB, dpct::get_in_order_queue())),
-           "host blob");
+        h_host = (uint8_t*) strata::ze::malloc_host(BLOB);
         std::memcpy(h_host, fx.hb(fx.nb - 1), BLOB);
-        ck(DPCT_CHECK_ERROR(*(void **)&d_host = (uint8_t *)h_host),
-           "host blob ptr");
+        d_host = h_host;
         // group sizes: 8, 1, 5, 2, 7, 3, 1, 6, 4, ... up to n entries
         const int sizes[] = {8, 1, 5, 2, 7, 3, 1, 6, 4, 8, 1, 2, 3, 4, 5, 6, 7, 1, 1, 5};
         std::vector<int32_t> order(n);   // the output rows, in group order
@@ -460,8 +429,7 @@ void check_all() {
             }, &r);
             reference(name.c_str(), r, s, ent, x, scaled ? &xs : nullptr);
         }
-        ck(DPCT_CHECK_ERROR(sycl::free(h_host, dpct::get_in_order_queue())),
-           "free host blob");
+        strata::ze::free(h_host);
     }
 
     // ---- 5. moe_group_resident + moe_grouped_s2: the MTP layer (experts resident at base + id * BLOB)
@@ -482,8 +450,7 @@ void check_all() {
         int32_t* d_edst = dalloc<int32_t>(n);
         int32_t* d_etok = dalloc<int32_t>(n);
         k::moe_group_resident(d_ids, n, K, fx.d, (int64_t) BLOB, d_gptr, d_gstart, d_counts, d_edst, d_etok, nullptr);
-        ck(DPCT_CHECK_ERROR(dpct::get_current_device().queues_wait_and_throw()),
-           "group_resident");
+        strata::ze::device_sync();
         const std::vector<int32_t> edst = down(d_edst, n), etok = down(d_etok, n);
         std::vector<Entry> ent(n);   // entry e: dst = routing index, blob = its expert
         for (int e = 0; e < n; ++e) ent[e] = {fx.hb(ids[(size_t) edst[e]]), etok[e], edst[e]};
@@ -503,15 +470,7 @@ void check_all() {
     // ---- 6. a 2-byte aligned activation row: the new path must decline and the previous kernels run
     {
         uint8_t* d_x2 = dalloc<uint8_t>(x.size() + 2);
-        /*
-        DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-        assuming in the original code the source host memory is pageable memory.
-        If the memory is not pageable, call wait() on event return by memcpy API
-        to ensure synchronization behavior.
-        */
-        ck(DPCT_CHECK_ERROR(
-               (dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(d_x2 + 2, x.data(), XROW).wait()),
-           "x2");
+        memcpy_sync(d_x2 + 2, x.data(), XROW);
         const int n_hits = 3;
         std::vector<int32_t> slot{2, 5, 7}, dst{4, 0, 9};
         int32_t* d_slot = dalloc<int32_t>(n_hits);
@@ -548,15 +507,7 @@ void check_all() {
         // One allocation for both layouts: the BLOB + 4 strided copies first, then the same blobs BLOB apart from
         // `d_arena + 4` over them.
         for (int i = 0; i < nb; ++i)
-            /*
-            DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-            assuming in the original code the source host memory is pageable
-            memory. If the memory is not pageable, call wait() on event return
-            by memcpy API to ensure synchronization behavior.
-            */
-            ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-                   d_arena + (size_t)i * STRIDE, fx.hb(i), BLOB).wait()),
-               "arena");
+            memcpy_sync(d_arena + (size_t)i * STRIDE, fx.hb(i), BLOB);
         {
             Run r;
             twice("moe_hit_grouped_s2 (slot stride BLOB + 4)", d_out, (size_t) K * H, s, [&] {
@@ -566,15 +517,7 @@ void check_all() {
             reference("moe_hit_grouped_s2 (slot stride BLOB + 4)", r, s, ent, x, &xs);
         }
         for (int i = 0; i < nb; ++i)
-            /*
-            DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-            assuming in the original code the source host memory is pageable
-            memory. If the memory is not pageable, call wait() on event return
-            by memcpy API to ensure synchronization behavior.
-            */
-            ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-                   d_arena + 4 + (size_t)i * BLOB, fx.hb(i), BLOB).wait()),
-               "arena");
+            memcpy_sync(d_arena + 4 + (size_t)i * BLOB, fx.hb(i), BLOB);
         {
             Run r;
             twice("moe_hit_grouped_s2 (arena 4 mod 8)", d_out, (size_t) K * H, s, [&] {
@@ -590,27 +533,13 @@ void check_all() {
 // Engine-like shapes with the blobs cycled through a set larger than the L2, so each call reads its codes from
 // DRAM as the engine's do.  Reports microseconds per call and the codes' effective bandwidth.
 void bench() {
-    int dev = 0;
-    dpct::device_info prop{};
-    ck(DPCT_CHECK_ERROR(dev = dpct::get_current_device_id()), "dev");
-    ck(DPCT_CHECK_ERROR(dpct::get_device(dev).get_device_info(prop)), "props");
-    /*
-    DPCT1051: SYCL does not support a device property functionally
-    compatible with l2CacheSize. It was migrated to global_mem_cache_size. You
-    may need to adjust the value of global_mem_cache_size for the specific
-    device.
-    */
-    const int nb = std::max(
-        48, (int)(3ull * (size_t)prop.get_global_mem_cache_size() / BLOB) + 8);
-    /*
-    DPCT1051: SYCL does not support a device property functionally
-    compatible with l2CacheSize. It was migrated to global_mem_cache_size. You
-    may need to adjust the value of global_mem_cache_size for the specific
-    device.
-    */
-    std::printf("bench: %s, L2 %d MB, %d blobs (%.0f MB) cycled\n",
-                prop.get_name(), prop.get_global_mem_cache_size() >> 20, nb,
-                nb * (double)BLOB / 1e6);
+    const int dev = strata::ze::current_device();
+    uint32_t ncache = 1;
+    ze_device_cache_properties_t cache{ZE_STRUCTURE_TYPE_DEVICE_CACHE_PROPERTIES};
+    STRATA_ZE_CHECK(zeDeviceGetCacheProperties(strata::ze::device_handle(dev), &ncache, &cache));
+    const int nb = std::max(48, (int) (3ull * (size_t) cache.cacheSize / BLOB) + 8);
+    std::printf("bench: %s, L2 %d MB, %d blobs (%.0f MB) cycled\n", strata::ze::device_info(dev).name.c_str(),
+                (int) (cache.cacheSize >> 20), nb, nb * (double) BLOB / 1e6);
     std::mt19937 rng(7);
     Fixture fx;
     fx.nb = nb;
@@ -619,15 +548,7 @@ void bench() {
         std::vector<uint8_t> b(BLOB);
         for (int i = 0; i < nb; ++i) {
             fill_blob(b.data(), rng);
-            /*
-            DPCT1114: cudaMemcpy is migrated to asynchronization memcpy,
-            assuming in the original code the source host memory is pageable
-            memory. If the memory is not pageable, call wait() on event return
-            by memcpy API to ensure synchronization behavior.
-            */
-            ck(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue()).memcpy(
-                   fx.d + (size_t)i * BLOB, b.data(), BLOB).wait()),
-               "blob");
+            memcpy_sync(fx.d + (size_t)i * BLOB, b.data(), BLOB);
         }
     }
     std::vector<uint8_t> x;
@@ -638,43 +559,18 @@ void bench() {
     up(d_x, x);
     up(d_xs, xs);
     constexpr int K = 10, ITERS = 200, SETS = 16;
-    dpct::event_ptr e0, e1;
-    ck(DPCT_CHECK_ERROR(e0 = new sycl::event()), "ev");
-    ck(DPCT_CHECK_ERROR(e1 = new sycl::event()), "ev");
+    strata::ze::Event* e0 = new strata::ze::Event(true);
+    strata::ze::Event* e1 = new strata::ze::Event(true);
     auto time = [&](const std::function<void(int)> &call) {
-        try {
-    call(0);
-        ck(DPCT_CHECK_ERROR(dpct::get_current_device().queues_wait_and_throw()),
-           "warm");
-        /*
-        DPCT1024: The original code returned the error code that was further
-        consumed by the program logic. This original code was replaced with 0.
-        You may need to rewrite the program logic consuming the error code.
-        */
-        ck(DPCT_CHECK_ERROR(dpct::sync_barrier(e0)), "rec");
+        call(0);
+        strata::ze::device_sync();
+        strata::ze::default_stream().record(*e0);
         for (int i = 0; i < ITERS; ++i) call(i % SETS);
-        /*
-        DPCT1024: The original code returned the error code that was further
-        consumed by the program logic. This original code was replaced with 0.
-        You may need to rewrite the program logic consuming the error code.
-        */
-        ck(DPCT_CHECK_ERROR(dpct::sync_barrier(e1)), "rec");
-        ck(DPCT_CHECK_ERROR(e1->wait_and_throw()), "sync");
+        strata::ze::default_stream().record(*e1);
+        e1->sync();
         float ms = 0;
-        ck(DPCT_CHECK_ERROR(
-               ms = (e1->get_profiling_info<
-                         sycl::info::event_profiling::command_end>() -
-                     e0->get_profiling_info<
-                         sycl::info::event_profiling::command_start>()) /
-                    1000000.0f),
-           "elapsed");
+        ms = e1->elapsed_ms_since(*e0);
         return 1000.0 * ms / ITERS;
-    }
-    catch (sycl::exception const &exc) {
-      std::cerr << exc.what() << "Exception caught at file:" << __FILE__
-                << ", line:" << __LINE__ << std::endl;
-      std::exit(1);
-    }
     };
     auto ab = [&](const char* name, double blobs_per_call, const std::function<void(int)>& call) {
         double us[2];
